@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ChatGPT 长对话性能优化与当前回答目录
+// @name         ChatGPT 长对话性能优化与双层导航目录
 // @namespace    local.chatgpt
-// @version      2.2.0
-// @description  优化长对话渲染、隐藏选中文本操作浮层，并提供半透明、可拖动、智能贴边收起、悬停展开的当前回答目录
+// @version      2.4.0
+// @description  优化长对话渲染并提供双层导航；修复虚拟化对话中的提问预览映射和点击跳转
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -55,16 +55,42 @@
         // 半透明背景后的模糊强度。默认关闭，避免固定模糊层增加绘制开销。
         answerTocBackdropBlurPx: 0,
 
-        // 折叠按钮悬停多久后自动展开。短暂延迟可保留按住拖动的机会。
+        // 折叠按钮悬停多久后临时展开；光标离开整个面板后多久自动收起。
         answerTocHoverExpandDelayMs: 180,
+        answerTocHoverCollapseDelayMs: 220,
+
+        // 一级目录：整段对话中的用户提问；二级目录：当前回答里的 H1/H2。
+        enableConversationToc: true,
+        hideOfficialConversationToc: true,
+        answerTocInitialView: 'headings', // 可选：'conversation' 或 'headings'
+        answerTocRememberView: true,
+        // 问答预览显示的最大行数：0 表示完整显示，不做行数截断。
+        conversationTocPreviewMaxLines: 0,
+
+        // 问答预览的最大字符数：0 表示完整显示，不按字符截断。
+        conversationTocMaxLabelLength: 0,
+
+        // 问答跳转后，目标提问与滚动视口顶部之间保留的距离。
+        conversationTocScrollOffsetPx: 88,
+
+        // 隐藏官方问答导航后，自定义目录距页面右侧的默认距离。
+        answerTocStandaloneInlineEndPx: 20,
 
         // 拖动后是否记住位置，以及控件与视口边缘的最小距离。
         answerTocRememberPosition: true,
         answerTocDragViewportMarginPx: 8,
+
+        // 面板缩放范围及尺寸持久化。缩放会自动转为手动定位。
+        answerTocRememberSize: true,
+        answerTocMinWidthPx: 220,
+        answerTocMaxWidthPx: 560,
+        answerTocMinHeightPx: 170,
+        answerTocMaxHeightPx: 760,
     });
 
     const TURN_SELECTOR = 'main [data-testid^="conversation-turn-"]';
     const ASSISTANT_SELECTOR = 'main [data-message-author-role="assistant"]';
+    const USER_SELECTOR = 'main [data-message-author-role="user"]';
 
     const LONG_ANSWER_BLOCK_SELECTOR = [
         `${ASSISTANT_SELECTOR} .markdown > p`,
@@ -125,11 +151,34 @@
     `);
     }
 
+    if (CONFIG.hideOfficialConversationToc) {
+        css.push(`
+      /*
+       * 只在视觉和指针层面隐藏官方问答导航，不使用 display:none。
+       * 这样仍可调用其原生点击逻辑处理尚未挂载的远端历史轮次。
+       */
+      [data-cgpt-native-conversation-toc-hidden] {
+        visibility: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    `);
+    }
+
     if (CONFIG.enableAnswerToc) {
         css.push(`
       /* 让目录跳转后的标题与页面顶部保留适当间距。 */
       ${ASSISTANT_SELECTOR} :is(h1, h2, h3, h4) {
         scroll-margin-block-start: 88px;
+      }
+
+      /*
+       * 远距离跳转时临时完整布局目标轮次，减少 content-visibility
+       * 使用估算高度而导致的落点偏差。脚本会在定位稳定后移除此属性。
+       */
+      [data-cgpt-conversation-jump-target] {
+        content-visibility: visible !important;
+        contain-intrinsic-size: none !important;
       }
     `);
     }
@@ -187,10 +236,21 @@
             this.panel = null;
             this.list = null;
             this.tocNav = null;
+            this.conversationList = null;
+            this.conversationNav = null;
+            this.headingEmptyState = null;
+            this.conversationEmptyState = null;
             this.countLabel = null;
             this.launcherCount = null;
+            this.launcherMode = null;
             this.panelHeader = null;
             this.collapseButton = null;
+            this.viewConversationButton = null;
+            this.viewHeadingsButton = null;
+            this.viewConversationCount = null;
+            this.viewHeadingsCount = null;
+            this.resizeHandleLeft = null;
+            this.resizeHandleRight = null;
 
             this.currentAnswer = null;
             this.currentContentRoot = null;
@@ -198,6 +258,19 @@
             this.headings = [];
             this.itemButtons = [];
             this.activeIndex = -1;
+
+            this.conversationItems = [];
+            this.conversationItemButtons = [];
+            this.activeConversationIndex = -1;
+            this.lastConversationSignature = '';
+            this.officialNavContainer = null;
+            this.conversationLabelCache = new Map();
+            this.pendingConversationLogicalIndex = -1;
+            this.pendingConversationUntil = 0;
+            this.conversationJumpToken = 0;
+            this.conversationJumpTimers = new Set();
+            this.conversationJumpRevealElement = null;
+            this.conversationJumpRevealTimer = 0;
 
             this.mainElement = null;
             this.mainObserver = null;
@@ -210,21 +283,33 @@
             this.answerDetectionTimer = 0;
             this.lastScrollTop = 0;
             this.rebuildTimer = 0;
+            this.conversationRebuildTimer = 0;
             this.rebindTimer = 0;
             this.healthTimer = 0;
             this.lastUrl = location.href;
 
             this.hoverExpandTimer = 0;
+            this.hoverCollapseTimer = 0;
             this.launcherHovered = false;
+            this.transientHoverOpen = false;
+
             this.dragState = null;
             this.dragFrameId = 0;
             this.pendingDragPoint = null;
             this.suppressNextLauncherClick = false;
             this.rootStyleBeforeDrag = null;
 
+            this.resizeState = null;
+            this.resizeFrameId = 0;
+            this.pendingResizePoint = null;
+            this.rootStyleBeforeResize = null;
+
             this.savedPosition = this.readPositionState();
             this.positionMode = this.savedPosition ? 'manual' : 'auto';
+            this.savedSize = this.readSizeState();
+            this.sizeMode = this.savedSize ? 'manual' : 'auto';
             this.collapsed = this.readCollapsedState();
+            this.activeView = this.readViewState();
 
             this.onScroll = this.onScroll.bind(this);
             this.onResize = this.onResize.bind(this);
@@ -235,9 +320,14 @@
             this.onAnswerMutations = this.onAnswerMutations.bind(this);
             this.onLauncherPointerEnter = this.onLauncherPointerEnter.bind(this);
             this.onLauncherPointerLeave = this.onLauncherPointerLeave.bind(this);
+            this.onPanelPointerEnter = this.onPanelPointerEnter.bind(this);
+            this.onPanelPointerLeave = this.onPanelPointerLeave.bind(this);
             this.onDragPointerMove = this.onDragPointerMove.bind(this);
             this.onDragPointerEnd = this.onDragPointerEnd.bind(this);
             this.onDragPointerCancel = this.onDragPointerCancel.bind(this);
+            this.onResizePointerMove = this.onResizePointerMove.bind(this);
+            this.onResizePointerEnd = this.onResizePointerEnd.bind(this);
+            this.onResizePointerCancel = this.onResizePointerCancel.bind(this);
         }
 
         start() {
@@ -245,6 +335,8 @@
 
             this.createUi();
             this.bindMainObserver();
+            this.syncOfficialConversationNav();
+            this.rebuildConversationToc();
             this.updateInlineEndOffset();
             this.syncVisibility();
 
@@ -262,10 +354,6 @@
                 window.navigation.addEventListener('navigatesuccess', this.onRouteSignal);
             }
 
-            /*
-             * 这个定时器只比较 URL 和主容器连接状态；
-             * 不遍历历史消息，也不读取回答布局。
-             */
             this.healthTimer = window.setInterval(() => {
                 if (document.hidden) return;
 
@@ -273,11 +361,13 @@
                     this.resetForNavigation();
                     return;
                 }
+
+                this.syncOfficialConversationNav();
+                this.refreshConversationTocIfNeeded();
             }, 1600);
 
             this.requestFrame(true);
         }
-
         createUi() {
             document.querySelector('#cgpt-answer-toc-host')?.remove();
 
@@ -285,9 +375,26 @@
                 const number = Number(value);
                 return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : fallback;
             };
-            const panelOpacityPercent = `${Math.round(clampUnit(this.config.answerTocPanelOpacity, 0.72) * 100)}%`;
-            const launcherOpacityPercent = `${Math.round(clampUnit(this.config.answerTocLauncherOpacity, 0.68) * 100)}%`;
+            const panelOpacity = clampUnit(this.config.answerTocPanelOpacity, 0.72);
+            const launcherOpacity = clampUnit(this.config.answerTocLauncherOpacity, 0.68);
+            const panelOpacityPercent = `${Math.round(panelOpacity * 100)}%`;
+            const launcherOpacityPercent = `${Math.round(launcherOpacity * 100)}%`;
             const backdropBlur = Math.max(0, Number(this.config.answerTocBackdropBlurPx) || 0);
+            const minWidth = Math.max(160, Number(this.config.answerTocMinWidthPx) || 220);
+            const minHeight = Math.max(120, Number(this.config.answerTocMinHeightPx) || 170);
+            const conversationPreviewMaxLines = Math.max(
+                0,
+                Math.floor(Number(this.config.conversationTocPreviewMaxLines) || 0),
+            );
+            const conversationPreviewCss = conversationPreviewMaxLines > 0
+                ? `display: -webkit-box;
+            overflow: hidden;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: ${conversationPreviewMaxLines};`
+                : `display: block;
+            overflow: visible;
+            -webkit-box-orient: initial;
+            -webkit-line-clamp: unset;`;
             const backdropFilterCss = backdropBlur > 0
                 ? `-webkit-backdrop-filter: blur(${backdropBlur}px) saturate(118%);
             backdrop-filter: blur(${backdropBlur}px) saturate(118%);`
@@ -297,6 +404,7 @@
             host.id = 'cgpt-answer-toc-host';
             host.hidden = true;
             host.setAttribute('data-cgpt-answer-toc', '');
+            host.dataset.dockSide = 'right';
 
             const shadow = host.attachShadow({ mode: 'open' });
             shadow.innerHTML = `
@@ -304,7 +412,7 @@
           :host {
             all: initial;
             position: fixed !important;
-            inset-inline-end: var(--cgpt-answer-toc-inline-end, 68px) !important;
+            inset-inline-end: var(--cgpt-answer-toc-inline-end, 20px) !important;
             top: 50% !important;
             z-index: 30 !important;
             width: max-content !important;
@@ -350,7 +458,7 @@
 
           .launcher {
             display: inline-flex;
-            min-width: 38px;
+            min-width: 42px;
             height: 38px;
             align-items: center;
             justify-content: center;
@@ -358,7 +466,7 @@
             padding: 0 9px;
             border: 1px solid var(--border-light, rgba(0, 0, 0, 0.14));
             border-radius: 12px;
-            background: rgba(255, 255, 255, ${clampUnit(this.config.answerTocLauncherOpacity, 0.68)});
+            background: rgba(255, 255, 255, ${launcherOpacity});
             background: color-mix(
               in srgb,
               var(--main-surface-primary, var(--bg-primary, #ffffff)) ${launcherOpacityPercent},
@@ -372,7 +480,7 @@
           }
 
           .launcher:hover {
-            background: rgba(244, 244, 244, ${clampUnit(this.config.answerTocLauncherOpacity, 0.68)});
+            background: rgba(244, 244, 244, ${launcherOpacity});
             background: color-mix(
               in srgb,
               var(--main-surface-secondary, var(--bg-secondary, #f4f4f4)) ${launcherOpacityPercent},
@@ -383,6 +491,7 @@
 
           .launcher:focus-visible,
           .icon-button:focus-visible,
+          .view-tab:focus-visible,
           .toc-item:focus-visible {
             outline: 2px solid var(--text-primary, #161616);
             outline-offset: 2px;
@@ -395,6 +504,13 @@
             flex: none;
           }
 
+          .launcher-mode {
+            min-width: 1em;
+            color: var(--text-tertiary, #777777);
+            font-size: 10px;
+            font-weight: 600;
+          }
+
           .launcher-count {
             min-width: 1.3em;
             text-align: center;
@@ -403,14 +519,15 @@
           }
 
           .panel {
-            width: min(300px, calc(100vw - 110px));
-            max-height: min(68vh, 660px);
+            position: relative;
+            width: min(var(--cgpt-answer-toc-width, 300px), calc(100vw - 16px));
+            max-height: min(68vh, 660px, calc(100vh - 16px));
             display: flex;
             flex-direction: column;
             overflow: hidden;
             border: 1px solid var(--border-light, rgba(0, 0, 0, 0.14));
             border-radius: 14px;
-            background: rgba(255, 255, 255, ${clampUnit(this.config.answerTocPanelOpacity, 0.72)});
+            background: rgba(255, 255, 255, ${panelOpacity});
             background: color-mix(
               in srgb,
               var(--main-surface-primary, var(--bg-primary, #ffffff)) ${panelOpacityPercent},
@@ -419,14 +536,26 @@
             box-shadow: 0 10px 34px rgba(0, 0, 0, 0.16);
           }
 
+          :host([data-size-mode="manual"]) .panel {
+            width: var(--cgpt-answer-toc-width, 300px);
+            height: var(--cgpt-answer-toc-height, 420px);
+            min-width: ${minWidth}px;
+            min-height: ${minHeight}px;
+            max-width: calc(100vw - 16px);
+            max-height: calc(100vh - 16px);
+          }
+
           .panel[hidden],
-          .launcher[hidden] {
+          .launcher[hidden],
+          .toc-nav[hidden],
+          .empty-state[hidden] {
             display: none !important;
           }
 
           .panel-header {
             min-height: 42px;
             display: flex;
+            flex: none;
             align-items: center;
             gap: 8px;
             padding: 7px 8px 7px 9px;
@@ -462,6 +591,10 @@
           :host([data-dragging]) .launcher,
           :host([data-dragging]) .panel-header {
             cursor: grabbing;
+          }
+
+          :host([data-resizing]) .panel {
+            user-select: none;
           }
 
           .panel-title-wrap {
@@ -507,8 +640,58 @@
             color: var(--text-primary, #161616);
           }
 
+          .view-tabs {
+            display: grid;
+            flex: none;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 4px;
+            padding: 5px 6px;
+            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+          }
+
+          .view-tab {
+            min-width: 0;
+            min-height: 31px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            padding: 5px 8px;
+            border: 0;
+            border-radius: 8px;
+            background: transparent;
+            color: var(--text-secondary, #4a4a4a);
+            cursor: pointer;
+          }
+
+          .view-tab:hover {
+            background: color-mix(
+              in srgb,
+              var(--main-surface-secondary, var(--bg-secondary, #f3f3f3)) 74%,
+              transparent
+            );
+            color: var(--text-primary, #161616);
+          }
+
+          .view-tab[aria-selected="true"] {
+            background: var(--main-surface-secondary, var(--bg-secondary, #ededed));
+            color: var(--text-primary, #111111);
+            font-weight: 600;
+          }
+
+          .view-count {
+            min-width: 1.6em;
+            padding: 1px 5px;
+            border-radius: 999px;
+            background: color-mix(in srgb, currentColor 10%, transparent);
+            font-size: 10px;
+            font-variant-numeric: tabular-nums;
+            font-weight: 500;
+          }
+
           .toc-nav {
             min-height: 0;
+            flex: 1;
             overflow-y: auto;
             overscroll-behavior: contain;
             padding: 6px;
@@ -524,11 +707,19 @@
             list-style: none;
           }
 
+          /* 长提问由目录区域滚动，不压缩单个条目的实际高度。 */
+          .toc-list > li {
+            min-width: 0;
+            flex: 0 0 auto;
+          }
+
           .toc-item {
             position: relative;
             width: 100%;
             min-height: 30px;
-            display: block;
+            display: flex;
+            align-items: flex-start;
+            gap: 7px;
             overflow: hidden;
             padding: 6px 9px 6px 11px;
             border: 0;
@@ -550,7 +741,11 @@
           }
 
           .toc-item:hover {
-            background: var(--main-surface-secondary, var(--bg-secondary, #f3f3f3));
+            background: color-mix(
+              in srgb,
+              var(--main-surface-secondary, var(--bg-secondary, #f3f3f3)) 82%,
+              transparent
+            );
             color: var(--text-primary, #161616);
           }
 
@@ -578,18 +773,104 @@
             font-size: 12px;
           }
 
+          .prompt-index {
+            width: 2.4em;
+            flex: none;
+            padding-top: 1px;
+            color: var(--text-tertiary, #777777);
+            font-size: 10.5px;
+            font-variant-numeric: tabular-nums;
+            text-align: end;
+          }
+
           .toc-item-label {
+            min-width: 0;
             display: -webkit-box;
+            flex: 1;
             overflow: hidden;
             -webkit-box-orient: vertical;
             -webkit-line-clamp: 2;
             overflow-wrap: anywhere;
           }
 
+          /*
+           * 问答级目录默认完整显示用户提问。
+           * 章节标题继续保持两行预览，避免长标题挤占整个面板。
+           */
+          #conversation-list .toc-item {
+            height: auto;
+            flex: 0 0 auto;
+          }
+
+          #conversation-list .toc-item-label {
+            ${conversationPreviewCss}
+            max-height: none;
+            text-overflow: clip;
+            white-space: pre-wrap;
+            word-break: break-word;
+          }
+
+          .empty-state {
+            margin: 6px;
+            padding: 18px 12px;
+            border: 1px dashed var(--border-light, rgba(0, 0, 0, 0.14));
+            border-radius: 10px;
+            color: var(--text-tertiary, #777777);
+            text-align: center;
+            font-size: 12px;
+          }
+
+          .resize-handle {
+            position: absolute;
+            bottom: 0;
+            width: 20px;
+            height: 20px;
+            display: none;
+            border: 0;
+            background: transparent;
+            color: var(--text-tertiary, #777777);
+            opacity: 0;
+            touch-action: none;
+            transition: opacity 120ms ease;
+          }
+
+          .panel:hover .resize-handle,
+          .resize-handle:focus-visible,
+          :host([data-resizing]) .resize-handle {
+            opacity: 0.72;
+          }
+
+          .resize-handle::after {
+            position: absolute;
+            right: 4px;
+            bottom: 4px;
+            width: 8px;
+            height: 8px;
+            border-right: 1.5px solid currentColor;
+            border-bottom: 1.5px solid currentColor;
+            content: "";
+          }
+
+          .resize-handle-left {
+            left: 0;
+            cursor: nesw-resize;
+            transform: scaleX(-1);
+          }
+
+          .resize-handle-right {
+            right: 0;
+            cursor: nwse-resize;
+          }
+
+          :host([data-dock-side="right"]) .resize-handle-left,
+          :host([data-dock-side="left"]) .resize-handle-right {
+            display: block;
+          }
+
           @media (prefers-color-scheme: dark) {
             .launcher {
               border-color: rgba(255, 255, 255, 0.14);
-              background: rgba(33, 33, 33, ${clampUnit(this.config.answerTocLauncherOpacity, 0.68)});
+              background: rgba(33, 33, 33, ${launcherOpacity});
               background: color-mix(
                 in srgb,
                 var(--main-surface-primary, var(--bg-primary, #212121)) ${launcherOpacityPercent},
@@ -600,7 +881,7 @@
 
             .panel {
               border-color: rgba(255, 255, 255, 0.14);
-              background: rgba(33, 33, 33, ${clampUnit(this.config.answerTocPanelOpacity, 0.72)});
+              background: rgba(33, 33, 33, ${panelOpacity});
               background: color-mix(
                 in srgb,
                 var(--main-surface-primary, var(--bg-primary, #212121)) ${panelOpacityPercent},
@@ -609,7 +890,8 @@
               box-shadow: 0 8px 28px rgba(0, 0, 0, 0.42);
             }
 
-            .panel-header {
+            .panel-header,
+            .view-tabs {
               border-bottom-color: rgba(255, 255, 255, 0.11);
             }
           }
@@ -626,29 +908,30 @@
           id="launcher"
           class="launcher"
           type="button"
-          aria-label="展开当前回答目录"
+          aria-label="展开导航目录"
           aria-expanded="false"
-          title="悬停展开；按住拖动可移动（Alt+Shift+O）"
+          title="悬停临时展开；点击保持展开；按住拖动可移动（Alt+Shift+O）"
           hidden
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M5 6h14M5 12h14M5 18h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
           </svg>
+          <span id="launcher-mode" class="launcher-mode">章</span>
           <span id="launcher-count" class="launcher-count">0</span>
         </button>
 
-        <aside id="panel" class="panel" aria-label="当前回答目录" hidden>
+        <aside id="panel" class="panel" aria-label="ChatGPT 导航目录" hidden>
           <div class="panel-header" title="拖动标题栏可移动目录">
             <span class="drag-grip" aria-hidden="true"></span>
             <div class="panel-title-wrap">
-              <span class="panel-title">当前回答目录</span>
+              <span class="panel-title">导航目录</span>
               <span id="count-label" class="count-label">0 节</span>
             </div>
             <button
               id="collapse-button"
               class="icon-button"
               type="button"
-              aria-label="收起当前回答目录"
+              aria-label="收起导航目录"
               title="收起目录（Alt+Shift+O）"
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -656,9 +939,28 @@
               </svg>
             </button>
           </div>
-          <nav class="toc-nav" aria-label="当前回答章节">
+
+          <div class="view-tabs" role="tablist" aria-label="目录层级">
+            <button id="view-conversation" class="view-tab" type="button" role="tab" data-view="conversation" aria-selected="false">
+              <span>问答</span><span id="view-conversation-count" class="view-count">0</span>
+            </button>
+            <button id="view-headings" class="view-tab" type="button" role="tab" data-view="headings" aria-selected="true">
+              <span>章节</span><span id="view-headings-count" class="view-count">0</span>
+            </button>
+          </div>
+
+          <nav id="conversation-nav" class="toc-nav" aria-label="对话问答导航" hidden>
+            <div id="conversation-empty" class="empty-state" hidden>暂未找到可跳转的提问</div>
+            <ol id="conversation-list" class="toc-list"></ol>
+          </nav>
+
+          <nav id="heading-nav" class="toc-nav" aria-label="当前回答章节">
+            <div id="heading-empty" class="empty-state" hidden>当前回答没有 H1/H2 标题</div>
             <ol id="toc-list" class="toc-list"></ol>
           </nav>
+
+          <button class="resize-handle resize-handle-left" type="button" aria-label="调整目录大小" title="拖动调整目录大小" data-resize-side="left"></button>
+          <button class="resize-handle resize-handle-right" type="button" aria-label="调整目录大小" title="拖动调整目录大小" data-resize-side="right"></button>
         </aside>
       `;
 
@@ -669,19 +971,34 @@
             this.launcher = shadow.getElementById('launcher');
             this.panel = shadow.getElementById('panel');
             this.list = shadow.getElementById('toc-list');
-            this.tocNav = shadow.querySelector('.toc-nav');
+            this.tocNav = shadow.getElementById('heading-nav');
+            this.conversationList = shadow.getElementById('conversation-list');
+            this.conversationNav = shadow.getElementById('conversation-nav');
+            this.headingEmptyState = shadow.getElementById('heading-empty');
+            this.conversationEmptyState = shadow.getElementById('conversation-empty');
             this.countLabel = shadow.getElementById('count-label');
             this.launcherCount = shadow.getElementById('launcher-count');
+            this.launcherMode = shadow.getElementById('launcher-mode');
             this.panelHeader = shadow.querySelector('.panel-header');
             this.collapseButton = shadow.getElementById('collapse-button');
+            this.viewConversationButton = shadow.getElementById('view-conversation');
+            this.viewHeadingsButton = shadow.getElementById('view-headings');
+            this.viewConversationCount = shadow.getElementById('view-conversation-count');
+            this.viewHeadingsCount = shadow.getElementById('view-headings-count');
+            this.resizeHandleLeft = shadow.querySelector('[data-resize-side="left"]');
+            this.resizeHandleRight = shadow.querySelector('[data-resize-side="right"]');
 
             host.dataset.positionMode = this.positionMode;
+            host.dataset.sizeMode = this.sizeMode;
             if (this.savedPosition) {
                 this.setManualPosition(
                     this.savedPosition.left,
                     this.savedPosition.top,
                     false,
                 );
+            }
+            if (this.savedSize) {
+                this.setPanelSize(this.savedSize.width, this.savedSize.height, false);
             }
 
             this.launcher.addEventListener('pointerenter', this.onLauncherPointerEnter);
@@ -696,8 +1013,11 @@
                     this.suppressNextLauncherClick = false;
                     return;
                 }
-                this.setCollapsed(false);
+                this.setCollapsed(false, { source: 'click', persist: true });
             });
+
+            this.panel.addEventListener('pointerenter', this.onPanelPointerEnter);
+            this.panel.addEventListener('pointerleave', this.onPanelPointerLeave);
 
             this.panelHeader?.addEventListener('pointerdown', (event) => {
                 const target = event.target;
@@ -708,7 +1028,14 @@
             });
 
             this.collapseButton?.addEventListener('click', () => {
-                this.setCollapsed(true);
+                this.setCollapsed(true, { source: 'click', persist: true });
+            });
+
+            this.viewConversationButton?.addEventListener('click', () => {
+                this.setActiveView('conversation', true);
+            });
+            this.viewHeadingsButton?.addEventListener('click', () => {
+                this.setActiveView('headings', true);
             });
 
             this.list.addEventListener('click', (event) => {
@@ -721,7 +1048,26 @@
                 if (Number.isInteger(index)) this.jumpToHeading(index);
             });
 
+            this.conversationList.addEventListener('click', (event) => {
+                const button = event.target instanceof Element
+                    ? event.target.closest('button[data-conversation-index]')
+                    : null;
+                if (!(button instanceof HTMLButtonElement)) return;
+
+                const index = Number.parseInt(button.dataset.conversationIndex ?? '', 10);
+                if (Number.isInteger(index)) this.jumpToConversation(index);
+            });
+
+            this.resizeHandleLeft?.addEventListener('pointerdown', (event) => {
+                this.beginResize(event, 'left');
+            });
+            this.resizeHandleRight?.addEventListener('pointerdown', (event) => {
+                this.beginResize(event, 'right');
+            });
+
+            this.applyActiveView();
             this.applyCollapsedState();
+            this.updateViewMeta();
         }
 
         readPositionState() {
@@ -734,10 +1080,7 @@
                 const parsed = JSON.parse(raw);
                 const left = Number(parsed?.left);
                 const top = Number(parsed?.top);
-
-                if (Number.isFinite(left) && Number.isFinite(top)) {
-                    return { left, top };
-                }
+                if (Number.isFinite(left) && Number.isFinite(top)) return { left, top };
             } catch {
                 // 忽略存储不可用或旧数据损坏的情况。
             }
@@ -756,7 +1099,6 @@
             const top = Number.parseFloat(
                 this.host?.style.getPropertyValue('--cgpt-answer-toc-top') ?? '',
             );
-
             if (!Number.isFinite(left) || !Number.isFinite(top)) return;
 
             try {
@@ -776,8 +1118,195 @@
             this.host.dataset.positionMode = 'manual';
             this.host.style.setProperty('--cgpt-answer-toc-left', `${left}px`);
             this.host.style.setProperty('--cgpt-answer-toc-top', `${top}px`);
-
             if (persist) this.writePositionState();
+        }
+
+        readSizeState() {
+            if (!this.config.answerTocRememberSize) return null;
+
+            try {
+                const raw = localStorage.getItem('cgpt-answer-toc-size-v1');
+                if (!raw) return null;
+
+                const parsed = JSON.parse(raw);
+                const width = Number(parsed?.width);
+                const height = Number(parsed?.height);
+                if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+                    return { width, height };
+                }
+            } catch {
+                // 忽略存储不可用或旧数据损坏的情况。
+            }
+
+            return null;
+        }
+
+        getPanelSizeLimits() {
+            const margin = Math.max(0, Number(this.config.answerTocDragViewportMarginPx) || 0);
+            const viewportWidth = Math.max(1, document.documentElement.clientWidth);
+            const viewportHeight = Math.max(1, document.documentElement.clientHeight);
+            const configuredMinWidth = Math.max(160, Number(this.config.answerTocMinWidthPx) || 220);
+            const configuredMaxWidth = Math.max(
+                configuredMinWidth,
+                Number(this.config.answerTocMaxWidthPx) || 560,
+            );
+            const configuredMinHeight = Math.max(120, Number(this.config.answerTocMinHeightPx) || 170);
+            const configuredMaxHeight = Math.max(
+                configuredMinHeight,
+                Number(this.config.answerTocMaxHeightPx) || 760,
+            );
+            const maxWidth = Math.max(1, Math.min(configuredMaxWidth, viewportWidth - margin * 2));
+            const maxHeight = Math.max(1, Math.min(configuredMaxHeight, viewportHeight - margin * 2));
+
+            return {
+                minWidth: Math.min(configuredMinWidth, maxWidth),
+                maxWidth,
+                minHeight: Math.min(configuredMinHeight, maxHeight),
+                maxHeight,
+            };
+        }
+
+        setPanelSize(width, height, persist = false) {
+            if (!this.host || !Number.isFinite(width) || !Number.isFinite(height)) return null;
+
+            const limits = this.getPanelSizeLimits();
+            const nextWidth = Math.round(
+                Math.min(limits.maxWidth, Math.max(limits.minWidth, width)),
+            );
+            const nextHeight = Math.round(
+                Math.min(limits.maxHeight, Math.max(limits.minHeight, height)),
+            );
+
+            this.savedSize = { width: nextWidth, height: nextHeight };
+            this.sizeMode = 'manual';
+            this.host.dataset.sizeMode = 'manual';
+            this.host.style.setProperty('--cgpt-answer-toc-width', `${nextWidth}px`);
+            this.host.style.setProperty('--cgpt-answer-toc-height', `${nextHeight}px`);
+
+            if (persist) this.writeSizeState();
+            return this.savedSize;
+        }
+
+        writeSizeState() {
+            if (!this.config.answerTocRememberSize || !this.savedSize) return;
+
+            try {
+                localStorage.setItem(
+                    'cgpt-answer-toc-size-v1',
+                    JSON.stringify(this.savedSize),
+                );
+            } catch {
+                // 忽略严格隐私模式下的存储错误。
+            }
+        }
+
+        ensurePanelSizeInViewport(persist = false) {
+            if (this.sizeMode !== 'manual' || !this.savedSize) return;
+
+            const anchor = !this.collapsed ? this.captureWidgetEdgeAnchor() : null;
+            const previous = this.savedSize;
+            const next = this.setPanelSize(previous.width, previous.height, false);
+            const changed = next && (
+                next.width !== previous.width || next.height !== previous.height
+            );
+
+            if (anchor) this.alignManualWidgetToEdgeAnchor(anchor, false);
+            if (persist && changed) this.writeSizeState();
+        }
+
+        readViewState() {
+            const fallback = this.config.answerTocInitialView === 'conversation'
+                ? 'conversation'
+                : 'headings';
+            if (!this.config.answerTocRememberView) return fallback;
+
+            try {
+                const stored = localStorage.getItem('cgpt-answer-toc-view-v1');
+                if (stored === 'conversation' || stored === 'headings') return stored;
+            } catch {
+                // 忽略存储不可用的情况。
+            }
+
+            return fallback;
+        }
+
+        writeViewState() {
+            if (!this.config.answerTocRememberView) return;
+
+            try {
+                localStorage.setItem('cgpt-answer-toc-view-v1', this.activeView);
+            } catch {
+                // 忽略存储不可用的情况。
+            }
+        }
+
+        setActiveView(view, persist = true) {
+            const nextView = view === 'conversation' ? 'conversation' : 'headings';
+            if (nextView === this.activeView) {
+                this.applyActiveView();
+                return;
+            }
+
+            this.activeView = nextView;
+            if (persist) this.writeViewState();
+            this.applyActiveView();
+            this.updateViewMeta();
+
+            window.requestAnimationFrame(() => {
+                if (this.activeView === 'conversation') {
+                    const current = this.conversationItemButtons[this.activeConversationIndex];
+                    if (current) this.scrollItemIntoView(this.conversationNav, current);
+                } else {
+                    const current = this.itemButtons[this.activeIndex];
+                    if (current) this.scrollItemIntoView(this.tocNav, current);
+                }
+            });
+        }
+
+        applyActiveView() {
+            if (!this.conversationNav || !this.tocNav) return;
+
+            const conversationActive = this.activeView === 'conversation';
+            this.conversationNav.hidden = !conversationActive;
+            this.tocNav.hidden = conversationActive;
+            this.viewConversationButton?.setAttribute('aria-selected', String(conversationActive));
+            this.viewHeadingsButton?.setAttribute('aria-selected', String(!conversationActive));
+            this.viewConversationButton?.setAttribute('tabindex', conversationActive ? '0' : '-1');
+            this.viewHeadingsButton?.setAttribute('tabindex', conversationActive ? '-1' : '0');
+        }
+
+        updateViewMeta() {
+            const conversationCount = this.conversationItems.length;
+            const headingCount = this.headings.length;
+            const conversationActive = this.activeView === 'conversation';
+            const activeCount = conversationActive ? conversationCount : headingCount;
+
+            if (this.viewConversationCount) {
+                this.viewConversationCount.textContent = String(conversationCount);
+            }
+            if (this.viewHeadingsCount) {
+                this.viewHeadingsCount.textContent = String(headingCount);
+            }
+            if (this.countLabel) {
+                this.countLabel.textContent = conversationActive
+                    ? `${conversationCount} 问`
+                    : `${headingCount} 节`;
+            }
+            if (this.launcherMode) {
+                this.launcherMode.textContent = conversationActive ? '问' : '章';
+            }
+            if (this.launcherCount) {
+                this.launcherCount.textContent = String(activeCount);
+            }
+            if (this.launcher) {
+                this.launcher.title = `悬停临时展开；点击保持展开；问答 ${conversationCount}，章节 ${headingCount}`;
+            }
+            if (this.conversationEmptyState) {
+                this.conversationEmptyState.hidden = conversationCount > 0;
+            }
+            if (this.headingEmptyState) {
+                this.headingEmptyState.hidden = headingCount > 0;
+            }
         }
 
         getVisibleWidget() {
@@ -785,20 +1314,12 @@
             return this.collapsed ? this.launcher : this.panel;
         }
 
-        /**
-         * 根据控件中心点判断它更靠近视口左侧还是右侧。
-         * 使用物理 left/right，而不是 inline-start/inline-end，确保拖动后的视觉行为直观。
-         */
         getWidgetDockSide(rect) {
             const viewportWidth = Math.max(1, document.documentElement.clientWidth);
             const centerX = rect.left + rect.width / 2;
             return centerX <= viewportWidth / 2 ? 'left' : 'right';
         }
 
-        /**
-         * 在展开/收起前记录当前控件的同侧边缘。
-         * 例如控件靠右时记录 right，切换尺寸后继续让新控件的 right 与之对齐。
-         */
         captureWidgetEdgeAnchor() {
             if (this.positionMode !== 'manual') return null;
 
@@ -810,7 +1331,6 @@
 
             const side = this.getWidgetDockSide(rect);
             if (this.host) this.host.dataset.dockSide = side;
-
             return {
                 side,
                 left: rect.left,
@@ -819,10 +1339,6 @@
             };
         }
 
-        /**
-         * 控件尺寸变化后，保持切换前更靠近视口的那一侧不动。
-         * 左侧区域：左边缘对齐；右侧区域：右边缘对齐。
-         */
         alignManualWidgetToEdgeAnchor(anchor, persist = false) {
             if (!anchor || this.positionMode !== 'manual' || !this.host || this.host.hidden) {
                 return;
@@ -848,16 +1364,78 @@
             this.setManualPosition(clamped.left, clamped.top, persist);
         }
 
+        readCollapsedState() {
+            if (!this.config.answerTocRememberCollapsedState) {
+                return this.config.answerTocInitiallyCollapsed;
+            }
+
+            try {
+                const stored = localStorage.getItem('cgpt-answer-toc-collapsed');
+                if (stored === '1') return true;
+                if (stored === '0') return false;
+            } catch {
+                // 某些严格隐私模式可能阻止 localStorage。
+            }
+
+            return this.config.answerTocInitiallyCollapsed;
+        }
+
+        writeCollapsedState() {
+            if (!this.config.answerTocRememberCollapsedState) return;
+
+            try {
+                localStorage.setItem('cgpt-answer-toc-collapsed', this.collapsed ? '1' : '0');
+            } catch {
+                // 忽略存储不可用的情况。
+            }
+        }
+
         cancelHoverExpand() {
             window.clearTimeout(this.hoverExpandTimer);
             this.hoverExpandTimer = 0;
         }
 
+        cancelHoverCollapse() {
+            window.clearTimeout(this.hoverCollapseTimer);
+            this.hoverCollapseTimer = 0;
+        }
+
+        scheduleHoverCollapse() {
+            this.cancelHoverCollapse();
+            if (
+                !this.transientHoverOpen ||
+                this.collapsed ||
+                this.dragState ||
+                this.resizeState
+            ) {
+                return;
+            }
+
+            const delay = Math.max(
+                0,
+                Number(this.config.answerTocHoverCollapseDelayMs) || 0,
+            );
+            this.hoverCollapseTimer = window.setTimeout(() => {
+                this.hoverCollapseTimer = 0;
+                if (
+                    this.transientHoverOpen &&
+                    !this.collapsed &&
+                    !this.dragState &&
+                    !this.resizeState &&
+                    !this.panel?.matches(':hover')
+                ) {
+                    this.setCollapsed(true, { source: 'hover-leave', persist: false });
+                }
+            }, delay);
+        }
+
         onLauncherPointerEnter(event) {
             this.launcherHovered = true;
+            this.cancelHoverCollapse();
             if (
                 !this.collapsed ||
                 this.dragState ||
+                this.resizeState ||
                 (event.pointerType && event.pointerType !== 'mouse')
             ) {
                 return;
@@ -867,8 +1445,13 @@
             const delay = Math.max(0, Number(this.config.answerTocHoverExpandDelayMs) || 0);
             this.hoverExpandTimer = window.setTimeout(() => {
                 this.hoverExpandTimer = 0;
-                if (this.collapsed && this.launcherHovered && !this.dragState) {
-                    this.setCollapsed(false);
+                if (this.collapsed && this.launcherHovered && !this.dragState && !this.resizeState) {
+                    this.setCollapsed(false, { source: 'hover', persist: false });
+                    window.requestAnimationFrame(() => {
+                        if (this.transientHoverOpen && !this.panel?.matches(':hover')) {
+                            this.scheduleHoverCollapse();
+                        }
+                    });
                 }
             }, delay);
         }
@@ -878,12 +1461,86 @@
             this.cancelHoverExpand();
         }
 
+        onPanelPointerEnter() {
+            this.cancelHoverCollapse();
+        }
+
+        onPanelPointerLeave(event) {
+            const related = event.relatedTarget;
+            if (
+                related instanceof Node &&
+                (this.panel?.contains(related) || this.launcher?.contains(related))
+            ) {
+                return;
+            }
+            this.scheduleHoverCollapse();
+        }
+
+        setCollapsed(collapsed, options = {}) {
+            const nextCollapsed = Boolean(collapsed);
+            const source = options.source || 'manual';
+            const persist = options.persist !== false;
+
+            this.cancelHoverExpand();
+            this.cancelHoverCollapse();
+
+            if (!nextCollapsed && source === 'hover') {
+                this.transientHoverOpen = true;
+            } else if (source !== 'layout') {
+                this.transientHoverOpen = false;
+            }
+
+            if (nextCollapsed === this.collapsed) {
+                this.applyCollapsedState();
+                return;
+            }
+
+            const edgeAnchor = this.captureWidgetEdgeAnchor();
+            this.collapsed = nextCollapsed;
+            if (persist) this.writeCollapsedState();
+            this.applyCollapsedState();
+
+            if (edgeAnchor) this.alignManualWidgetToEdgeAnchor(edgeAnchor, false);
+
+            window.requestAnimationFrame(() => {
+                if (edgeAnchor) {
+                    this.alignManualWidgetToEdgeAnchor(edgeAnchor, true);
+                } else {
+                    this.ensureManualPositionInViewport(true);
+                }
+
+                if (!this.collapsed) {
+                    this.ensurePanelSizeInViewport(false);
+                    const current = this.activeView === 'conversation'
+                        ? this.conversationItemButtons[this.activeConversationIndex]
+                        : this.itemButtons[this.activeIndex];
+                    const nav = this.activeView === 'conversation'
+                        ? this.conversationNav
+                        : this.tocNav;
+                    if (current) this.scrollItemIntoView(nav, current);
+
+                    if (this.transientHoverOpen && !this.panel?.matches(':hover')) {
+                        this.scheduleHoverCollapse();
+                    }
+                }
+            });
+        }
+
+        applyCollapsedState() {
+            if (!this.launcher || !this.panel) return;
+
+            this.launcher.hidden = !this.collapsed;
+            this.panel.hidden = this.collapsed;
+            this.launcher.setAttribute('aria-expanded', String(!this.collapsed));
+        }
+
         beginDrag(event, source) {
             if (
                 !(event instanceof PointerEvent) ||
                 event.button !== 0 ||
                 event.isPrimary === false ||
                 this.dragState ||
+                this.resizeState ||
                 !this.host
             ) {
                 return;
@@ -893,6 +1550,7 @@
             if (!(widget instanceof HTMLElement) || widget.hidden) return;
 
             this.cancelHoverExpand();
+            this.cancelHoverCollapse();
             event.preventDefault();
 
             const rect = widget.getBoundingClientRect();
@@ -921,7 +1579,7 @@
             try {
                 this.dragState.captureTarget?.setPointerCapture?.(event.pointerId);
             } catch {
-                // 某些环境不允许显式捕获；window 级监听仍可完成拖动。
+                // window 级监听仍可完成拖动。
             }
 
             window.addEventListener('pointermove', this.onDragPointerMove, {
@@ -942,7 +1600,6 @@
 
             if (!state.moved) {
                 if (Math.hypot(deltaX, deltaY) < 4) return;
-
                 state.moved = true;
                 this.host?.setAttribute('data-dragging', '');
                 this.setManualPosition(state.startLeft, state.startTop, false);
@@ -996,7 +1653,7 @@
             try {
                 state.captureTarget?.releasePointerCapture?.(state.pointerId);
             } catch {
-                // 忽略捕获已经被浏览器释放的情况。
+                // 忽略 pointer capture 已释放的情况。
             }
 
             window.removeEventListener('pointermove', this.onDragPointerMove, true);
@@ -1021,6 +1678,205 @@
                     }, 0);
                 }
             }
+
+            this.resumeTransientAutoCollapse(event.clientX, event.clientY);
+        }
+
+        beginResize(event, handleSide) {
+            if (
+                !(event instanceof PointerEvent) ||
+                event.button !== 0 ||
+                event.isPrimary === false ||
+                this.resizeState ||
+                this.dragState ||
+                this.collapsed ||
+                !this.host ||
+                !this.panel
+            ) {
+                return;
+            }
+
+            const rect = this.panel.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return;
+
+            const side = handleSide === 'left' ? 'left' : 'right';
+            this.cancelHoverExpand();
+            this.cancelHoverCollapse();
+            event.preventDefault();
+            event.stopPropagation();
+
+            this.resizeState = {
+                pointerId: event.pointerId,
+                captureTarget: event.currentTarget instanceof Element
+                    ? event.currentTarget
+                    : null,
+                side,
+                startClientX: event.clientX,
+                startClientY: event.clientY,
+                startWidth: rect.width,
+                startHeight: rect.height,
+                startLeft: rect.left,
+                startRight: rect.right,
+                startTop: rect.top,
+                moved: false,
+            };
+
+            this.rootStyleBeforeResize = {
+                userSelect: document.documentElement.style.userSelect,
+                cursor: document.documentElement.style.cursor,
+            };
+            document.documentElement.style.userSelect = 'none';
+            document.documentElement.style.cursor = side === 'left'
+                ? 'nesw-resize'
+                : 'nwse-resize';
+
+            try {
+                this.resizeState.captureTarget?.setPointerCapture?.(event.pointerId);
+            } catch {
+                // window 级监听仍可完成缩放。
+            }
+
+            window.addEventListener('pointermove', this.onResizePointerMove, {
+                capture: true,
+                passive: false,
+            });
+            window.addEventListener('pointerup', this.onResizePointerEnd, true);
+            window.addEventListener('pointercancel', this.onResizePointerCancel, true);
+        }
+
+        onResizePointerMove(event) {
+            const state = this.resizeState;
+            if (!state || event.pointerId !== state.pointerId) return;
+
+            event.preventDefault();
+            const deltaX = event.clientX - state.startClientX;
+            const deltaY = event.clientY - state.startClientY;
+
+            if (!state.moved) {
+                if (Math.hypot(deltaX, deltaY) < 3) return;
+                state.moved = true;
+                this.host?.setAttribute('data-resizing', '');
+                this.setManualPosition(state.startLeft, state.startTop, false);
+                this.setPanelSize(state.startWidth, state.startHeight, false);
+            }
+
+            this.pendingResizePoint = {
+                clientX: event.clientX,
+                clientY: event.clientY,
+            };
+
+            if (this.resizeFrameId) return;
+            this.resizeFrameId = window.requestAnimationFrame(() => {
+                this.resizeFrameId = 0;
+                const point = this.pendingResizePoint;
+                this.pendingResizePoint = null;
+                if (point) this.applyResizePoint(point.clientX, point.clientY);
+            });
+        }
+
+        applyResizePoint(clientX, clientY) {
+            const state = this.resizeState;
+            if (!state?.moved) return;
+
+            const deltaX = clientX - state.startClientX;
+            const deltaY = clientY - state.startClientY;
+            const requestedWidth = state.side === 'left'
+                ? state.startWidth - deltaX
+                : state.startWidth + deltaX;
+            const requestedHeight = state.startHeight + deltaY;
+
+            const margin = Math.max(
+                0,
+                Number(this.config.answerTocDragViewportMarginPx) || 0,
+            );
+            const viewportWidth = Math.max(1, document.documentElement.clientWidth);
+            const viewportHeight = Math.max(1, document.documentElement.clientHeight);
+            const limits = this.getPanelSizeLimits();
+            const maxWidthByAnchor = state.side === 'left'
+                ? state.startRight - margin
+                : viewportWidth - state.startLeft - margin;
+            const maxHeightByAnchor = viewportHeight - state.startTop - margin;
+            const maxWidth = Math.max(
+                Math.min(limits.minWidth, maxWidthByAnchor),
+                Math.min(limits.maxWidth, maxWidthByAnchor),
+            );
+            const maxHeight = Math.max(
+                Math.min(limits.minHeight, maxHeightByAnchor),
+                Math.min(limits.maxHeight, maxHeightByAnchor),
+            );
+            const width = Math.round(
+                Math.min(maxWidth, Math.max(Math.min(limits.minWidth, maxWidth), requestedWidth)),
+            );
+            const height = Math.round(
+                Math.min(maxHeight, Math.max(Math.min(limits.minHeight, maxHeight), requestedHeight)),
+            );
+            const left = state.side === 'left'
+                ? state.startRight - width
+                : state.startLeft;
+
+            this.setPanelSize(width, height, false);
+            this.setManualPosition(left, state.startTop, false);
+        }
+
+        onResizePointerEnd(event) {
+            this.finishResize(event, false);
+        }
+
+        onResizePointerCancel(event) {
+            this.finishResize(event, true);
+        }
+
+        finishResize(event, cancelled) {
+            const state = this.resizeState;
+            if (!state || event.pointerId !== state.pointerId) return;
+
+            if (this.resizeFrameId) {
+                window.cancelAnimationFrame(this.resizeFrameId);
+                this.resizeFrameId = 0;
+            }
+
+            const point = this.pendingResizePoint;
+            this.pendingResizePoint = null;
+            if (point && state.moved) this.applyResizePoint(point.clientX, point.clientY);
+
+            try {
+                state.captureTarget?.releasePointerCapture?.(state.pointerId);
+            } catch {
+                // 忽略 pointer capture 已释放的情况。
+            }
+
+            window.removeEventListener('pointermove', this.onResizePointerMove, true);
+            window.removeEventListener('pointerup', this.onResizePointerEnd, true);
+            window.removeEventListener('pointercancel', this.onResizePointerCancel, true);
+
+            this.host?.removeAttribute('data-resizing');
+            if (this.rootStyleBeforeResize) {
+                document.documentElement.style.userSelect = this.rootStyleBeforeResize.userSelect;
+                document.documentElement.style.cursor = this.rootStyleBeforeResize.cursor;
+            }
+            this.rootStyleBeforeResize = null;
+            this.resizeState = null;
+
+            if (state.moved && !cancelled) {
+                this.ensurePanelSizeInViewport(false);
+                this.ensureManualPositionInViewport(true);
+                this.writeSizeState();
+            }
+
+            this.resumeTransientAutoCollapse(event.clientX, event.clientY);
+        }
+
+        resumeTransientAutoCollapse(clientX, clientY) {
+            if (!this.transientHoverOpen || this.collapsed || this.dragState || this.resizeState) {
+                return;
+            }
+
+            const rect = this.panel?.getBoundingClientRect();
+            const pointInside = rect && Number.isFinite(clientX) && Number.isFinite(clientY)
+                ? clientX >= rect.left && clientX <= rect.right &&
+                clientY >= rect.top && clientY <= rect.bottom
+                : false;
+            if (!pointInside && !this.panel?.matches(':hover')) this.scheduleHoverCollapse();
         }
 
         clampPosition(left, top, width, height) {
@@ -1057,7 +1913,6 @@
             if (rect.width <= 0 || rect.height <= 0) return;
 
             this.host.dataset.dockSide = this.getWidgetDockSide(rect);
-
             const clamped = this.clampPosition(
                 rect.left,
                 rect.top,
@@ -1065,78 +1920,6 @@
                 rect.height,
             );
             this.setManualPosition(clamped.left, clamped.top, persist);
-        }
-
-        readCollapsedState() {
-            if (!this.config.answerTocRememberCollapsedState) {
-                return this.config.answerTocInitiallyCollapsed;
-            }
-
-            try {
-                const stored = localStorage.getItem('cgpt-answer-toc-collapsed');
-                if (stored === '1') return true;
-                if (stored === '0') return false;
-            } catch {
-                // 某些严格隐私模式可能阻止 localStorage。
-            }
-
-            return this.config.answerTocInitiallyCollapsed;
-        }
-
-        writeCollapsedState() {
-            if (!this.config.answerTocRememberCollapsedState) return;
-
-            try {
-                localStorage.setItem('cgpt-answer-toc-collapsed', this.collapsed ? '1' : '0');
-            } catch {
-                // 忽略存储不可用的情况。
-            }
-        }
-
-        setCollapsed(collapsed) {
-            const nextCollapsed = Boolean(collapsed);
-            if (nextCollapsed === this.collapsed) return;
-
-            this.cancelHoverExpand();
-
-            /*
-             * 手动定位时，先记录当前可见控件更靠近视口的哪一侧。
-             * 随后无论从面板变成按钮，还是从按钮恢复面板，都从同侧展开/收起。
-             */
-            const edgeAnchor = this.captureWidgetEdgeAnchor();
-
-            this.collapsed = nextCollapsed;
-            this.writeCollapsedState();
-            this.applyCollapsedState();
-
-            /*
-             * 立即对齐可避免切换后的第一帧短暂出现在错误一侧；
-             * 下一帧再校正一次，以兼容浏览器延迟应用布局的情况。
-             */
-            if (edgeAnchor) {
-                this.alignManualWidgetToEdgeAnchor(edgeAnchor, false);
-            }
-
-            window.requestAnimationFrame(() => {
-                if (edgeAnchor) {
-                    this.alignManualWidgetToEdgeAnchor(edgeAnchor, true);
-                } else {
-                    this.ensureManualPositionInViewport(true);
-                }
-
-                if (!this.collapsed && this.itemButtons[this.activeIndex]) {
-                    const current = this.itemButtons[this.activeIndex];
-                    if (current) this.scrollTocItemIntoView(current);
-                }
-            });
-        }
-
-        applyCollapsedState() {
-            if (!this.launcher || !this.panel) return;
-
-            this.launcher.hidden = !this.collapsed;
-            this.panel.hidden = this.collapsed;
-            this.launcher.setAttribute('aria-expanded', String(!this.collapsed));
         }
 
         onScroll(event) {
@@ -1167,13 +1950,14 @@
                 this.currentScrollRoot = this.findScrollRoot(this.currentAnswer);
             }
 
-            if (this.positionMode === 'manual') {
-                window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+                this.ensurePanelSizeInViewport(true);
+                if (this.positionMode === 'manual') {
                     this.ensureManualPositionInViewport(true);
-                });
-            } else {
-                this.updateInlineEndOffset();
-            }
+                } else {
+                    this.updateInlineEndOffset();
+                }
+            });
 
             this.syncVisibility();
             this.requestFrame(true);
@@ -1183,19 +1967,25 @@
             if (event.altKey && event.shiftKey && event.code === 'KeyO') {
                 if (!this.host?.hidden) {
                     event.preventDefault();
-                    this.setCollapsed(!this.collapsed);
+                    this.setCollapsed(!this.collapsed, { source: 'keyboard', persist: true });
                 }
                 return;
             }
 
             if (event.key === 'Escape' && !this.collapsed) {
                 const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
-                if (this.host && path.includes(this.host)) this.setCollapsed(true);
+                if (this.host && path.includes(this.host)) {
+                    this.setCollapsed(true, { source: 'keyboard', persist: true });
+                }
             }
         }
 
         onVisibilityChange() {
-            if (!document.hidden) this.requestFrame(true);
+            if (!document.hidden) {
+                this.syncOfficialConversationNav();
+                this.refreshConversationTocIfNeeded();
+                this.requestFrame(true);
+            }
         }
 
         onRouteSignal() {
@@ -1205,9 +1995,14 @@
 
         resetForNavigation() {
             this.lastUrl = location.href;
+            this.cancelConversationJump();
+            this.conversationLabelCache.clear();
             this.disconnectCurrentAnswer();
             this.clearToc();
+            this.clearConversationToc();
             this.bindMainObserver();
+            this.syncOfficialConversationNav();
+            this.scheduleConversationRebuild(80);
             this.updateInlineEndOffset();
             this.requestFrame(true);
         }
@@ -1215,6 +2010,7 @@
         bindMainObserver() {
             const conversationAnchor =
                 document.querySelector('[data-message-author-role="assistant"]') ||
+                document.querySelector('[data-message-author-role="user"]') ||
                 document.querySelector('[data-composer-surface="true"], #prompt-textarea');
             const main = conversationAnchor?.closest('main') || document.querySelector('main');
             if (!main) {
@@ -1232,12 +2028,19 @@
                 childList: true,
                 subtree: true,
             });
+            this.scheduleConversationRebuild(60);
+        }
+
+        nodeMatchesOrContains(node, selector) {
+            return node instanceof Element && (
+                node.matches?.(selector) || Boolean(node.querySelector?.(selector))
+            );
         }
 
         onMainMutations(records) {
             let assistantAdded = false;
+            let conversationChanged = false;
 
-            recordLoop:
             for (const record of records) {
                 if (
                     this.currentAnswer?.isConnected &&
@@ -1247,15 +2050,15 @@
                     continue;
                 }
 
-                for (const node of record.addedNodes) {
-                    if (!(node instanceof Element)) continue;
-
-                    if (
-                        node.matches?.('[data-message-author-role="assistant"]') ||
-                        node.querySelector?.('[data-message-author-role="assistant"]')
-                    ) {
+                for (const node of [...record.addedNodes, ...record.removedNodes]) {
+                    if (this.nodeMatchesOrContains(node, '[data-message-author-role="assistant"]')) {
                         assistantAdded = true;
-                        break recordLoop;
+                    }
+                    if (
+                        this.nodeMatchesOrContains(node, '[data-message-author-role="user"]') ||
+                        this.nodeMatchesOrContains(node, 'button[data-toc-item-index]')
+                    ) {
+                        conversationChanged = true;
                     }
                 }
             }
@@ -1266,6 +2069,7 @@
                 assistantAdded = true;
             }
 
+            if (conversationChanged) this.scheduleConversationRebuild();
             if (assistantAdded) this.requestFrame(true);
         }
 
@@ -1295,10 +2099,6 @@
                     this.lastAnswerDetectionAt = timestamp;
                     this.detectCurrentAnswer();
                 } else {
-                    /*
-                     * 保留一次尾随检测。否则单次大幅跳转恰好落在节流窗口内时，
-                     * 如果之后没有新的 scroll 事件，目录会暂时停留在旧回答。
-                     */
                     window.clearTimeout(this.answerDetectionTimer);
                     this.answerDetectionTimer = window.setTimeout(() => {
                         this.answerDetectionTimer = 0;
@@ -1351,7 +2151,6 @@
                 }
             };
 
-            /* 主内容通常位于视口中线；只有中线被遮挡时才取两侧后备点。 */
             sampleAtX(0.5);
             if (scores.size === 0) {
                 sampleAtX(0.42);
@@ -1360,20 +2159,14 @@
 
             let bestAnswer = null;
             let bestScore = -Infinity;
-
             for (const [answer, score] of scores) {
                 if (score > bestScore) {
                     bestAnswer = answer;
                     bestScore = score;
                 }
             }
-
             if (bestAnswer) return bestAnswer;
 
-            /*
-             * 只有当前回答已离开视口或不存在时，才执行可见区域后备扫描；
-             * 正常滚动路径不会遍历全部历史消息。
-             */
             let currentStillVisible = false;
             if (this.currentAnswer?.isConnected) {
                 const rect = this.currentAnswer.getBoundingClientRect();
@@ -1388,7 +2181,6 @@
                         0,
                         Math.min(rect.bottom, height) - Math.max(rect.top, 0),
                     );
-
                     if (visiblePixels > bestVisiblePixels) {
                         bestVisiblePixels = visiblePixels;
                         bestAnswer = answer;
@@ -1414,6 +2206,8 @@
             });
 
             this.rebuildToc();
+            this.scheduleConversationRebuild(30);
+            this.updateActiveConversation(true);
             this.updateInlineEndOffset();
         }
 
@@ -1450,7 +2244,6 @@
                 const changedNodes = [...record.addedNodes, ...record.removedNodes];
                 for (const node of changedNodes) {
                     if (!(node instanceof Element)) continue;
-
                     if (
                         node.matches?.(this.config.answerTocHeadingSelector) ||
                         node.querySelector?.(this.config.answerTocHeadingSelector)
@@ -1459,7 +2252,6 @@
                         break;
                     }
                 }
-
                 if (touchesHeading) break;
             }
 
@@ -1498,14 +2290,14 @@
                     continue;
                 }
 
-                const fullLabel = this.normalizeHeadingText(element.textContent ?? '');
+                const fullLabel = this.normalizeText(element.textContent ?? '');
                 if (!fullLabel) continue;
 
                 headings.push({
                     element,
                     level: Number.parseInt(element.tagName.slice(1), 10) || 2,
                     fullLabel,
-                    label: this.truncateLabel(fullLabel),
+                    label: this.truncateLabel(fullLabel, this.config.answerTocMaxLabelLength, 180),
                 });
             }
 
@@ -1515,6 +2307,7 @@
             const nextActiveIndex = this.findActiveIndexBinary();
             this.activeIndex = -1;
             this.applyActiveIndex(nextActiveIndex, false);
+            this.updateViewMeta();
             this.syncVisibility();
         }
 
@@ -1536,14 +2329,23 @@
             }
         }
 
-        normalizeHeadingText(text) {
-            return text.replace(/\s+/g, ' ').trim();
+        normalizeText(text) {
+            return String(text).replace(/\s+/g, ' ').trim();
         }
 
-        truncateLabel(label) {
-            const max = this.config.answerTocMaxLabelLength;
+        truncateLabel(label, configuredMax, fallback) {
+            const max = Math.max(20, Number(configuredMax) || fallback);
             if (label.length <= max) return label;
             return `${label.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
+        }
+
+        formatConversationLabel(label) {
+            const configuredMax = Number(this.config.conversationTocMaxLabelLength);
+
+            // 0 或负数代表不按字符数截断。
+            if (Number.isFinite(configuredMax) && configuredMax <= 0) return label;
+
+            return this.truncateLabel(label, configuredMax, 120);
         }
 
         renderTocItems() {
@@ -1559,6 +2361,7 @@
 
                 button.type = 'button';
                 button.className = 'toc-item';
+                button.dataset.kind = 'heading';
                 button.dataset.headingIndex = String(index);
                 button.dataset.level = String(heading.level);
                 button.dataset.active = 'false';
@@ -1574,10 +2377,7 @@
             });
 
             this.list.replaceChildren(fragment);
-
-            const count = this.headings.length;
-            if (this.countLabel) this.countLabel.textContent = `${count} 节`;
-            if (this.launcherCount) this.launcherCount.textContent = String(count);
+            this.updateViewMeta();
         }
 
         clearToc() {
@@ -1585,9 +2385,771 @@
             this.itemButtons = [];
             this.activeIndex = -1;
             this.list?.replaceChildren();
-            if (this.countLabel) this.countLabel.textContent = '0 节';
-            if (this.launcherCount) this.launcherCount.textContent = '0';
+            this.updateViewMeta();
             this.syncVisibility();
+        }
+
+        getConversationTurnElement(element) {
+            return element instanceof Element
+                ? element.closest('[data-testid^="conversation-turn-"]')
+                : null;
+        }
+
+        getConversationTurnNumber(element) {
+            const turn = this.getConversationTurnElement(element);
+            const testId = turn?.getAttribute('data-testid') || '';
+            const match = /^conversation-turn-(\d+)$/.exec(testId);
+            if (!match) return null;
+
+            const number = Number.parseInt(match[1], 10);
+            return Number.isInteger(number) && number >= 0 ? number : null;
+        }
+
+        getConversationRecordIdentity(element, fallbackIndex = 0) {
+            const turn = this.getConversationTurnElement(element);
+            const testId = turn?.getAttribute('data-testid') || '';
+            if (testId) return testId;
+
+            const messageId =
+                element?.getAttribute?.('data-message-id') ||
+                element?.closest?.('[data-message-id]')?.getAttribute('data-message-id') ||
+                turn?.querySelector?.('[data-message-id]')?.getAttribute('data-message-id') ||
+                '';
+            return messageId ? `message:${messageId}` : `user-node:${fallbackIndex}`;
+        }
+
+        getUserMessageElements() {
+            const candidates = [...document.querySelectorAll(USER_SELECTOR)].filter((element) => {
+                if (!(element instanceof HTMLElement) || !element.isConnected) return false;
+                if (element.parentElement?.closest('[data-message-author-role="user"]')) return false;
+                if (element.closest('[hidden]')) return false;
+                return true;
+            });
+
+            /*
+             * 响应式布局或分支切换期间可能同时存在同一轮次的多个副本。
+             * 每个 conversation-turn 仅保留“可见且文本更完整”的那个节点。
+             */
+            const bestByIdentity = new Map();
+            candidates.forEach((element, index) => {
+                const identity = this.getConversationRecordIdentity(element, index);
+                const textLength = (element.textContent ?? '').trim().length;
+                const hiddenPenalty = element.closest('[aria-hidden="true"]') ? 0 : 1_000_000;
+                const score = hiddenPenalty + textLength;
+                const current = bestByIdentity.get(identity);
+                if (!current || score > current.score) {
+                    bestByIdentity.set(identity, { element, score });
+                }
+            });
+
+            return [...bestByIdentity.values()]
+                .map((entry) => entry.element)
+                .sort((a, b) => {
+                    if (a === b) return 0;
+                    const relation = a.compareDocumentPosition(b);
+                    if (relation & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                    if (relation & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                    return 0;
+                });
+        }
+
+        normalizeConversationText(text) {
+            return String(text)
+                .replace(/\r\n?/g, '\n')
+                .replace(/[^\S\n]+/g, ' ')
+                .replace(/ *\n */g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+        }
+
+        extractUserPromptText(element) {
+            const source =
+                element.querySelector('[data-message-content]') ||
+                element.querySelector('.whitespace-pre-wrap') ||
+                element.querySelector('.markdown') ||
+                element;
+
+            const clone = source.cloneNode(true);
+            if (clone instanceof Element) {
+                for (const removable of clone.querySelectorAll(
+                    'button, script, style, svg, [aria-hidden="true"], [role="tooltip"]',
+                )) {
+                    removable.remove();
+                }
+            }
+
+            return this.normalizeConversationText(clone.textContent ?? '')
+                .replace(/^(?:You said:|你说[:：])\s*/i, '')
+                .trim();
+        }
+
+        collectUserMessageRecords() {
+            return this.getUserMessageElements().map((userElement, index) => ({
+                userElement,
+                targetElement: this.getConversationTurnElement(userElement) || userElement,
+                turnNumber: this.getConversationTurnNumber(userElement),
+                identity: this.getConversationRecordIdentity(userElement, index),
+                fullLabel: this.extractUserPromptText(userElement),
+                ariaHidden: Boolean(userElement.closest('[aria-hidden="true"]')),
+            }));
+        }
+
+        getOfficialNavButtons() {
+            return [...document.querySelectorAll('button[data-toc-item-index]')]
+                .filter((button) => button instanceof HTMLButtonElement && button.isConnected)
+                .sort((a, b) => {
+                    const ai = Number.parseInt(a.dataset.tocItemIndex ?? '', 10);
+                    const bi = Number.parseInt(b.dataset.tocItemIndex ?? '', 10);
+                    return (Number.isFinite(ai) ? ai : 0) - (Number.isFinite(bi) ? bi : 0);
+                });
+        }
+
+        getOfficialActiveLogicalIndex(buttons = this.getOfficialNavButtons()) {
+            const activeButton = buttons.find((button) => button.hasAttribute('data-toc-active'));
+            const index = Number.parseInt(activeButton?.dataset.tocItemIndex ?? '', 10);
+            return Number.isInteger(index) && index >= 0 ? index : -1;
+        }
+
+        findFixedAncestor(element) {
+            for (let current = element?.parentElement; current; current = current.parentElement) {
+                if (
+                    getComputedStyle(current).position === 'fixed' ||
+                    current.classList.contains('fixed')
+                ) {
+                    return current;
+                }
+            }
+            return null;
+        }
+
+        syncOfficialConversationNav() {
+            const buttons = this.getOfficialNavButtons();
+            const container = buttons.length ? this.findFixedAncestor(buttons[0]) : null;
+
+            if (
+                this.officialNavContainer &&
+                this.officialNavContainer !== container &&
+                this.officialNavContainer.isConnected
+            ) {
+                this.officialNavContainer.removeAttribute(
+                    'data-cgpt-native-conversation-toc-hidden',
+                );
+            }
+
+            this.officialNavContainer = container;
+            if (container) {
+                if (this.config.hideOfficialConversationToc) {
+                    container.setAttribute('data-cgpt-native-conversation-toc-hidden', '');
+                } else {
+                    container.removeAttribute('data-cgpt-native-conversation-toc-hidden');
+                }
+            }
+
+            return buttons;
+        }
+
+        getConversationSignature() {
+            const users = this.getUserMessageElements();
+            const buttons = this.getOfficialNavButtons();
+            const currentAnswerIdentity = this.currentAnswer?.closest?.(
+                '[data-testid^="conversation-turn-"]',
+            )?.getAttribute('data-testid') || '';
+            const userSignature = users.map((element, index) => {
+                const text = (element.textContent ?? '').trim();
+                const identity = this.getConversationRecordIdentity(element, index);
+                return `${identity}:${text.length}:${text.slice(0, 16)}:${text.slice(-16)}`;
+            }).join('|');
+            const buttonSignature = buttons.map((button) => {
+                const index = button.dataset.tocItemIndex ?? '?';
+                const active = button.hasAttribute('data-toc-active') ? 'a' : '';
+                return `${index}${active}`;
+            }).join(',');
+            return `${currentAnswerIdentity}||${userSignature}||${buttonSignature}`;
+        }
+
+        refreshConversationTocIfNeeded() {
+            const signature = this.getConversationSignature();
+            if (signature !== this.lastConversationSignature) {
+                this.scheduleConversationRebuild(40);
+            }
+        }
+
+        scheduleConversationRebuild(delay = 120) {
+            window.clearTimeout(this.conversationRebuildTimer);
+            this.conversationRebuildTimer = window.setTimeout(() => {
+                this.conversationRebuildTimer = 0;
+                this.rebuildConversationToc();
+            }, Math.max(0, Number(delay) || 0));
+        }
+
+        findCurrentPromptRecordIndex(records) {
+            if (!this.currentAnswer?.isConnected || !records.length) return -1;
+
+            let bestIndex = -1;
+            for (let index = 0; index < records.length; index += 1) {
+                const userElement = records[index].userElement;
+                if (!userElement?.isConnected) continue;
+
+                const relation = userElement.compareDocumentPosition(this.currentAnswer);
+                if (relation & Node.DOCUMENT_POSITION_FOLLOWING) {
+                    bestIndex = index;
+                } else if (relation & Node.DOCUMENT_POSITION_PRECEDING) {
+                    break;
+                }
+            }
+            return bestIndex;
+        }
+
+        findViewportPromptRecordIndex(records) {
+            if (!records.length) return -1;
+            const lineY = this.getActiveLineViewportY();
+            let bestIndex = -1;
+            let bestDistance = Number.POSITIVE_INFINITY;
+
+            records.forEach((record, index) => {
+                const target = record.targetElement || record.userElement;
+                if (!(target instanceof HTMLElement) || !target.isConnected) return;
+                const rect = target.getBoundingClientRect();
+                const distance = rect.top <= lineY && rect.bottom >= lineY
+                    ? 0
+                    : Math.min(Math.abs(rect.top - lineY), Math.abs(rect.bottom - lineY));
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = index;
+                }
+            });
+            return bestIndex;
+        }
+
+        getUserTurnStride(records) {
+            const numbers = records
+                .map((record) => record.turnNumber)
+                .filter((number) => Number.isInteger(number));
+            if (numbers.length < 2) return 2;
+
+            const parity = numbers[0] % 2;
+            return numbers.every((number) => number % 2 === parity) ? 2 : 1;
+        }
+
+        validateRecordIndexMapping(indices, maxOfficialIndex) {
+            if (!indices.length) return false;
+            const seen = new Set();
+            let previous = -1;
+
+            for (const index of indices) {
+                if (!Number.isInteger(index) || index < 0) return false;
+                if (maxOfficialIndex >= 0 && index > maxOfficialIndex) return false;
+                if (seen.has(index) || index <= previous) return false;
+                seen.add(index);
+                previous = index;
+            }
+            return true;
+        }
+
+        mapUserRecordsToLogicalIndices(records, officialButtons) {
+            const buttonsByIndex = new Map();
+            let maxOfficialIndex = -1;
+
+            for (const button of officialButtons) {
+                const logicalIndex = Number.parseInt(button.dataset.tocItemIndex ?? '', 10);
+                if (!Number.isInteger(logicalIndex) || logicalIndex < 0) continue;
+                if (!buttonsByIndex.has(logicalIndex)) buttonsByIndex.set(logicalIndex, button);
+                maxOfficialIndex = Math.max(maxOfficialIndex, logicalIndex);
+            }
+
+            const officialIndices = [...buttonsByIndex.keys()].sort((a, b) => a - b);
+            const officialCount = officialIndices.length;
+            const activeLogicalIndex = this.getOfficialActiveLogicalIndex(officialButtons);
+            const anchorRecordIndex = this.findCurrentPromptRecordIndex(records);
+            const viewportAnchorIndex = this.findViewportPromptRecordIndex(records);
+            const stride = this.getUserTurnStride(records);
+            let mappedIndices = null;
+            let confident = false;
+
+            if (!records.length) {
+                return {
+                    buttonsByIndex,
+                    recordsByIndex: new Map(),
+                    maxIndex: maxOfficialIndex,
+                    confident: true,
+                };
+            }
+
+            if (!officialCount) {
+                mappedIndices = records.map((_, index) => index);
+                confident = true;
+            } else if (records.length === officialCount) {
+                mappedIndices = officialIndices.slice();
+                confident = true;
+            }
+
+            /*
+             * conversation-turn-N 是当前最强的绝对索引信号。优先使用它，
+             * 避免官方 active 状态在快速滚动期间短暂滞后而造成错配。
+             */
+            if (!mappedIndices) {
+                const recordsWithTurns = records.every((record) =>
+                    Number.isInteger(record.turnNumber));
+                if (recordsWithTurns) {
+                    const pairedCandidate = records.map((record) => Math.floor(record.turnNumber / 2));
+                    const directCandidate = records.map((record) => record.turnNumber);
+                    if (this.validateRecordIndexMapping(pairedCandidate, maxOfficialIndex)) {
+                        mappedIndices = pairedCandidate;
+                        confident = true;
+                    } else if (this.validateRecordIndexMapping(directCandidate, maxOfficialIndex)) {
+                        mappedIndices = directCandidate;
+                        confident = true;
+                    }
+                }
+            }
+
+            if (!mappedIndices && activeLogicalIndex >= 0 && anchorRecordIndex >= 0) {
+                const anchorTurn = records[anchorRecordIndex].turnNumber;
+                const candidate = records.map((record, index) => {
+                    if (Number.isInteger(anchorTurn) && Number.isInteger(record.turnNumber)) {
+                        const delta = record.turnNumber - anchorTurn;
+                        if (delta % stride === 0) return activeLogicalIndex + delta / stride;
+                    }
+                    return activeLogicalIndex + index - anchorRecordIndex;
+                });
+                if (this.validateRecordIndexMapping(candidate, maxOfficialIndex)) {
+                    mappedIndices = candidate;
+                    confident = true;
+                }
+            }
+
+            if (!mappedIndices && activeLogicalIndex >= 0 && viewportAnchorIndex >= 0) {
+                const candidate = records.map((_, index) =>
+                    activeLogicalIndex + index - viewportAnchorIndex);
+                if (this.validateRecordIndexMapping(candidate, maxOfficialIndex)) {
+                    mappedIndices = candidate;
+                    confident = true;
+                }
+            }
+
+            if (!mappedIndices) {
+                const offset = Math.max(0, maxOfficialIndex + 1 - records.length);
+                mappedIndices = records.map((_, index) => index + offset);
+                confident = false;
+            }
+
+            const recordsByIndex = new Map();
+            mappedIndices.forEach((logicalIndex, recordIndex) => {
+                if (!Number.isInteger(logicalIndex) || logicalIndex < 0) return;
+                if (maxOfficialIndex >= 0 && logicalIndex > maxOfficialIndex) return;
+                const record = records[recordIndex];
+                if (!record) return;
+
+                const previous = recordsByIndex.get(logicalIndex);
+                if (!previous) {
+                    recordsByIndex.set(logicalIndex, record);
+                    return;
+                }
+
+                const previousScore = (previous.ariaHidden ? 0 : 1_000_000) + previous.fullLabel.length;
+                const nextScore = (record.ariaHidden ? 0 : 1_000_000) + record.fullLabel.length;
+                if (nextScore > previousScore) recordsByIndex.set(logicalIndex, record);
+            });
+
+            let maxMappedIndex = -1;
+            for (const index of recordsByIndex.keys()) {
+                maxMappedIndex = Math.max(maxMappedIndex, index);
+            }
+
+            return {
+                buttonsByIndex,
+                recordsByIndex,
+                maxIndex: Math.max(maxOfficialIndex, maxMappedIndex),
+                confident,
+            };
+        }
+
+        rebuildConversationToc() {
+            if (!this.config.enableConversationToc) {
+                this.clearConversationToc();
+                return;
+            }
+
+            const records = this.collectUserMessageRecords();
+            const officialButtons = this.syncOfficialConversationNav();
+            const mapping = this.mapUserRecordsToLogicalIndices(records, officialButtons);
+            const items = [];
+
+            for (const [logicalIndex, record] of mapping.recordsByIndex) {
+                if (record.fullLabel && mapping.confident) {
+                    this.conversationLabelCache.set(logicalIndex, record.fullLabel);
+                }
+            }
+
+            const knownIndices = new Set([
+                ...mapping.buttonsByIndex.keys(),
+                ...mapping.recordsByIndex.keys(),
+                ...this.conversationLabelCache.keys(),
+            ]);
+            const maxKnownIndex = knownIndices.size ? Math.max(...knownIndices) : -1;
+            const maxIndex = Math.max(mapping.maxIndex, maxKnownIndex);
+
+            for (let logicalIndex = 0; logicalIndex <= maxIndex; logicalIndex += 1) {
+                const record = mapping.recordsByIndex.get(logicalIndex) ?? null;
+                const officialButton = mapping.buttonsByIndex.get(logicalIndex) ?? null;
+                const cachedLabel = this.conversationLabelCache.get(logicalIndex) || '';
+                if (!record && !officialButton && !cachedLabel) continue;
+
+                const fullLabel =
+                    record?.fullLabel ||
+                    cachedLabel ||
+                    officialButton?.getAttribute('aria-label') ||
+                    `提问 ${logicalIndex + 1}`;
+
+                items.push({
+                    logicalIndex,
+                    userElement: record?.userElement ?? null,
+                    targetElement: record?.targetElement ?? null,
+                    officialButton,
+                    fullLabel,
+                    label: this.formatConversationLabel(fullLabel),
+                    mappingConfident: mapping.confident,
+                });
+            }
+
+            this.conversationItems = items;
+            this.lastConversationSignature = this.getConversationSignature();
+            this.renderConversationItems();
+            const active = this.findActiveConversationIndex();
+            this.activeConversationIndex = -1;
+            this.applyActiveConversationIndex(active, false);
+            this.updateViewMeta();
+            this.syncVisibility();
+        }
+
+        renderConversationItems() {
+            if (!this.conversationList) return;
+
+            const fragment = document.createDocumentFragment();
+            this.conversationItemButtons = [];
+
+            this.conversationItems.forEach((conversation, index) => {
+                const item = document.createElement('li');
+                const button = document.createElement('button');
+                const number = document.createElement('span');
+                const label = document.createElement('span');
+
+                button.type = 'button';
+                button.className = 'toc-item';
+                button.dataset.kind = 'conversation';
+                button.dataset.conversationIndex = String(index);
+                button.dataset.active = 'false';
+                button.title = conversation.fullLabel;
+
+                number.className = 'prompt-index';
+                number.textContent = String(conversation.logicalIndex + 1);
+                label.className = 'toc-item-label';
+                label.textContent = conversation.label;
+
+                button.append(number, label);
+                item.appendChild(button);
+                fragment.appendChild(item);
+                this.conversationItemButtons.push(button);
+            });
+
+            this.conversationList.replaceChildren(fragment);
+            this.updateViewMeta();
+        }
+
+        clearConversationToc(clearCache = false) {
+            window.clearTimeout(this.conversationRebuildTimer);
+            this.conversationRebuildTimer = 0;
+            this.conversationItems = [];
+            this.conversationItemButtons = [];
+            this.activeConversationIndex = -1;
+            this.lastConversationSignature = '';
+            this.pendingConversationLogicalIndex = -1;
+            this.pendingConversationUntil = 0;
+            if (clearCache) this.conversationLabelCache.clear();
+            this.conversationList?.replaceChildren();
+            this.updateViewMeta();
+            this.syncVisibility();
+        }
+
+        findActiveConversationIndex() {
+            if (!this.conversationItems.length) return -1;
+
+            if (
+                this.pendingConversationLogicalIndex >= 0 &&
+                performance.now() < this.pendingConversationUntil
+            ) {
+                const pendingIndex = this.conversationItems.findIndex(
+                    (item) => item.logicalIndex === this.pendingConversationLogicalIndex,
+                );
+                if (pendingIndex >= 0) return pendingIndex;
+            }
+
+            if (this.currentAnswer?.isConnected) {
+                let best = -1;
+                for (let index = 0; index < this.conversationItems.length; index += 1) {
+                    const userElement = this.conversationItems[index].userElement;
+                    if (!userElement?.isConnected) continue;
+
+                    const relation = userElement.compareDocumentPosition(this.currentAnswer);
+                    if (relation & Node.DOCUMENT_POSITION_FOLLOWING) {
+                        best = index;
+                    } else if (relation & Node.DOCUMENT_POSITION_PRECEDING) {
+                        break;
+                    }
+                }
+                if (best >= 0) return best;
+            }
+
+            const officialActiveLogicalIndex = this.getOfficialActiveLogicalIndex();
+            if (officialActiveLogicalIndex >= 0) {
+                const officialActiveIndex = this.conversationItems.findIndex(
+                    (item) => item.logicalIndex === officialActiveLogicalIndex,
+                );
+                if (officialActiveIndex >= 0) return officialActiveIndex;
+            }
+
+            if (
+                this.activeConversationIndex >= 0 &&
+                this.activeConversationIndex < this.conversationItems.length
+            ) {
+                return this.activeConversationIndex;
+            }
+
+            return 0;
+        }
+
+        updateActiveConversation(force = false) {
+            const index = this.findActiveConversationIndex();
+            this.applyActiveConversationIndex(index, force);
+        }
+
+        applyActiveConversationIndex(index, ensureVisible) {
+            if (
+                !Number.isInteger(index) ||
+                index < 0 ||
+                index >= this.conversationItemButtons.length
+            ) {
+                return;
+            }
+            if (this.activeConversationIndex === index && !ensureVisible) return;
+
+            const previous = this.conversationItemButtons[this.activeConversationIndex];
+            if (previous) {
+                previous.dataset.active = 'false';
+                previous.removeAttribute('aria-current');
+            }
+
+            this.activeConversationIndex = index;
+            const current = this.conversationItemButtons[index];
+            if (!current) return;
+
+            current.dataset.active = 'true';
+            current.setAttribute('aria-current', 'location');
+            if (ensureVisible || (!this.collapsed && this.activeView === 'conversation')) {
+                this.scrollItemIntoView(this.conversationNav, current);
+            }
+        }
+
+        clearConversationJumpReveal() {
+            window.clearTimeout(this.conversationJumpRevealTimer);
+            this.conversationJumpRevealTimer = 0;
+            if (this.conversationJumpRevealElement?.isConnected) {
+                this.conversationJumpRevealElement.removeAttribute(
+                    'data-cgpt-conversation-jump-target',
+                );
+            }
+            this.conversationJumpRevealElement = null;
+        }
+
+        revealConversationJumpTarget(target) {
+            if (!(target instanceof HTMLElement)) return;
+            if (this.conversationJumpRevealElement !== target) {
+                this.clearConversationJumpReveal();
+            }
+            this.conversationJumpRevealElement = target;
+            target.setAttribute('data-cgpt-conversation-jump-target', '');
+            window.clearTimeout(this.conversationJumpRevealTimer);
+            this.conversationJumpRevealTimer = window.setTimeout(() => {
+                this.clearConversationJumpReveal();
+            }, 2400);
+        }
+
+        cancelConversationJump() {
+            this.conversationJumpToken += 1;
+            for (const timer of this.conversationJumpTimers) window.clearTimeout(timer);
+            this.conversationJumpTimers.clear();
+            this.pendingConversationLogicalIndex = -1;
+            this.pendingConversationUntil = 0;
+            this.clearConversationJumpReveal();
+        }
+
+        scheduleConversationJumpTask(callback, delay, token) {
+            const timer = window.setTimeout(() => {
+                this.conversationJumpTimers.delete(timer);
+                if (token !== this.conversationJumpToken) return;
+                callback();
+            }, Math.max(0, Number(delay) || 0));
+            this.conversationJumpTimers.add(timer);
+            return timer;
+        }
+
+        resolveConversationTarget(logicalIndex) {
+            const currentItem = this.conversationItems.find(
+                (item) => item.logicalIndex === logicalIndex,
+            );
+            if (
+                currentItem?.mappingConfident &&
+                currentItem.targetElement?.isConnected
+            ) {
+                return currentItem.targetElement;
+            }
+
+            const records = this.collectUserMessageRecords();
+            const mapping = this.mapUserRecordsToLogicalIndices(
+                records,
+                this.getOfficialNavButtons(),
+            );
+            const record = mapping.recordsByIndex.get(logicalIndex);
+            if (!record || !mapping.confident) return null;
+
+            if (record.fullLabel) {
+                this.conversationLabelCache.set(logicalIndex, record.fullLabel);
+            }
+            if (currentItem) {
+                currentItem.userElement = record.userElement;
+                currentItem.targetElement = record.targetElement;
+                currentItem.fullLabel = record.fullLabel || currentItem.fullLabel;
+                currentItem.label = this.formatConversationLabel(currentItem.fullLabel);
+                currentItem.mappingConfident = true;
+            }
+            return record.targetElement || record.userElement;
+        }
+
+        isUsableConversationTarget(element) {
+            if (!(element instanceof HTMLElement) || !element.isConnected) return false;
+            if (element.closest('[hidden]')) return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 || rect.height > 0 || element.getClientRects().length > 0;
+        }
+
+        getConversationJumpBehavior() {
+            const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+            return this.config.answerTocSmoothScroll && !reduceMotion ? 'smooth' : 'auto';
+        }
+
+        getConversationScrollOffset() {
+            return Math.max(
+                0,
+                Number(this.config.conversationTocScrollOffsetPx) || 88,
+            );
+        }
+
+        scrollConversationTarget(target, behavior = 'auto') {
+            if (!this.isUsableConversationTarget(target)) return false;
+            this.revealConversationJumpTarget(target);
+
+            const targetRect = target.getBoundingClientRect();
+            const offset = this.getConversationScrollOffset();
+            const scrollRoot = this.findScrollRoot(target);
+
+            if (scrollRoot instanceof HTMLElement) {
+                const rootRect = scrollRoot.getBoundingClientRect();
+                const visibleTop = Math.max(0, rootRect.top);
+                const visibleBottom = Math.min(window.innerHeight, rootRect.bottom);
+                const availableHeight = Math.max(1, visibleBottom - visibleTop);
+                const desiredTop = visibleTop + Math.min(offset, availableHeight * 0.3);
+                const delta = targetRect.top - desiredTop;
+                scrollRoot.scrollBy({ top: delta, behavior });
+            } else {
+                const desiredTop = Math.min(offset, window.innerHeight * 0.3);
+                const delta = targetRect.top - desiredTop;
+                window.scrollBy({ top: delta, behavior });
+            }
+            return true;
+        }
+
+        correctConversationTargetPosition(target) {
+            return this.scrollConversationTarget(target, 'auto');
+        }
+
+        activateOfficialConversationButton(logicalIndex) {
+            const button = this.getOfficialNavButtons().find((candidate) => (
+                Number.parseInt(candidate.dataset.tocItemIndex ?? '', 10) === logicalIndex
+            ));
+            if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
+
+            try {
+                button.click();
+                return true;
+            } catch (error) {
+                console.warn('[ChatGPT 双层目录] 官方问答跳转失败：', error);
+                return false;
+            }
+        }
+
+        jumpToConversation(index) {
+            const item = this.conversationItems[index];
+            if (!item) return;
+
+            this.cancelConversationJump();
+            const token = this.conversationJumpToken;
+            const logicalIndex = item.logicalIndex;
+            this.pendingConversationLogicalIndex = logicalIndex;
+            this.pendingConversationUntil = performance.now() + 2600;
+            this.applyActiveConversationIndex(index, true);
+
+            const initialTarget = this.resolveConversationTarget(logicalIndex);
+            const canDirectlyScroll = this.isUsableConversationTarget(initialTarget);
+
+            if (canDirectlyScroll) {
+                this.scrollConversationTarget(
+                    initialTarget,
+                    this.getConversationJumpBehavior(),
+                );
+
+                for (const delay of [460, 980, 1700]) {
+                    this.scheduleConversationJumpTask(() => {
+                        const liveTarget = this.resolveConversationTarget(logicalIndex) || initialTarget;
+                        this.correctConversationTargetPosition(liveTarget);
+                        this.requestFrame(true);
+                    }, delay, token);
+                }
+            } else {
+                const activated = this.activateOfficialConversationButton(logicalIndex);
+
+                for (const delay of [100, 280, 620, 1150, 1950]) {
+                    this.scheduleConversationJumpTask(() => {
+                        this.syncOfficialConversationNav();
+                        this.scheduleConversationRebuild(0);
+                        this.requestFrame(true);
+
+                        const liveTarget = this.resolveConversationTarget(logicalIndex);
+                        if (this.isUsableConversationTarget(liveTarget)) {
+                            this.correctConversationTargetPosition(liveTarget);
+                            return;
+                        }
+
+                        /* React 若替换了官方按钮，在中段再解析并补点一次。 */
+                        if (activated && delay === 620) {
+                            const activeLogicalIndex = this.getOfficialActiveLogicalIndex();
+                            if (activeLogicalIndex !== logicalIndex) {
+                                this.activateOfficialConversationButton(logicalIndex);
+                            }
+                        }
+                    }, delay, token);
+                }
+            }
+
+            this.scheduleConversationJumpTask(() => {
+                this.pendingConversationLogicalIndex = -1;
+                this.pendingConversationUntil = 0;
+                this.requestFrame(true);
+                window.setTimeout(() => {
+                    if (token === this.conversationJumpToken) {
+                        this.clearConversationJumpReveal();
+                    }
+                }, 240);
+            }, 2250, token);
         }
 
         isViewportEligible() {
@@ -1601,18 +3163,34 @@
             if (!this.host) return;
 
             const wasHidden = this.host.hidden;
-            this.host.hidden = !this.isViewportEligible() || this.headings.length === 0;
+            const hasAnyNavigation =
+                this.conversationItems.length > 0 || this.headings.length > 0;
+            this.host.hidden = !this.isViewportEligible() || !hasAnyNavigation;
+
+            if (this.host.hidden && this.transientHoverOpen) {
+                this.transientHoverOpen = false;
+                this.collapsed = true;
+                this.applyCollapsedState();
+            }
 
             if (!this.host.hidden) {
+                this.applyActiveView();
                 this.applyCollapsedState();
+                this.updateViewMeta();
 
                 if (wasHidden) {
                     window.requestAnimationFrame(() => {
+                        this.ensurePanelSizeInViewport(false);
                         this.ensureManualPositionInViewport(true);
 
-                        if (!this.collapsed && this.itemButtons[this.activeIndex]) {
-                            const current = this.itemButtons[this.activeIndex];
-                            if (current) this.scrollTocItemIntoView(current);
+                        if (!this.collapsed) {
+                            const current = this.activeView === 'conversation'
+                                ? this.conversationItemButtons[this.activeConversationIndex]
+                                : this.itemButtons[this.activeIndex];
+                            const nav = this.activeView === 'conversation'
+                                ? this.conversationNav
+                                : this.tocNav;
+                            if (current) this.scrollItemIntoView(nav, current);
                         }
                     });
                 }
@@ -1624,8 +3202,9 @@
             if (!heading?.element?.isConnected) return;
 
             const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-            const behavior =
-                this.config.answerTocSmoothScroll && !reduceMotion ? 'smooth' : 'auto';
+            const behavior = this.config.answerTocSmoothScroll && !reduceMotion
+                ? 'smooth'
+                : 'auto';
 
             this.applyActiveIndex(index, true);
             heading.element.scrollIntoView({
@@ -1668,7 +3247,6 @@
 
         findActiveIndexBinary(lineY = this.getActiveLineViewportY()) {
             if (!this.headings.length) return -1;
-
             if (this.headings[0].element.getBoundingClientRect().top > lineY) return 0;
 
             let low = 0;
@@ -1694,7 +3272,6 @@
             if (!Number.isInteger(index) || index < 0 || index >= this.itemButtons.length) {
                 return;
             }
-
             if (this.activeIndex === index && !ensureVisible) return;
 
             const previous = this.itemButtons[this.activeIndex];
@@ -1709,23 +3286,23 @@
 
             current.dataset.active = 'true';
             current.setAttribute('aria-current', 'location');
-
-            if (ensureVisible || !this.collapsed) {
-                this.scrollTocItemIntoView(current);
+            if (ensureVisible || (!this.collapsed && this.activeView === 'headings')) {
+                this.scrollItemIntoView(this.tocNav, current);
             }
         }
 
-        scrollTocItemIntoView(button) {
-            if (!(this.tocNav instanceof HTMLElement)) return;
+        scrollItemIntoView(nav, button) {
+            if (!(nav instanceof HTMLElement) || !(button instanceof HTMLElement)) return;
+            if (nav.hidden) return;
 
-            const navRect = this.tocNav.getBoundingClientRect();
+            const navRect = nav.getBoundingClientRect();
             const buttonRect = button.getBoundingClientRect();
             const padding = 5;
 
             if (buttonRect.top < navRect.top + padding) {
-                this.tocNav.scrollTop += buttonRect.top - navRect.top - padding;
+                nav.scrollTop += buttonRect.top - navRect.top - padding;
             } else if (buttonRect.bottom > navRect.bottom - padding) {
-                this.tocNav.scrollTop += buttonRect.bottom - navRect.bottom + padding;
+                nav.scrollTop += buttonRect.bottom - navRect.bottom + padding;
             }
         }
 
@@ -1763,7 +3340,6 @@
             if (this.currentScrollRoot instanceof HTMLElement) {
                 return this.currentScrollRoot.scrollTop;
             }
-
             return window.scrollY || document.documentElement.scrollTop || 0;
         }
 
@@ -1771,43 +3347,46 @@
             if (this.currentScrollRoot instanceof HTMLElement) {
                 return Math.max(1, this.currentScrollRoot.clientHeight);
             }
-
             return Math.max(1, window.innerHeight);
         }
 
         getOfficialNavContainer() {
-            const item = document.querySelector('button[data-toc-item-index]');
-            if (!item) return null;
-
-            for (let element = item.parentElement; element; element = element.parentElement) {
-                if (getComputedStyle(element).position === 'fixed') return element;
-            }
-
-            return null;
+            if (this.officialNavContainer?.isConnected) return this.officialNavContainer;
+            this.syncOfficialConversationNav();
+            return this.officialNavContainer;
         }
 
         updateInlineEndOffset() {
             if (!this.host || this.positionMode === 'manual') return;
 
-            let offset = this.config.answerTocFallbackInlineEndPx;
-            const container = this.getOfficialNavContainer();
+            this.host.dataset.dockSide = 'right';
+            let offset = this.config.hideOfficialConversationToc
+                ? Math.max(0, Number(this.config.answerTocStandaloneInlineEndPx) || 20)
+                : Math.max(0, Number(this.config.answerTocFallbackInlineEndPx) || 68);
 
-            if (container) {
-                const rect = container.getBoundingClientRect();
-                const direction = getComputedStyle(document.documentElement).direction;
-                const occupiedFromInlineEnd = direction === 'rtl'
-                    ? rect.right
-                    : window.innerWidth - rect.left;
+            if (!this.config.hideOfficialConversationToc) {
+                const container = this.getOfficialNavContainer();
+                if (container) {
+                    const rect = container.getBoundingClientRect();
+                    const direction = getComputedStyle(document.documentElement).direction;
+                    const occupiedFromInlineEnd = direction === 'rtl'
+                        ? rect.right
+                        : window.innerWidth - rect.left;
 
-                offset = Math.max(
-                    offset,
-                    Math.ceil(occupiedFromInlineEnd + this.config.answerTocOfficialNavGapPx),
-                );
+                    offset = Math.max(
+                        offset,
+                        Math.ceil(
+                            occupiedFromInlineEnd +
+                            (Number(this.config.answerTocOfficialNavGapPx) || 12),
+                        ),
+                    );
+                }
             }
 
             this.host.style.setProperty('--cgpt-answer-toc-inline-end', `${offset}px`);
         }
     }
+
 
     const startAnswerToc = () => {
         const controller = new AnswerTocController(CONFIG);
