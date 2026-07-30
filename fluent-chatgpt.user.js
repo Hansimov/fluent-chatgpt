@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化与双层导航目录
 // @namespace    local.chatgpt
-// @version      2.4.0
-// @description  优化长对话渲染并提供双层导航；修复虚拟化对话中的提问预览映射和点击跳转
+// @version      2.6.1
+// @description  优化长对话渲染并提供双层导航；四角缩放区域保持可用但不再显示角标
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -64,11 +64,12 @@
         hideOfficialConversationToc: true,
         answerTocInitialView: 'headings', // 可选：'conversation' 或 'headings'
         answerTocRememberView: true,
-        // 问答预览显示的最大行数：0 表示完整显示，不做行数截断。
-        conversationTocPreviewMaxLines: 0,
+        // 问答预览最多显示 3 行；完整提问仍保留在鼠标悬停提示中。
+        // 设为 0 可取消按行限制。
+        conversationTocPreviewMaxLines: 3,
 
-        // 问答预览的最大字符数：0 表示完整显示，不按字符截断。
-        conversationTocMaxLabelLength: 0,
+        // 超长提问最多保留 240 个字符；设为 0 可取消按字符限制。
+        conversationTocMaxLabelLength: 240,
 
         // 问答跳转后，目标提问与滚动视口顶部之间保留的距离。
         conversationTocScrollOffsetPx: 88,
@@ -80,7 +81,7 @@
         answerTocRememberPosition: true,
         answerTocDragViewportMarginPx: 8,
 
-        // 面板缩放范围及尺寸持久化。缩放会自动转为手动定位。
+        // 面板四角缩放范围及尺寸持久化。缩放会自动转为手动定位。
         answerTocRememberSize: true,
         answerTocMinWidthPx: 220,
         answerTocMaxWidthPx: 560,
@@ -249,8 +250,7 @@
             this.viewHeadingsButton = null;
             this.viewConversationCount = null;
             this.viewHeadingsCount = null;
-            this.resizeHandleLeft = null;
-            this.resizeHandleRight = null;
+            this.resizeHandles = [];
 
             this.currentAnswer = null;
             this.currentContentRoot = null;
@@ -265,6 +265,9 @@
             this.lastConversationSignature = '';
             this.officialNavContainer = null;
             this.conversationLabelCache = new Map();
+            this.conversationCacheIdentityByIndex = new Map();
+            this.conversationCacheIndexByIdentity = new Map();
+            this.maxObservedOfficialLogicalIndex = -1;
             this.pendingConversationLogicalIndex = -1;
             this.pendingConversationUntil = 0;
             this.conversationJumpToken = 0;
@@ -292,6 +295,16 @@
             this.hoverCollapseTimer = 0;
             this.launcherHovered = false;
             this.transientHoverOpen = false;
+
+            /*
+             * 悬浮展开时，面板右上角的“收起”按钮可能正好覆盖折叠启动器原位置。
+             * 记录启动器矩形，才能把用户在原位置的第一次点击识别为“固定展开”，
+             * 而不是误触面板里的收起按钮。
+             */
+            this.transientHoverOriginRect = null;
+            this.suppressTransientOriginClick = false;
+            this.suppressTransientOriginClickRect = null;
+            this.suppressTransientOriginClickTimer = 0;
 
             this.dragState = null;
             this.dragFrameId = 0;
@@ -322,6 +335,9 @@
             this.onLauncherPointerLeave = this.onLauncherPointerLeave.bind(this);
             this.onPanelPointerEnter = this.onPanelPointerEnter.bind(this);
             this.onPanelPointerLeave = this.onPanelPointerLeave.bind(this);
+            this.onPanelClickCapture = this.onPanelClickCapture.bind(this);
+            this.onDocumentPointerDown = this.onDocumentPointerDown.bind(this);
+            this.onDocumentClick = this.onDocumentClick.bind(this);
             this.onDragPointerMove = this.onDragPointerMove.bind(this);
             this.onDragPointerEnd = this.onDragPointerEnd.bind(this);
             this.onDragPointerCancel = this.onDragPointerCancel.bind(this);
@@ -348,6 +364,8 @@
             window.addEventListener('popstate', this.onRouteSignal, { passive: true });
             window.addEventListener('hashchange', this.onRouteSignal, { passive: true });
             document.addEventListener('keydown', this.onKeyDown, true);
+            document.addEventListener('pointerdown', this.onDocumentPointerDown, true);
+            document.addEventListener('click', this.onDocumentClick, true);
             document.addEventListener('visibilitychange', this.onVisibilityChange);
 
             if (window.navigation && typeof window.navigation.addEventListener === 'function') {
@@ -558,7 +576,9 @@
             flex: none;
             align-items: center;
             gap: 8px;
-            padding: 7px 8px 7px 9px;
+            padding-block: 7px;
+            padding-inline-start: 9px;
+            padding-inline-end: 24px;
             border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.11));
             cursor: grab;
             touch-action: none;
@@ -621,6 +641,8 @@
           }
 
           .icon-button {
+            position: relative;
+            z-index: 4;
             width: 29px;
             height: 29px;
             display: inline-flex;
@@ -794,8 +816,8 @@
           }
 
           /*
-           * 问答级目录默认完整显示用户提问。
-           * 章节标题继续保持两行预览，避免长标题挤占整个面板。
+           * 问答级目录只在提问过长时按配置限制行数和字符数；
+           * 完整文本仍写入按钮 title。章节标题继续保持两行预览。
            */
           #conversation-list .toc-item {
             height: auto;
@@ -820,51 +842,52 @@
             font-size: 12px;
           }
 
+          /*
+           * 四个角仍可缩放，但命中区域完全透明，不绘制任何角标。
+           * 鼠标进入角落命中区时，仅通过系统 resize 光标提示该功能。
+           */
           .resize-handle {
             position: absolute;
-            bottom: 0;
-            width: 20px;
-            height: 20px;
-            display: none;
+            z-index: 3;
+            width: 18px;
+            height: 18px;
+            display: block;
             border: 0;
             background: transparent;
-            color: var(--text-tertiary, #777777);
             opacity: 0;
+            pointer-events: auto;
             touch-action: none;
-            transition: opacity 120ms ease;
+            user-select: none;
           }
 
-          .panel:hover .resize-handle,
-          .resize-handle:focus-visible,
-          :host([data-resizing]) .resize-handle {
-            opacity: 0.72;
-          }
-
+          .resize-handle::before,
           .resize-handle::after {
-            position: absolute;
-            right: 4px;
-            bottom: 4px;
-            width: 8px;
-            height: 8px;
-            border-right: 1.5px solid currentColor;
-            border-bottom: 1.5px solid currentColor;
-            content: "";
+            display: none !important;
+            content: none !important;
           }
 
-          .resize-handle-left {
+          .resize-handle[data-resize-corner="top-left"] {
+            top: 0;
             left: 0;
-            cursor: nesw-resize;
-            transform: scaleX(-1);
-          }
-
-          .resize-handle-right {
-            right: 0;
             cursor: nwse-resize;
           }
 
-          :host([data-dock-side="right"]) .resize-handle-left,
-          :host([data-dock-side="left"]) .resize-handle-right {
-            display: block;
+          .resize-handle[data-resize-corner="top-right"] {
+            top: 0;
+            right: 0;
+            cursor: nesw-resize;
+          }
+
+          .resize-handle[data-resize-corner="bottom-left"] {
+            bottom: 0;
+            left: 0;
+            cursor: nesw-resize;
+          }
+
+          .resize-handle[data-resize-corner="bottom-right"] {
+            right: 0;
+            bottom: 0;
+            cursor: nwse-resize;
           }
 
           @media (prefers-color-scheme: dark) {
@@ -910,7 +933,7 @@
           type="button"
           aria-label="展开导航目录"
           aria-expanded="false"
-          title="悬停临时展开；点击保持展开；按住拖动可移动（Alt+Shift+O）"
+          title="悬停临时展开；在目录中点击、拖动或缩放后保持展开（Alt+Shift+O）"
           hidden
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -959,8 +982,10 @@
             <ol id="toc-list" class="toc-list"></ol>
           </nav>
 
-          <button class="resize-handle resize-handle-left" type="button" aria-label="调整目录大小" title="拖动调整目录大小" data-resize-side="left"></button>
-          <button class="resize-handle resize-handle-right" type="button" aria-label="调整目录大小" title="拖动调整目录大小" data-resize-side="right"></button>
+          <span class="resize-handle" aria-hidden="true" data-resize-corner="top-left"></span>
+          <span class="resize-handle" aria-hidden="true" data-resize-corner="top-right"></span>
+          <span class="resize-handle" aria-hidden="true" data-resize-corner="bottom-left"></span>
+          <span class="resize-handle" aria-hidden="true" data-resize-corner="bottom-right"></span>
         </aside>
       `;
 
@@ -985,8 +1010,9 @@
             this.viewHeadingsButton = shadow.getElementById('view-headings');
             this.viewConversationCount = shadow.getElementById('view-conversation-count');
             this.viewHeadingsCount = shadow.getElementById('view-headings-count');
-            this.resizeHandleLeft = shadow.querySelector('[data-resize-side="left"]');
-            this.resizeHandleRight = shadow.querySelector('[data-resize-side="right"]');
+            this.resizeHandles = Array.from(
+                shadow.querySelectorAll('[data-resize-corner]'),
+            );
 
             host.dataset.positionMode = this.positionMode;
             host.dataset.sizeMode = this.sizeMode;
@@ -1018,6 +1044,7 @@
 
             this.panel.addEventListener('pointerenter', this.onPanelPointerEnter);
             this.panel.addEventListener('pointerleave', this.onPanelPointerLeave);
+            this.panel.addEventListener('click', this.onPanelClickCapture, true);
 
             this.panelHeader?.addEventListener('pointerdown', (event) => {
                 const target = event.target;
@@ -1058,12 +1085,11 @@
                 if (Number.isInteger(index)) this.jumpToConversation(index);
             });
 
-            this.resizeHandleLeft?.addEventListener('pointerdown', (event) => {
-                this.beginResize(event, 'left');
-            });
-            this.resizeHandleRight?.addEventListener('pointerdown', (event) => {
-                this.beginResize(event, 'right');
-            });
+            for (const handle of this.resizeHandles) {
+                handle.addEventListener('pointerdown', (event) => {
+                    this.beginResize(event, handle.dataset.resizeCorner);
+                });
+            }
 
             this.applyActiveView();
             this.applyCollapsedState();
@@ -1299,7 +1325,7 @@
                 this.launcherCount.textContent = String(activeCount);
             }
             if (this.launcher) {
-                this.launcher.title = `悬停临时展开；点击保持展开；问答 ${conversationCount}，章节 ${headingCount}`;
+                this.launcher.title = `悬停临时展开；在目录中点击、拖动或缩放后保持展开；问答 ${conversationCount}，章节 ${headingCount}`;
             }
             if (this.conversationEmptyState) {
                 this.conversationEmptyState.hidden = conversationCount > 0;
@@ -1400,6 +1426,94 @@
             this.hoverCollapseTimer = 0;
         }
 
+        captureHoverOriginRect() {
+            if (!(this.launcher instanceof HTMLElement) || this.launcher.hidden) return null;
+            const rect = this.launcher.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return null;
+            return {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+        }
+
+        isPointInsideRect(clientX, clientY, rect, tolerance = 0) {
+            return Boolean(
+                rect &&
+                Number.isFinite(clientX) &&
+                Number.isFinite(clientY) &&
+                clientX >= rect.left - tolerance &&
+                clientX <= rect.right + tolerance &&
+                clientY >= rect.top - tolerance &&
+                clientY <= rect.bottom + tolerance
+            );
+        }
+
+        clearTransientOriginClickSuppression() {
+            window.clearTimeout(this.suppressTransientOriginClickTimer);
+            this.suppressTransientOriginClickTimer = 0;
+            this.suppressTransientOriginClick = false;
+            this.suppressTransientOriginClickRect = null;
+        }
+
+        armTransientOriginClickSuppression(rect) {
+            this.clearTransientOriginClickSuppression();
+            this.suppressTransientOriginClick = true;
+            this.suppressTransientOriginClickRect = rect ? { ...rect } : null;
+            this.suppressTransientOriginClickTimer = window.setTimeout(() => {
+                this.clearTransientOriginClickSuppression();
+            }, 900);
+        }
+
+        onDocumentPointerDown(event) {
+            if (!this.transientHoverOpen || this.collapsed) return;
+            if (
+                event instanceof PointerEvent &&
+                (event.button !== 0 || event.isPrimary === false)
+            ) {
+                return;
+            }
+
+            const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+            const insidePanel = Boolean(this.host && path.includes(this.host));
+            const insideOrigin = this.isPointInsideRect(
+                event.clientX,
+                event.clientY,
+                this.transientHoverOriginRect,
+                3,
+            );
+
+            if (!insidePanel && !insideOrigin) return;
+
+            if (insideOrigin) {
+                /*
+                 * 面板展开后，原启动器位置通常会被“收起”按钮覆盖。抑制这一次
+                 * 随后的 click，避免用户本想点击展开，却立即触发收起。
+                 */
+                this.armTransientOriginClickSuppression(this.transientHoverOriginRect);
+            }
+
+            // pointerdown 早于 click：先把临时悬浮状态提升为持久展开。
+            this.pinTransientHoverOpen(true);
+        }
+
+        onDocumentClick(event) {
+            if (!this.suppressTransientOriginClick) return;
+
+            const shouldSuppress = this.isPointInsideRect(
+                event.clientX,
+                event.clientY,
+                this.suppressTransientOriginClickRect,
+                5,
+            );
+            this.clearTransientOriginClickSuppression();
+            if (!shouldSuppress) return;
+
+            event.preventDefault();
+            event.stopPropagation();
+        }
+
         scheduleHoverCollapse() {
             this.cancelHoverCollapse();
             if (
@@ -1446,6 +1560,7 @@
             this.hoverExpandTimer = window.setTimeout(() => {
                 this.hoverExpandTimer = 0;
                 if (this.collapsed && this.launcherHovered && !this.dragState && !this.resizeState) {
+                    this.transientHoverOriginRect = this.captureHoverOriginRect();
                     this.setCollapsed(false, { source: 'hover', persist: false });
                     window.requestAnimationFrame(() => {
                         if (this.transientHoverOpen && !this.panel?.matches(':hover')) {
@@ -1476,6 +1591,28 @@
             this.scheduleHoverCollapse();
         }
 
+        /*
+         * 悬浮展开只有在“纯浏览、无交互”时才会自动收起。
+         * 一旦用户点击、拖动或缩放目录，就将本次展开提升为持久展开。
+         */
+        pinTransientHoverOpen(persist = true) {
+            if (!this.transientHoverOpen || this.collapsed) return false;
+
+            this.transientHoverOpen = false;
+            this.cancelHoverCollapse();
+            this.transientHoverOriginRect = null;
+            if (persist) this.writeCollapsedState();
+            return true;
+        }
+
+        onPanelClickCapture(event) {
+            const target = event.target;
+
+            // “收起”按钮是明确的折叠意图，不先把状态提升为持久展开。
+            if (target instanceof Element && target.closest('#collapse-button')) return;
+            this.pinTransientHoverOpen(true);
+        }
+
         setCollapsed(collapsed, options = {}) {
             const nextCollapsed = Boolean(collapsed);
             const source = options.source || 'manual';
@@ -1488,9 +1625,15 @@
                 this.transientHoverOpen = true;
             } else if (source !== 'layout') {
                 this.transientHoverOpen = false;
+                this.transientHoverOriginRect = null;
             }
 
             if (nextCollapsed === this.collapsed) {
+                /*
+                 * 悬浮已经把面板打开后，后续点击的视觉状态仍是“展开”。这里不能
+                 * 因状态相同而丢弃点击语义，必须写入持久展开状态。
+                 */
+                if (persist) this.writeCollapsedState();
                 this.applyCollapsedState();
                 return;
             }
@@ -1549,6 +1692,7 @@
             const widget = this.getVisibleWidget();
             if (!(widget instanceof HTMLElement) || widget.hidden) return;
 
+            if (source === 'panel') this.pinTransientHoverOpen(true);
             this.cancelHoverExpand();
             this.cancelHoverCollapse();
             event.preventDefault();
@@ -1668,6 +1812,25 @@
             this.rootStyleBeforeDrag = null;
             this.dragState = null;
 
+            const launcherActivation =
+                state.source === 'launcher' &&
+                !state.moved &&
+                !cancelled;
+
+            if (launcherActivation) {
+                /*
+                 * launcher 的 pointerdown 同时承担拖动起点，并调用了 preventDefault。
+                 * 某些 Chromium/React 组合不会再派发可靠的 click；在 pointerup 这里
+                 * 直接按“点击展开”处理，且明确退出 hover 临时展开状态。
+                 */
+                this.suppressNextLauncherClick = true;
+                this.setCollapsed(false, { source: 'click', persist: true });
+                window.setTimeout(() => {
+                    this.suppressNextLauncherClick = false;
+                }, 0);
+                return;
+            }
+
             if (state.moved && !cancelled) {
                 this.ensureManualPositionInViewport(true);
 
@@ -1682,7 +1845,7 @@
             this.resumeTransientAutoCollapse(event.clientX, event.clientY);
         }
 
-        beginResize(event, handleSide) {
+        beginResize(event, handleCorner) {
             if (
                 !(event instanceof PointerEvent) ||
                 event.button !== 0 ||
@@ -1696,10 +1859,21 @@
                 return;
             }
 
+            const allowedCorners = new Set([
+                'top-left',
+                'top-right',
+                'bottom-left',
+                'bottom-right',
+            ]);
+            const corner = allowedCorners.has(handleCorner)
+                ? handleCorner
+                : 'bottom-right';
+            const [verticalSide, horizontalSide] = corner.split('-');
             const rect = this.panel.getBoundingClientRect();
             if (rect.width <= 0 || rect.height <= 0) return;
 
-            const side = handleSide === 'left' ? 'left' : 'right';
+            // 缩放属于明确交互：若面板由 hover 临时展开，则从此保持展开。
+            this.pinTransientHoverOpen(true);
             this.cancelHoverExpand();
             this.cancelHoverCollapse();
             event.preventDefault();
@@ -1710,7 +1884,9 @@
                 captureTarget: event.currentTarget instanceof Element
                     ? event.currentTarget
                     : null,
-                side,
+                corner,
+                horizontalSide,
+                verticalSide,
                 startClientX: event.clientX,
                 startClientY: event.clientY,
                 startWidth: rect.width,
@@ -1718,6 +1894,7 @@
                 startLeft: rect.left,
                 startRight: rect.right,
                 startTop: rect.top,
+                startBottom: rect.bottom,
                 moved: false,
             };
 
@@ -1726,9 +1903,9 @@
                 cursor: document.documentElement.style.cursor,
             };
             document.documentElement.style.userSelect = 'none';
-            document.documentElement.style.cursor = side === 'left'
-                ? 'nesw-resize'
-                : 'nwse-resize';
+            document.documentElement.style.cursor = (
+                corner === 'top-left' || corner === 'bottom-right'
+            ) ? 'nwse-resize' : 'nesw-resize';
 
             try {
                 this.resizeState.captureTarget?.setPointerCapture?.(event.pointerId);
@@ -1780,10 +1957,12 @@
 
             const deltaX = clientX - state.startClientX;
             const deltaY = clientY - state.startClientY;
-            const requestedWidth = state.side === 'left'
+            const requestedWidth = state.horizontalSide === 'left'
                 ? state.startWidth - deltaX
                 : state.startWidth + deltaX;
-            const requestedHeight = state.startHeight + deltaY;
+            const requestedHeight = state.verticalSide === 'top'
+                ? state.startHeight - deltaY
+                : state.startHeight + deltaY;
 
             const margin = Math.max(
                 0,
@@ -1792,30 +1971,45 @@
             const viewportWidth = Math.max(1, document.documentElement.clientWidth);
             const viewportHeight = Math.max(1, document.documentElement.clientHeight);
             const limits = this.getPanelSizeLimits();
-            const maxWidthByAnchor = state.side === 'left'
-                ? state.startRight - margin
-                : viewportWidth - state.startLeft - margin;
-            const maxHeightByAnchor = viewportHeight - state.startTop - margin;
-            const maxWidth = Math.max(
-                Math.min(limits.minWidth, maxWidthByAnchor),
+
+            // 固定对角：从哪个角拖动，就保持其对角在原位置。
+            const maxWidthByAnchor = Math.max(
+                1,
+                state.horizontalSide === 'left'
+                    ? state.startRight - margin
+                    : viewportWidth - state.startLeft - margin,
+            );
+            const maxHeightByAnchor = Math.max(
+                1,
+                state.verticalSide === 'top'
+                    ? state.startBottom - margin
+                    : viewportHeight - state.startTop - margin,
+            );
+            const effectiveMinWidth = Math.min(limits.minWidth, maxWidthByAnchor);
+            const effectiveMaxWidth = Math.max(
+                effectiveMinWidth,
                 Math.min(limits.maxWidth, maxWidthByAnchor),
             );
-            const maxHeight = Math.max(
-                Math.min(limits.minHeight, maxHeightByAnchor),
+            const effectiveMinHeight = Math.min(limits.minHeight, maxHeightByAnchor);
+            const effectiveMaxHeight = Math.max(
+                effectiveMinHeight,
                 Math.min(limits.maxHeight, maxHeightByAnchor),
             );
             const width = Math.round(
-                Math.min(maxWidth, Math.max(Math.min(limits.minWidth, maxWidth), requestedWidth)),
+                Math.min(effectiveMaxWidth, Math.max(effectiveMinWidth, requestedWidth)),
             );
             const height = Math.round(
-                Math.min(maxHeight, Math.max(Math.min(limits.minHeight, maxHeight), requestedHeight)),
+                Math.min(effectiveMaxHeight, Math.max(effectiveMinHeight, requestedHeight)),
             );
-            const left = state.side === 'left'
+            const left = state.horizontalSide === 'left'
                 ? state.startRight - width
                 : state.startLeft;
+            const top = state.verticalSide === 'top'
+                ? state.startBottom - height
+                : state.startTop;
 
             this.setPanelSize(width, height, false);
-            this.setManualPosition(left, state.startTop, false);
+            this.setManualPosition(left, top, false);
         }
 
         onResizePointerEnd(event) {
@@ -1996,7 +2190,8 @@
         resetForNavigation() {
             this.lastUrl = location.href;
             this.cancelConversationJump();
-            this.conversationLabelCache.clear();
+            this.clearConversationLabelCacheState();
+            this.maxObservedOfficialLogicalIndex = -1;
             this.disconnectCurrentAnswer();
             this.clearToc();
             this.clearConversationToc();
@@ -2407,15 +2602,15 @@
 
         getConversationRecordIdentity(element, fallbackIndex = 0) {
             const turn = this.getConversationTurnElement(element);
-            const testId = turn?.getAttribute('data-testid') || '';
-            if (testId) return testId;
-
             const messageId =
                 element?.getAttribute?.('data-message-id') ||
                 element?.closest?.('[data-message-id]')?.getAttribute('data-message-id') ||
                 turn?.querySelector?.('[data-message-id]')?.getAttribute('data-message-id') ||
                 '';
-            return messageId ? `message:${messageId}` : `user-node:${fallbackIndex}`;
+            if (messageId) return `message:${messageId}`;
+
+            const testId = turn?.getAttribute('data-testid') || '';
+            return testId || `user-node:${fallbackIndex}`;
         }
 
         getUserMessageElements() {
@@ -2646,6 +2841,56 @@
             return true;
         }
 
+        clearConversationLabelCacheState() {
+            this.conversationLabelCache.clear();
+            this.conversationCacheIdentityByIndex.clear();
+            this.conversationCacheIndexByIdentity.clear();
+        }
+
+        removeConversationCachedLabel(logicalIndex) {
+            const identity = this.conversationCacheIdentityByIndex.get(logicalIndex);
+            if (
+                identity &&
+                this.conversationCacheIndexByIdentity.get(identity) === logicalIndex
+            ) {
+                this.conversationCacheIndexByIdentity.delete(identity);
+            }
+            this.conversationCacheIdentityByIndex.delete(logicalIndex);
+            this.conversationLabelCache.delete(logicalIndex);
+        }
+
+        cacheConversationRecordLabel(logicalIndex, record) {
+            if (
+                !Number.isInteger(logicalIndex) ||
+                logicalIndex < 0 ||
+                !record?.fullLabel
+            ) {
+                return;
+            }
+
+            const identity = String(record.identity || '');
+            if (identity) {
+                const previousIndex = this.conversationCacheIndexByIdentity.get(identity);
+                if (Number.isInteger(previousIndex) && previousIndex !== logicalIndex) {
+                    this.removeConversationCachedLabel(previousIndex);
+                }
+
+                const displacedIdentity = this.conversationCacheIdentityByIndex.get(logicalIndex);
+                if (
+                    displacedIdentity &&
+                    displacedIdentity !== identity &&
+                    this.conversationCacheIndexByIdentity.get(displacedIdentity) === logicalIndex
+                ) {
+                    this.conversationCacheIndexByIdentity.delete(displacedIdentity);
+                }
+
+                this.conversationCacheIdentityByIndex.set(logicalIndex, identity);
+                this.conversationCacheIndexByIdentity.set(identity, logicalIndex);
+            }
+
+            this.conversationLabelCache.set(logicalIndex, record.fullLabel);
+        }
+
         mapUserRecordsToLogicalIndices(records, officialButtons) {
             const buttonsByIndex = new Map();
             let maxOfficialIndex = -1;
@@ -2663,46 +2908,59 @@
             const anchorRecordIndex = this.findCurrentPromptRecordIndex(records);
             const viewportAnchorIndex = this.findViewportPromptRecordIndex(records);
             const stride = this.getUserTurnStride(records);
+            const officialNavAppearsPartial =
+                this.maxObservedOfficialLogicalIndex >= 0 &&
+                maxOfficialIndex >= 0 &&
+                maxOfficialIndex < this.maxObservedOfficialLogicalIndex;
+
             let mappedIndices = null;
             let confident = false;
+            let trustLabels = false;
+            let source = 'none';
+            let tentativeTurnCandidate = null;
+
+            const acceptCandidate = (
+                candidate,
+                candidateSource,
+                candidateConfident,
+                candidateTrustLabels,
+            ) => {
+                if (mappedIndices || !this.validateRecordIndexMapping(candidate, maxOfficialIndex)) {
+                    return false;
+                }
+                mappedIndices = candidate;
+                source = candidateSource;
+                confident = Boolean(candidateConfident);
+                trustLabels = Boolean(candidateTrustLabels);
+                return true;
+            };
 
             if (!records.length) {
                 return {
                     buttonsByIndex,
                     recordsByIndex: new Map(),
                     maxIndex: maxOfficialIndex,
+                    officialMaxIndex: maxOfficialIndex,
                     confident: true,
+                    trustLabels: true,
+                    source: 'empty',
                 };
             }
 
             if (!officialCount) {
-                mappedIndices = records.map((_, index) => index);
-                confident = true;
-            } else if (records.length === officialCount) {
-                mappedIndices = officialIndices.slice();
-                confident = true;
+                acceptCandidate(
+                    records.map((_, index) => index),
+                    'dom-only',
+                    true,
+                    true,
+                );
             }
 
             /*
-             * conversation-turn-N 是当前最强的绝对索引信号。优先使用它，
-             * 避免官方 active 状态在快速滚动期间短暂滞后而造成错配。
+             * 官方 active 项与“当前回答之前的用户提问”是最可靠的独立锚点。
+             * 必须优先于 conversation-turn-N；页面首轮 hydration/虚拟化期间，
+             * 后者可能暂时从 0 重新编号，不能直接视为绝对问答序号。
              */
-            if (!mappedIndices) {
-                const recordsWithTurns = records.every((record) =>
-                    Number.isInteger(record.turnNumber));
-                if (recordsWithTurns) {
-                    const pairedCandidate = records.map((record) => Math.floor(record.turnNumber / 2));
-                    const directCandidate = records.map((record) => record.turnNumber);
-                    if (this.validateRecordIndexMapping(pairedCandidate, maxOfficialIndex)) {
-                        mappedIndices = pairedCandidate;
-                        confident = true;
-                    } else if (this.validateRecordIndexMapping(directCandidate, maxOfficialIndex)) {
-                        mappedIndices = directCandidate;
-                        confident = true;
-                    }
-                }
-            }
-
             if (!mappedIndices && activeLogicalIndex >= 0 && anchorRecordIndex >= 0) {
                 const anchorTurn = records[anchorRecordIndex].turnNumber;
                 const candidate = records.map((record, index) => {
@@ -2712,25 +2970,92 @@
                     }
                     return activeLogicalIndex + index - anchorRecordIndex;
                 });
-                if (this.validateRecordIndexMapping(candidate, maxOfficialIndex)) {
-                    mappedIndices = candidate;
-                    confident = true;
-                }
+                acceptCandidate(candidate, 'active-current-answer', true, true);
             }
 
             if (!mappedIndices && activeLogicalIndex >= 0 && viewportAnchorIndex >= 0) {
                 const candidate = records.map((_, index) =>
                     activeLogicalIndex + index - viewportAnchorIndex);
-                if (this.validateRecordIndexMapping(candidate, maxOfficialIndex)) {
-                    mappedIndices = candidate;
-                    confident = true;
+                acceptCandidate(candidate, 'active-viewport', true, true);
+            }
+
+            if (!mappedIndices) {
+                const recordsWithTurns = records.every((record) =>
+                    Number.isInteger(record.turnNumber));
+                if (recordsWithTurns) {
+                    const candidates = [
+                        records.map((record) => Math.floor(record.turnNumber / 2)),
+                        records.map((record) => record.turnNumber),
+                    ];
+
+                    for (const candidate of candidates) {
+                        if (!this.validateRecordIndexMapping(candidate, maxOfficialIndex)) continue;
+
+                        const matchesCurrentAnchor =
+                            activeLogicalIndex >= 0 &&
+                            anchorRecordIndex >= 0 &&
+                            candidate[anchorRecordIndex] === activeLogicalIndex;
+                        const matchesViewportAnchor =
+                            activeLogicalIndex >= 0 &&
+                            viewportAnchorIndex >= 0 &&
+                            candidate[viewportAnchorIndex] === activeLogicalIndex;
+                        const matchesCompleteOfficialSet =
+                            records.length === officialCount &&
+                            candidate.length === officialIndices.length &&
+                            candidate.every((value, index) => value === officialIndices[index]);
+                        const reachesKnownConversationEnd =
+                            maxOfficialIndex >= 0 &&
+                            candidate[candidate.length - 1] === maxOfficialIndex;
+
+                        if (matchesCurrentAnchor || matchesViewportAnchor) {
+                            acceptCandidate(candidate, 'turn-number-aligned', true, true);
+                            break;
+                        }
+
+                        if (
+                            reachesKnownConversationEnd &&
+                            records.length < officialCount &&
+                            !officialNavAppearsPartial
+                        ) {
+                            acceptCandidate(candidate, 'turn-number-end-aligned', true, true);
+                            break;
+                        }
+
+                        if (matchesCompleteOfficialSet && !officialNavAppearsPartial) {
+                            acceptCandidate(candidate, 'turn-number-complete', true, true);
+                            break;
+                        }
+
+                        tentativeTurnCandidate ||= candidate;
+                    }
                 }
+            }
+
+            /*
+             * DOM 记录数与当前官方按钮数相等时可以临时一一对应；但如果此前
+             * 已观察到更多官方项，则当前按钮集只是 React 过渡态，不能缓存标签。
+             */
+            if (!mappedIndices && records.length === officialCount) {
+                acceptCandidate(
+                    officialIndices.slice(),
+                    'count-match',
+                    !officialNavAppearsPartial,
+                    !officialNavAppearsPartial,
+                );
+            }
+
+            if (!mappedIndices && tentativeTurnCandidate) {
+                acceptCandidate(tentativeTurnCandidate, 'turn-number-tentative', false, false);
             }
 
             if (!mappedIndices) {
                 const offset = Math.max(0, maxOfficialIndex + 1 - records.length);
-                mappedIndices = records.map((_, index) => index + offset);
-                confident = false;
+                acceptCandidate(
+                    records.map((_, index) => index + offset),
+                    'tail-fallback',
+                    false,
+                    false,
+                );
             }
 
             const recordsByIndex = new Map();
@@ -2760,7 +3085,10 @@
                 buttonsByIndex,
                 recordsByIndex,
                 maxIndex: Math.max(maxOfficialIndex, maxMappedIndex),
+                officialMaxIndex: maxOfficialIndex,
                 confident,
+                trustLabels,
+                source,
             };
         }
 
@@ -2775,9 +3103,36 @@
             const mapping = this.mapUserRecordsToLogicalIndices(records, officialButtons);
             const items = [];
 
-            for (const [logicalIndex, record] of mapping.recordsByIndex) {
-                if (record.fullLabel && mapping.confident) {
-                    this.conversationLabelCache.set(logicalIndex, record.fullLabel);
+            /*
+             * 首次 hydration 时官方目录可能先出现 1～2 项，随后一次性扩展为
+             * 完整问答数。此前按“小目录”写入的缓存没有可信的绝对索引，必须清空。
+             */
+            if (
+                this.maxObservedOfficialLogicalIndex >= 0 &&
+                mapping.officialMaxIndex > this.maxObservedOfficialLogicalIndex + 1
+            ) {
+                this.clearConversationLabelCacheState();
+            }
+            if (mapping.officialMaxIndex >= 0) {
+                this.maxObservedOfficialLogicalIndex = Math.max(
+                    this.maxObservedOfficialLogicalIndex,
+                    mapping.officialMaxIndex,
+                );
+            }
+
+            if (mapping.trustLabels) {
+                for (const [logicalIndex, record] of mapping.recordsByIndex) {
+                    this.cacheConversationRecordLabel(logicalIndex, record);
+                }
+            }
+
+            const liveLabelIndices = new Map();
+            if (mapping.trustLabels) {
+                for (const [logicalIndex, record] of mapping.recordsByIndex) {
+                    if (!record.fullLabel) continue;
+                    const indices = liveLabelIndices.get(record.fullLabel) || new Set();
+                    indices.add(logicalIndex);
+                    liveLabelIndices.set(record.fullLabel, indices);
                 }
             }
 
@@ -2790,21 +3145,36 @@
             const maxIndex = Math.max(mapping.maxIndex, maxKnownIndex);
 
             for (let logicalIndex = 0; logicalIndex <= maxIndex; logicalIndex += 1) {
-                const record = mapping.recordsByIndex.get(logicalIndex) ?? null;
+                const mappedRecord = mapping.recordsByIndex.get(logicalIndex) ?? null;
+                const displayRecord = mapping.trustLabels ? mappedRecord : null;
                 const officialButton = mapping.buttonsByIndex.get(logicalIndex) ?? null;
-                const cachedLabel = this.conversationLabelCache.get(logicalIndex) || '';
-                if (!record && !officialButton && !cachedLabel) continue;
+                let cachedLabel = this.conversationLabelCache.get(logicalIndex) || '';
+
+                /*
+                 * 若某个仅来自缓存的标签，与当前已可信挂载在另一个序号的记录完全
+                 * 相同，它通常就是 hydration 早期错位留下的副本。宁可退回 Prompt N，
+                 * 也不把最后两问错误显示到最前两问。
+                 */
+                if (!displayRecord && cachedLabel) {
+                    const liveIndices = liveLabelIndices.get(cachedLabel);
+                    if (liveIndices && !liveIndices.has(logicalIndex)) {
+                        this.removeConversationCachedLabel(logicalIndex);
+                        cachedLabel = '';
+                    }
+                }
+
+                if (!mappedRecord && !officialButton && !cachedLabel) continue;
 
                 const fullLabel =
-                    record?.fullLabel ||
+                    displayRecord?.fullLabel ||
                     cachedLabel ||
                     officialButton?.getAttribute('aria-label') ||
                     `提问 ${logicalIndex + 1}`;
 
                 items.push({
                     logicalIndex,
-                    userElement: record?.userElement ?? null,
-                    targetElement: record?.targetElement ?? null,
+                    userElement: mapping.confident ? mappedRecord?.userElement ?? null : null,
+                    targetElement: mapping.confident ? mappedRecord?.targetElement ?? null : null,
                     officialButton,
                     fullLabel,
                     label: this.formatConversationLabel(fullLabel),
@@ -2865,7 +3235,7 @@
             this.lastConversationSignature = '';
             this.pendingConversationLogicalIndex = -1;
             this.pendingConversationUntil = 0;
-            if (clearCache) this.conversationLabelCache.clear();
+            if (clearCache) this.clearConversationLabelCacheState();
             this.conversationList?.replaceChildren();
             this.updateViewMeta();
             this.syncVisibility();
@@ -3012,8 +3382,8 @@
             const record = mapping.recordsByIndex.get(logicalIndex);
             if (!record || !mapping.confident) return null;
 
-            if (record.fullLabel) {
-                this.conversationLabelCache.set(logicalIndex, record.fullLabel);
+            if (record.fullLabel && mapping.trustLabels) {
+                this.cacheConversationRecordLabel(logicalIndex, record);
             }
             if (currentItem) {
                 currentItem.userElement = record.userElement;
@@ -3169,6 +3539,8 @@
 
             if (this.host.hidden && this.transientHoverOpen) {
                 this.transientHoverOpen = false;
+                this.transientHoverOriginRect = null;
+                this.clearTransientOriginClickSuppression();
                 this.collapsed = true;
                 this.applyCollapsedState();
             }
