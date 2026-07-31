@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ChatGPT 长对话性能优化与双层导航目录
+// @name         ChatGPT 长对话性能优化、导航与快速搜索
 // @namespace    local.chatgpt
-// @version      2.6.1
-// @description  优化长对话渲染并提供双层导航；四角缩放区域保持可用但不再显示角标
+// @version      2.7.0
+// @description  优化长对话渲染，提供问答/章节导航与章节、段落快速搜索
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -62,8 +62,33 @@
         // 一级目录：整段对话中的用户提问；二级目录：当前回答里的 H1/H2。
         enableConversationToc: true,
         hideOfficialConversationToc: true,
-        answerTocInitialView: 'headings', // 可选：'conversation' 或 'headings'
+        answerTocInitialView: 'headings', // 可选：'conversation'、'headings' 或 'search'
         answerTocRememberView: true,
+
+        // 快速搜索：检索当前页面已经挂载的 Assistant 章节与段落。
+        enableQuickSearch: true,
+
+        // 'conversation' 检索当前页面全部已加载回答；'current-answer' 只检索当前回答。
+        quickSearchScope: 'conversation',
+
+        // 输入防抖、最短关键词、最多显示结果数及结果摘要长度。
+        quickSearchDebounceMs: 140,
+        quickSearchMinQueryLength: 1,
+        quickSearchMaxResults: 80,
+        quickSearchSnippetLength: 180,
+
+        // 索引范围与分片大小。代码块默认不加入索引，避免超长代码造成噪音。
+        quickSearchHeadingSelector: 'h1, h2, h3, h4, h5, h6',
+        quickSearchParagraphSelector: 'p, li, blockquote, pre, table tr',
+        quickSearchIncludeCodeBlocks: false,
+        quickSearchMinBlockTextLength: 2,
+        quickSearchMaxIndexedBlocks: 8000,
+        quickSearchIndexChunkSize: 160,
+
+        // 搜索跳转后的顶部留白及目标短暂定位提示。
+        quickSearchScrollOffsetPx: 96,
+        quickSearchHighlightTarget: true,
+
         // 问答预览最多显示 3 行；完整提问仍保留在鼠标悬停提示中。
         // 设为 0 可取消按行限制。
         conversationTocPreviewMaxLines: 3,
@@ -168,9 +193,9 @@
 
     if (CONFIG.enableAnswerToc) {
         css.push(`
-      /* 让目录跳转后的标题与页面顶部保留适当间距。 */
-      ${ASSISTANT_SELECTOR} :is(h1, h2, h3, h4) {
-        scroll-margin-block-start: 88px;
+      /* 让目录与搜索跳转后的目标和页面顶部保留适当间距。 */
+      ${ASSISTANT_SELECTOR} :is(h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, tr) {
+        scroll-margin-block-start: 96px;
       }
 
       /*
@@ -180,6 +205,13 @@
       [data-cgpt-conversation-jump-target] {
         content-visibility: visible !important;
         contain-intrinsic-size: none !important;
+      }
+
+      /* 搜索跳转后短暂标出目标，不改变文档布局。 */
+      [data-cgpt-search-jump-target] {
+        outline: 2px solid color-mix(in srgb, currentColor 32%, transparent) !important;
+        outline-offset: 4px !important;
+        border-radius: 4px !important;
       }
     `);
     }
@@ -248,8 +280,17 @@
             this.collapseButton = null;
             this.viewConversationButton = null;
             this.viewHeadingsButton = null;
+            this.viewSearchButton = null;
             this.viewConversationCount = null;
             this.viewHeadingsCount = null;
+            this.viewSearchCount = null;
+            this.searchView = null;
+            this.searchNav = null;
+            this.searchList = null;
+            this.searchInput = null;
+            this.searchClearButton = null;
+            this.searchStatus = null;
+            this.searchEmptyState = null;
             this.resizeHandles = [];
 
             this.currentAnswer = null;
@@ -258,6 +299,27 @@
             this.headings = [];
             this.itemButtons = [];
             this.activeIndex = -1;
+
+            this.searchIndex = [];
+            this.searchResults = [];
+            this.searchResultButtons = [];
+            this.activeSearchResultIndex = -1;
+            this.searchTotalMatches = 0;
+            this.searchQuery = '';
+            this.searchTerms = [];
+            this.searchIndexBuilt = false;
+            this.searchIndexDirty = true;
+            this.searchIndexRevision = 0;
+            this.searchIndexing = false;
+            this.searchDebounceTimer = 0;
+            this.searchBuildToken = 0;
+            this.searchBuildHandle = 0;
+            this.searchBuildHandleType = '';
+            this.searchJumpToken = 0;
+            this.searchJumpTimers = new Set();
+            this.searchHighlightElement = null;
+            this.searchHighlightTimer = 0;
+            this.searchConversationMapSignature = '';
 
             this.conversationItems = [];
             this.conversationItemButtons = [];
@@ -344,6 +406,8 @@
             this.onResizePointerMove = this.onResizePointerMove.bind(this);
             this.onResizePointerEnd = this.onResizePointerEnd.bind(this);
             this.onResizePointerCancel = this.onResizePointerCancel.bind(this);
+            this.onSearchInput = this.onSearchInput.bind(this);
+            this.onSearchKeyDown = this.onSearchKeyDown.bind(this);
         }
 
         start() {
@@ -417,6 +481,47 @@
                 ? `-webkit-backdrop-filter: blur(${backdropBlur}px) saturate(118%);
             backdrop-filter: blur(${backdropBlur}px) saturate(118%);`
                 : '';
+            const searchEnabled = Boolean(this.config.enableQuickSearch);
+            const viewColumnCount = searchEnabled ? 3 : 2;
+            const searchTabHtml = searchEnabled
+                ? `<button id="view-search" class="view-tab" type="button" role="tab" data-view="search" aria-selected="false">
+              <span>搜索</span><span id="view-search-count" class="view-count">0</span>
+            </button>`
+                : '';
+            const searchViewHtml = searchEnabled
+                ? `<section id="search-view" class="search-view" aria-label="快速搜索" hidden>
+              <div class="search-toolbar">
+                <label class="search-input-wrap" for="quick-search-input">
+                  <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/>
+                    <path d="m16 16 4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                  </svg>
+                  <input
+                    id="quick-search-input"
+                    class="search-input"
+                    type="search"
+                    autocomplete="off"
+                    autocorrect="off"
+                    autocapitalize="off"
+                    spellcheck="false"
+                    placeholder="搜索章节和段落"
+                    aria-label="搜索章节和段落"
+                    aria-controls="search-list"
+                  />
+                  <button id="quick-search-clear" class="search-clear" type="button" aria-label="清空搜索" title="清空搜索" hidden>
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                    </svg>
+                  </button>
+                </label>
+                <div id="search-status" class="search-status" aria-live="polite">输入关键词，检索当前已加载的章节和段落</div>
+              </div>
+              <nav id="search-nav" class="toc-nav search-results-nav" aria-label="搜索结果">
+                <div id="search-empty" class="empty-state">输入关键词开始搜索</div>
+                <ol id="search-list" class="toc-list"></ol>
+              </nav>
+            </section>`
+                : '';
 
             const host = document.createElement('div');
             host.id = 'cgpt-answer-toc-host';
@@ -464,7 +569,8 @@
             box-sizing: border-box;
           }
 
-          button {
+          button,
+          input {
             font: inherit;
           }
 
@@ -510,7 +616,8 @@
           .launcher:focus-visible,
           .icon-button:focus-visible,
           .view-tab:focus-visible,
-          .toc-item:focus-visible {
+          .toc-item:focus-visible,
+          .search-clear:focus-visible {
             outline: 2px solid var(--text-primary, #161616);
             outline-offset: 2px;
           }
@@ -566,7 +673,9 @@
           .panel[hidden],
           .launcher[hidden],
           .toc-nav[hidden],
-          .empty-state[hidden] {
+          .search-view[hidden],
+          .empty-state[hidden],
+          .search-clear[hidden] {
             display: none !important;
           }
 
@@ -665,7 +774,7 @@
           .view-tabs {
             display: grid;
             flex: none;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+            grid-template-columns: repeat(${viewColumnCount}, minmax(0, 1fr));
             gap: 4px;
             padding: 5px 6px;
             border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
@@ -832,6 +941,156 @@
             word-break: break-word;
           }
 
+          .search-view {
+            min-height: 0;
+            display: flex;
+            flex: 1;
+            flex-direction: column;
+          }
+
+          .search-toolbar {
+            flex: none;
+            padding: 7px 8px 6px;
+            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+          }
+
+          .search-input-wrap {
+            min-width: 0;
+            height: 34px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding-inline: 9px 5px;
+            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.14));
+            border-radius: 9px;
+            background: color-mix(
+              in srgb,
+              var(--main-surface-secondary, var(--bg-secondary, #f3f3f3)) 70%,
+              transparent
+            );
+            color: var(--text-tertiary, #777777);
+          }
+
+          .search-input-wrap:focus-within {
+            border-color: color-mix(in srgb, var(--text-primary, #161616) 36%, transparent);
+            color: var(--text-secondary, #444444);
+          }
+
+          .search-icon {
+            width: 16px;
+            height: 16px;
+            flex: none;
+          }
+
+          .search-input {
+            min-width: 0;
+            height: 100%;
+            flex: 1;
+            padding: 0;
+            border: 0;
+            outline: 0;
+            background: transparent;
+            color: var(--text-primary, #161616);
+            font-size: 12.5px;
+          }
+
+          .search-input::-webkit-search-cancel-button {
+            display: none;
+          }
+
+          .search-input::placeholder {
+            color: var(--text-tertiary, #777777);
+            opacity: 0.9;
+          }
+
+          .search-clear {
+            width: 25px;
+            height: 25px;
+            display: inline-flex;
+            flex: none;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            border: 0;
+            border-radius: 7px;
+            background: transparent;
+            color: var(--text-tertiary, #777777);
+            cursor: pointer;
+          }
+
+          .search-clear:hover {
+            background: color-mix(in srgb, currentColor 10%, transparent);
+            color: var(--text-primary, #161616);
+          }
+
+          .search-clear svg {
+            width: 15px;
+            height: 15px;
+          }
+
+          .search-status {
+            min-height: 16px;
+            margin-top: 5px;
+            overflow: hidden;
+            color: var(--text-tertiary, #777777);
+            font-size: 10.5px;
+            line-height: 1.35;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .search-results-nav {
+            padding-top: 5px;
+          }
+
+          .search-result {
+            display: block;
+            padding-block: 7px;
+          }
+
+          .search-result-meta {
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 3px;
+            color: var(--text-tertiary, #777777);
+            font-size: 10.5px;
+          }
+
+          .search-result-kind {
+            flex: none;
+            padding: 1px 5px;
+            border-radius: 999px;
+            background: color-mix(in srgb, currentColor 10%, transparent);
+            color: var(--text-secondary, #555555);
+            font-weight: 600;
+          }
+
+          .search-result-context {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .search-result-snippet {
+            display: -webkit-box;
+            overflow: hidden;
+            color: var(--text-secondary, #444444);
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3;
+            overflow-wrap: anywhere;
+            white-space: pre-wrap;
+          }
+
+          .search-result mark {
+            padding: 0 1px;
+            border-radius: 2px;
+            background: color-mix(in srgb, #f4c542 42%, transparent);
+            color: inherit;
+          }
+
           .empty-state {
             margin: 6px;
             padding: 18px 12px;
@@ -914,7 +1173,8 @@
             }
 
             .panel-header,
-            .view-tabs {
+            .view-tabs,
+            .search-toolbar {
               border-bottom-color: rgba(255, 255, 255, 0.11);
             }
           }
@@ -970,6 +1230,7 @@
             <button id="view-headings" class="view-tab" type="button" role="tab" data-view="headings" aria-selected="true">
               <span>章节</span><span id="view-headings-count" class="view-count">0</span>
             </button>
+            ${searchTabHtml}
           </div>
 
           <nav id="conversation-nav" class="toc-nav" aria-label="对话问答导航" hidden>
@@ -981,6 +1242,8 @@
             <div id="heading-empty" class="empty-state" hidden>当前回答没有 H1/H2 标题</div>
             <ol id="toc-list" class="toc-list"></ol>
           </nav>
+
+          ${searchViewHtml}
 
           <span class="resize-handle" aria-hidden="true" data-resize-corner="top-left"></span>
           <span class="resize-handle" aria-hidden="true" data-resize-corner="top-right"></span>
@@ -1008,8 +1271,17 @@
             this.collapseButton = shadow.getElementById('collapse-button');
             this.viewConversationButton = shadow.getElementById('view-conversation');
             this.viewHeadingsButton = shadow.getElementById('view-headings');
+            this.viewSearchButton = shadow.getElementById('view-search');
             this.viewConversationCount = shadow.getElementById('view-conversation-count');
             this.viewHeadingsCount = shadow.getElementById('view-headings-count');
+            this.viewSearchCount = shadow.getElementById('view-search-count');
+            this.searchView = shadow.getElementById('search-view');
+            this.searchNav = shadow.getElementById('search-nav');
+            this.searchList = shadow.getElementById('search-list');
+            this.searchInput = shadow.getElementById('quick-search-input');
+            this.searchClearButton = shadow.getElementById('quick-search-clear');
+            this.searchStatus = shadow.getElementById('search-status');
+            this.searchEmptyState = shadow.getElementById('search-empty');
             this.resizeHandles = Array.from(
                 shadow.querySelectorAll('[data-resize-corner]'),
             );
@@ -1063,6 +1335,24 @@
             });
             this.viewHeadingsButton?.addEventListener('click', () => {
                 this.setActiveView('headings', true);
+            });
+            this.viewSearchButton?.addEventListener('click', () => {
+                this.setActiveView('search', true, { focusSearch: true });
+            });
+
+            this.searchInput?.addEventListener('input', this.onSearchInput);
+            this.searchInput?.addEventListener('keydown', this.onSearchKeyDown);
+            this.searchClearButton?.addEventListener('click', () => {
+                this.clearSearchQuery(true);
+            });
+            this.searchList?.addEventListener('click', (event) => {
+                const button = event.target instanceof Element
+                    ? event.target.closest('button[data-search-result-index]')
+                    : null;
+                if (!(button instanceof HTMLButtonElement)) return;
+
+                const index = Number.parseInt(button.dataset.searchResultIndex ?? '', 10);
+                if (Number.isInteger(index)) this.jumpToSearchResult(index);
             });
 
             this.list.addEventListener('click', (event) => {
@@ -1241,14 +1531,21 @@
         }
 
         readViewState() {
-            const fallback = this.config.answerTocInitialView === 'conversation'
-                ? 'conversation'
-                : 'headings';
+            let fallback = 'headings';
+            if (this.config.answerTocInitialView === 'conversation') {
+                fallback = 'conversation';
+            } else if (
+                this.config.answerTocInitialView === 'search' &&
+                this.config.enableQuickSearch
+            ) {
+                fallback = 'search';
+            }
             if (!this.config.answerTocRememberView) return fallback;
 
             try {
                 const stored = localStorage.getItem('cgpt-answer-toc-view-v1');
                 if (stored === 'conversation' || stored === 'headings') return stored;
+                if (stored === 'search' && this.config.enableQuickSearch) return stored;
             } catch {
                 // 忽略存储不可用的情况。
             }
@@ -1266,10 +1563,21 @@
             }
         }
 
-        setActiveView(view, persist = true) {
-            const nextView = view === 'conversation' ? 'conversation' : 'headings';
+        setActiveView(view, persist = true, options = {}) {
+            let nextView = 'headings';
+            if (view === 'conversation') {
+                nextView = 'conversation';
+            } else if (view === 'search' && this.config.enableQuickSearch) {
+                nextView = 'search';
+            }
+
+            const shouldFocusSearch = Boolean(options.focusSearch && nextView === 'search');
             if (nextView === this.activeView) {
                 this.applyActiveView();
+                if (nextView === 'search') this.scheduleQuickSearch(0);
+                if (shouldFocusSearch) {
+                    window.requestAnimationFrame(() => this.searchInput?.focus());
+                }
                 return;
             }
 
@@ -1277,15 +1585,12 @@
             if (persist) this.writeViewState();
             this.applyActiveView();
             this.updateViewMeta();
+            if (nextView === 'search') this.scheduleQuickSearch(0);
 
             window.requestAnimationFrame(() => {
-                if (this.activeView === 'conversation') {
-                    const current = this.conversationItemButtons[this.activeConversationIndex];
-                    if (current) this.scrollItemIntoView(this.conversationNav, current);
-                } else {
-                    const current = this.itemButtons[this.activeIndex];
-                    if (current) this.scrollItemIntoView(this.tocNav, current);
-                }
+                const { nav, button } = this.getActiveViewNavigation();
+                if (button) this.scrollItemIntoView(nav, button);
+                if (shouldFocusSearch) this.searchInput?.focus();
             });
         }
 
@@ -1293,19 +1598,37 @@
             if (!this.conversationNav || !this.tocNav) return;
 
             const conversationActive = this.activeView === 'conversation';
+            const headingsActive = this.activeView === 'headings';
+            const searchActive = this.activeView === 'search' && this.config.enableQuickSearch;
             this.conversationNav.hidden = !conversationActive;
-            this.tocNav.hidden = conversationActive;
+            this.tocNav.hidden = !headingsActive;
+            if (this.searchView) this.searchView.hidden = !searchActive;
             this.viewConversationButton?.setAttribute('aria-selected', String(conversationActive));
-            this.viewHeadingsButton?.setAttribute('aria-selected', String(!conversationActive));
+            this.viewHeadingsButton?.setAttribute('aria-selected', String(headingsActive));
+            this.viewSearchButton?.setAttribute('aria-selected', String(searchActive));
             this.viewConversationButton?.setAttribute('tabindex', conversationActive ? '0' : '-1');
-            this.viewHeadingsButton?.setAttribute('tabindex', conversationActive ? '-1' : '0');
+            this.viewHeadingsButton?.setAttribute('tabindex', headingsActive ? '0' : '-1');
+            this.viewSearchButton?.setAttribute('tabindex', searchActive ? '0' : '-1');
         }
 
         updateViewMeta() {
             const conversationCount = this.conversationItems.length;
             const headingCount = this.headings.length;
+            const searchCount = this.searchTotalMatches;
+            const maxSearchResults = Math.max(
+                1,
+                Number(this.config.quickSearchMaxResults) || 80,
+            );
+            const searchCountLabel = searchCount > maxSearchResults
+                ? `${maxSearchResults}+`
+                : String(searchCount);
             const conversationActive = this.activeView === 'conversation';
-            const activeCount = conversationActive ? conversationCount : headingCount;
+            const searchActive = this.activeView === 'search';
+            const activeCount = conversationActive
+                ? String(conversationCount)
+                : searchActive
+                    ? searchCountLabel
+                    : String(headingCount);
 
             if (this.viewConversationCount) {
                 this.viewConversationCount.textContent = String(conversationCount);
@@ -1313,19 +1636,30 @@
             if (this.viewHeadingsCount) {
                 this.viewHeadingsCount.textContent = String(headingCount);
             }
+            if (this.viewSearchCount) {
+                this.viewSearchCount.textContent = searchCountLabel;
+            }
             if (this.countLabel) {
-                this.countLabel.textContent = conversationActive
-                    ? `${conversationCount} 问`
-                    : `${headingCount} 节`;
+                if (conversationActive) {
+                    this.countLabel.textContent = `${conversationCount} 问`;
+                } else if (searchActive) {
+                    this.countLabel.textContent = this.searchIndexing
+                        ? '搜索中…'
+                        : this.searchQuery.trim()
+                            ? `${searchCount} 项`
+                            : '快速搜索';
+                } else {
+                    this.countLabel.textContent = `${headingCount} 节`;
+                }
             }
             if (this.launcherMode) {
-                this.launcherMode.textContent = conversationActive ? '问' : '章';
+                this.launcherMode.textContent = conversationActive ? '问' : searchActive ? '搜' : '章';
             }
             if (this.launcherCount) {
-                this.launcherCount.textContent = String(activeCount);
+                this.launcherCount.textContent = activeCount;
             }
             if (this.launcher) {
-                this.launcher.title = `悬停临时展开；在目录中点击、拖动或缩放后保持展开；问答 ${conversationCount}，章节 ${headingCount}`;
+                this.launcher.title = `悬停临时展开；在目录中点击、拖动或缩放后保持展开；问答 ${conversationCount}，章节 ${headingCount}，搜索 ${searchCount}（Alt+Shift+F）`;
             }
             if (this.conversationEmptyState) {
                 this.conversationEmptyState.hidden = conversationCount > 0;
@@ -1333,6 +1667,25 @@
             if (this.headingEmptyState) {
                 this.headingEmptyState.hidden = headingCount > 0;
             }
+        }
+
+        getActiveViewNavigation() {
+            if (this.activeView === 'conversation') {
+                return {
+                    nav: this.conversationNav,
+                    button: this.conversationItemButtons[this.activeConversationIndex] || null,
+                };
+            }
+            if (this.activeView === 'search') {
+                return {
+                    nav: this.searchNav,
+                    button: this.searchResultButtons[this.activeSearchResultIndex] || null,
+                };
+            }
+            return {
+                nav: this.tocNav,
+                button: this.itemButtons[this.activeIndex] || null,
+            };
         }
 
         getVisibleWidget() {
@@ -1654,13 +2007,8 @@
 
                 if (!this.collapsed) {
                     this.ensurePanelSizeInViewport(false);
-                    const current = this.activeView === 'conversation'
-                        ? this.conversationItemButtons[this.activeConversationIndex]
-                        : this.itemButtons[this.activeIndex];
-                    const nav = this.activeView === 'conversation'
-                        ? this.conversationNav
-                        : this.tocNav;
-                    if (current) this.scrollItemIntoView(nav, current);
+                    const { nav, button } = this.getActiveViewNavigation();
+                    if (button) this.scrollItemIntoView(nav, button);
 
                     if (this.transientHoverOpen && !this.panel?.matches(':hover')) {
                         this.scheduleHoverCollapse();
@@ -2166,8 +2514,32 @@
                 return;
             }
 
+            if (
+                this.config.enableQuickSearch &&
+                event.altKey &&
+                event.shiftKey &&
+                event.code === 'KeyF'
+            ) {
+                if (!this.host?.hidden) {
+                    event.preventDefault();
+                    this.setCollapsed(false, { source: 'keyboard', persist: true });
+                    this.setActiveView('search', true, { focusSearch: true });
+                }
+                return;
+            }
+
             if (event.key === 'Escape' && !this.collapsed) {
                 const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+                if (
+                    this.searchInput &&
+                    path.includes(this.searchInput) &&
+                    this.searchInput.value
+                ) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.clearSearchQuery(true);
+                    return;
+                }
                 if (this.host && path.includes(this.host)) {
                     this.setCollapsed(true, { source: 'keyboard', persist: true });
                 }
@@ -2195,6 +2567,7 @@
             this.disconnectCurrentAnswer();
             this.clearToc();
             this.clearConversationToc();
+            this.resetQuickSearchForNavigation();
             this.bindMainObserver();
             this.syncOfficialConversationNav();
             this.scheduleConversationRebuild(80);
@@ -2223,6 +2596,7 @@
                 childList: true,
                 subtree: true,
             });
+            this.markSearchIndexDirty(false);
             this.scheduleConversationRebuild(60);
         }
 
@@ -2235,6 +2609,7 @@
         onMainMutations(records) {
             let assistantAdded = false;
             let conversationChanged = false;
+            let searchContentChanged = false;
 
             for (const record of records) {
                 if (
@@ -2242,12 +2617,19 @@
                     record.target instanceof Node &&
                     this.currentAnswer.contains(record.target)
                 ) {
+                    searchContentChanged = true;
                     continue;
                 }
 
                 for (const node of [...record.addedNodes, ...record.removedNodes]) {
                     if (this.nodeMatchesOrContains(node, '[data-message-author-role="assistant"]')) {
                         assistantAdded = true;
+                        searchContentChanged = true;
+                    } else if (
+                        node instanceof Text &&
+                        node.parentElement?.closest?.('[data-message-author-role="assistant"]')
+                    ) {
+                        searchContentChanged = true;
                     }
                     if (
                         this.nodeMatchesOrContains(node, '[data-message-author-role="user"]') ||
@@ -2262,8 +2644,10 @@
                 this.disconnectCurrentAnswer();
                 this.clearToc();
                 assistantAdded = true;
+                searchContentChanged = true;
             }
 
+            if (searchContentChanged) this.markSearchIndexDirty(true);
             if (conversationChanged) this.scheduleConversationRebuild();
             if (assistantAdded) this.requestFrame(true);
         }
@@ -2398,8 +2782,12 @@
             this.answerObserver.observe(answer, {
                 childList: true,
                 subtree: true,
+                characterData: true,
             });
 
+            if (this.config.quickSearchScope === 'current-answer') {
+                this.markSearchIndexDirty(true);
+            }
             this.rebuildToc();
             this.scheduleConversationRebuild(30);
             this.updateActiveConversation(true);
@@ -2407,6 +2795,7 @@
         }
 
         disconnectCurrentAnswer() {
+            const hadCurrentAnswer = Boolean(this.currentAnswer);
             this.answerObserver?.disconnect();
             this.answerObserver = null;
             this.headingTextObserver?.disconnect();
@@ -2414,6 +2803,9 @@
             this.currentAnswer = null;
             this.currentContentRoot = null;
             this.currentScrollRoot = null;
+            if (hadCurrentAnswer && this.config.quickSearchScope === 'current-answer') {
+                this.markSearchIndexDirty(true);
+            }
             this.activeIndex = -1;
             this.lastScrollTop = 0;
             window.clearTimeout(this.answerDetectionTimer);
@@ -2425,7 +2817,16 @@
         onAnswerMutations(records) {
             let touchesHeading = false;
 
+            if (records.length) this.markSearchIndexDirty(true);
+
             for (const record of records) {
+                if (record.type === 'characterData') {
+                    if (record.target.parentElement?.closest(this.config.answerTocHeadingSelector)) {
+                        touchesHeading = true;
+                        break;
+                    }
+                    continue;
+                }
                 if (record.type !== 'childList') continue;
 
                 if (
@@ -2582,6 +2983,810 @@
             this.list?.replaceChildren();
             this.updateViewMeta();
             this.syncVisibility();
+        }
+
+
+        onSearchInput() {
+            if (!this.searchInput) return;
+            this.searchQuery = this.searchInput.value;
+            if (this.searchClearButton) {
+                this.searchClearButton.hidden = !this.searchInput.value;
+            }
+            this.scheduleQuickSearch();
+        }
+
+        onSearchKeyDown(event) {
+            if (!(event instanceof KeyboardEvent)) return;
+
+            if (event.key === 'Enter') {
+                if (!this.searchResults.length) return;
+                event.preventDefault();
+                const index = this.activeSearchResultIndex >= 0
+                    ? this.activeSearchResultIndex
+                    : 0;
+                this.jumpToSearchResult(index);
+                return;
+            }
+
+            if (event.key === 'ArrowDown' && this.searchResults.length) {
+                event.preventDefault();
+                const next = Math.min(
+                    this.searchResults.length - 1,
+                    Math.max(0, this.activeSearchResultIndex + 1),
+                );
+                this.applyActiveSearchResultIndex(next, true);
+                return;
+            }
+
+            if (event.key === 'ArrowUp' && this.searchResults.length) {
+                event.preventDefault();
+                const next = Math.max(0, this.activeSearchResultIndex - 1);
+                this.applyActiveSearchResultIndex(next, true);
+            }
+        }
+
+        clearSearchQuery(focus = false) {
+            window.clearTimeout(this.searchDebounceTimer);
+            this.searchDebounceTimer = 0;
+            this.cancelSearchIndexBuild();
+            this.cancelSearchJump();
+
+            if (this.searchInput) {
+                this.searchInput.value = '';
+                this.searchInput.removeAttribute('aria-busy');
+            }
+            if (this.searchClearButton) this.searchClearButton.hidden = true;
+
+            this.searchQuery = '';
+            this.searchTerms = [];
+            this.searchResults = [];
+            this.searchResultButtons = [];
+            this.activeSearchResultIndex = -1;
+            this.searchTotalMatches = 0;
+            this.searchList?.replaceChildren();
+            if (this.searchEmptyState) {
+                this.searchEmptyState.hidden = false;
+                this.searchEmptyState.textContent = '输入关键词开始搜索';
+            }
+            this.setSearchStatus('输入关键词，检索当前已加载的章节和段落');
+            this.updateViewMeta();
+
+            if (focus) window.requestAnimationFrame(() => this.searchInput?.focus());
+        }
+
+        resetQuickSearchForNavigation() {
+            window.clearTimeout(this.searchDebounceTimer);
+            this.searchDebounceTimer = 0;
+            this.cancelSearchIndexBuild();
+            this.cancelSearchJump();
+            this.searchIndex = [];
+            this.searchIndexBuilt = false;
+            this.searchIndexDirty = true;
+            this.searchIndexRevision += 1;
+            this.searchConversationMapSignature = '';
+            this.clearSearchQuery(false);
+        }
+
+        setSearchStatus(text) {
+            if (this.searchStatus) this.searchStatus.textContent = String(text || '');
+        }
+
+        getQuickSearchScopeLabel() {
+            return this.config.quickSearchScope === 'current-answer'
+                ? '当前回答'
+                : '当前已加载内容';
+        }
+
+        normalizeSearchText(text) {
+            return this.normalizeConversationText(text).toLocaleLowerCase();
+        }
+
+        parseQuickSearchQuery(rawQuery) {
+            const normalized = this.normalizeSearchText(rawQuery);
+            const terms = [...new Set(normalized.split(/\s+/).filter(Boolean))];
+            return {
+                normalized,
+                terms,
+                significantLength: normalized.replace(/\s+/g, '').length,
+            };
+        }
+
+        scheduleQuickSearch(delay = this.config.quickSearchDebounceMs) {
+            if (!this.config.enableQuickSearch) return;
+            window.clearTimeout(this.searchDebounceTimer);
+            this.searchDebounceTimer = window.setTimeout(() => {
+                this.searchDebounceTimer = 0;
+                this.runQuickSearch();
+            }, Math.max(0, Number(delay) || 0));
+        }
+
+        markSearchIndexDirty(schedule = true) {
+            if (!this.config.enableQuickSearch) return;
+            this.searchIndexDirty = true;
+            this.searchIndexRevision += 1;
+            if (this.searchIndexing) this.cancelSearchIndexBuild();
+
+            if (
+                schedule &&
+                this.searchInput?.value.trim() &&
+                this.activeView === 'search'
+            ) {
+                this.scheduleQuickSearch(Math.max(180, Number(this.config.quickSearchDebounceMs) || 0));
+            }
+        }
+
+        cancelSearchIndexBuild() {
+            this.searchBuildToken += 1;
+            if (this.searchBuildHandle) {
+                if (
+                    this.searchBuildHandleType === 'idle' &&
+                    typeof window.cancelIdleCallback === 'function'
+                ) {
+                    window.cancelIdleCallback(this.searchBuildHandle);
+                } else {
+                    window.clearTimeout(this.searchBuildHandle);
+                }
+            }
+            this.searchBuildHandle = 0;
+            this.searchBuildHandleType = '';
+            this.searchIndexing = false;
+            this.searchInput?.removeAttribute('aria-busy');
+        }
+
+        queueSearchIndexStep(callback) {
+            if (typeof window.requestIdleCallback === 'function') {
+                this.searchBuildHandleType = 'idle';
+                this.searchBuildHandle = window.requestIdleCallback(callback, { timeout: 140 });
+                return;
+            }
+
+            this.searchBuildHandleType = 'timeout';
+            this.searchBuildHandle = window.setTimeout(() => {
+                callback({
+                    didTimeout: true,
+                    timeRemaining: () => 8,
+                });
+            }, 0);
+        }
+
+        startSearchIndexBuild() {
+            if (!this.config.enableQuickSearch || this.searchIndexing) return;
+
+            this.cancelSearchIndexBuild();
+            const token = this.searchBuildToken;
+            const revision = this.searchIndexRevision;
+            let descriptors = [];
+
+            try {
+                descriptors = this.collectSearchCandidateDescriptors();
+            } catch (error) {
+                console.warn('[ChatGPT 双层目录] 建立搜索候选集失败：', error);
+                this.searchIndexing = false;
+                this.setSearchStatus('搜索索引建立失败，请刷新页面后重试');
+                return;
+            }
+
+            this.searchIndexing = true;
+            this.searchInput?.setAttribute('aria-busy', 'true');
+            this.setSearchStatus(`正在建立索引… 0/${descriptors.length}`);
+            this.updateViewMeta();
+
+            const entries = [];
+            const chunkSize = Math.max(
+                20,
+                Number(this.config.quickSearchIndexChunkSize) || 160,
+            );
+            let cursor = 0;
+
+            const processChunk = (deadline) => {
+                this.searchBuildHandle = 0;
+                this.searchBuildHandleType = '';
+                if (token !== this.searchBuildToken) return;
+
+                let processed = 0;
+                while (
+                    cursor < descriptors.length &&
+                    processed < chunkSize &&
+                    (
+                        processed < 20 ||
+                        deadline?.didTimeout ||
+                        typeof deadline?.timeRemaining !== 'function' ||
+                        deadline.timeRemaining() > 2
+                    )
+                ) {
+                    const entry = this.buildSearchIndexEntry(descriptors[cursor]);
+                    if (entry) entries.push(entry);
+                    cursor += 1;
+                    processed += 1;
+                }
+
+                if (cursor < descriptors.length) {
+                    this.setSearchStatus(`正在建立索引… ${cursor}/${descriptors.length}`);
+                    this.queueSearchIndexStep(processChunk);
+                    return;
+                }
+
+                this.searchIndexing = false;
+                this.searchInput?.removeAttribute('aria-busy');
+
+                if (revision !== this.searchIndexRevision) {
+                    this.searchIndexDirty = true;
+                    this.scheduleQuickSearch(80);
+                    return;
+                }
+
+                this.searchIndex = entries;
+                this.searchIndexBuilt = true;
+                this.searchIndexDirty = false;
+                this.runQuickSearch();
+            };
+
+            this.queueSearchIndexStep(processChunk);
+        }
+
+        getSearchAssistantElements() {
+            if (this.config.quickSearchScope === 'current-answer') {
+                return this.currentAnswer?.isConnected ? [this.currentAnswer] : [];
+            }
+
+            return [...document.querySelectorAll(ASSISTANT_SELECTOR)].filter((element) => (
+                element instanceof HTMLElement &&
+                element.isConnected &&
+                !element.parentElement?.closest('[data-message-author-role="assistant"]') &&
+                !element.closest('[hidden], [aria-hidden="true"]')
+            ));
+        }
+
+        buildSearchAssistantContextMap(assistants) {
+            const map = new Map();
+            const liveConversationItems = this.conversationItems
+                .filter((item) => item.userElement?.isConnected)
+                .sort((a, b) => {
+                    if (a.userElement === b.userElement) return 0;
+                    const relation = a.userElement.compareDocumentPosition(b.userElement);
+                    if (relation & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                    if (relation & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                    return 0;
+                });
+
+            for (const assistant of assistants) {
+                let logicalIndex = -1;
+                for (const item of liveConversationItems) {
+                    const relation = item.userElement.compareDocumentPosition(assistant);
+                    if (relation & Node.DOCUMENT_POSITION_FOLLOWING) {
+                        logicalIndex = item.logicalIndex;
+                    } else if (relation & Node.DOCUMENT_POSITION_PRECEDING) {
+                        break;
+                    }
+                }
+
+                if (
+                    logicalIndex < 0 &&
+                    assistant === this.currentAnswer &&
+                    this.activeConversationIndex >= 0
+                ) {
+                    logicalIndex = this.conversationItems[this.activeConversationIndex]?.logicalIndex ?? -1;
+                }
+
+                map.set(assistant, logicalIndex);
+            }
+            return map;
+        }
+
+        getSearchKindMeta(element) {
+            const tagName = element.tagName.toUpperCase();
+            if (/^H[1-6]$/.test(tagName)) {
+                const level = Number.parseInt(tagName.slice(1), 10) || 2;
+                return { kind: 'heading', kindLabel: `H${level}`, level };
+            }
+            if (tagName === 'LI') return { kind: 'list', kindLabel: '列表', level: 0 };
+            if (tagName === 'BLOCKQUOTE') return { kind: 'quote', kindLabel: '引用', level: 0 };
+            if (tagName === 'TR') return { kind: 'table', kindLabel: '表格', level: 0 };
+            if (tagName === 'PRE') return { kind: 'code', kindLabel: '代码', level: 0 };
+            return { kind: 'paragraph', kindLabel: '段落', level: 0 };
+        }
+
+        collectSearchCandidateDescriptors() {
+            const assistants = this.getSearchAssistantElements();
+            const contextMap = this.buildSearchAssistantContextMap(assistants);
+            const headingSelector = String(
+                this.config.quickSearchHeadingSelector || 'h1, h2, h3, h4, h5, h6',
+            );
+            const paragraphSelector = String(
+                this.config.quickSearchParagraphSelector || 'p, li, blockquote, pre, table tr',
+            );
+            const selector = `${headingSelector}, ${paragraphSelector}`;
+            const maxBlocks = Math.max(
+                1,
+                Number(this.config.quickSearchMaxIndexedBlocks) || 8000,
+            );
+            const descriptors = [];
+            const seen = new Set();
+            let order = 0;
+
+            for (const assistant of assistants) {
+                const markdownRoots = assistant.matches('.markdown')
+                    ? [assistant]
+                    : [...assistant.querySelectorAll('.markdown')].filter((root) => (
+                        root.closest('[data-message-author-role="assistant"]') === assistant &&
+                        !root.parentElement?.closest('.markdown')
+                    ));
+                const roots = markdownRoots.length ? markdownRoots : [assistant];
+
+                for (const root of roots) {
+                    let elements;
+                    try {
+                        elements = root.querySelectorAll(selector);
+                    } catch (error) {
+                        console.warn('[ChatGPT 双层目录] 搜索选择器无效：', error);
+                        return descriptors;
+                    }
+
+                    for (const element of elements) {
+                        if (!(element instanceof HTMLElement) || seen.has(element)) continue;
+                        seen.add(element);
+                        if (!element.isConnected) continue;
+                        if (element.closest('[hidden], [aria-hidden="true"]')) continue;
+                        if (element.closest('[data-message-author-role="assistant"]') !== assistant) continue;
+                        if (element.closest('button, nav, aside, [role="toolbar"], [role="menu"]')) {
+                            continue;
+                        }
+
+                        const tagName = element.tagName.toUpperCase();
+                        if (tagName === 'PRE' && !this.config.quickSearchIncludeCodeBlocks) continue;
+
+                        /*
+                         * li/blockquote 中若已经有更细粒度的 p/li 等节点，则只索引子节点，
+                         * 避免同一段文字以父子容器重复出现。
+                         */
+                        if (
+                            (tagName === 'LI' || tagName === 'BLOCKQUOTE') &&
+                            element.querySelector('p, li, blockquote, pre, table tr')
+                        ) {
+                            continue;
+                        }
+
+                        const meta = this.getSearchKindMeta(element);
+                        descriptors.push({
+                            element,
+                            assistant,
+                            logicalIndex: contextMap.get(assistant) ?? -1,
+                            tagName,
+                            order,
+                            ...meta,
+                        });
+                        order += 1;
+                        if (descriptors.length >= maxBlocks) return descriptors;
+                    }
+                }
+            }
+
+            return descriptors;
+        }
+
+        extractSearchBlockText(element) {
+            if (!(element instanceof HTMLElement)) return '';
+            if (element.tagName === 'TR') {
+                const cells = [...element.querySelectorAll(':scope > th, :scope > td')]
+                    .map((cell) => this.normalizeConversationText(cell.textContent ?? ''))
+                    .filter(Boolean);
+                return cells.join(' · ');
+            }
+            return this.normalizeConversationText(element.textContent ?? '');
+        }
+
+        buildSearchIndexEntry(descriptor) {
+            if (!descriptor?.element?.isConnected) return null;
+            const fullText = this.extractSearchBlockText(descriptor.element);
+            const minLength = Math.max(
+                1,
+                Number(this.config.quickSearchMinBlockTextLength) || 2,
+            );
+            if (fullText.length < minLength) return null;
+
+            const searchText = this.normalizeSearchText(fullText);
+            if (!searchText) return null;
+            return {
+                ...descriptor,
+                fullText,
+                searchText,
+            };
+        }
+
+        runQuickSearch() {
+            if (!this.config.enableQuickSearch || !this.searchInput) return;
+
+            const rawQuery = this.searchInput.value;
+            this.searchQuery = rawQuery;
+            if (this.searchClearButton) this.searchClearButton.hidden = !rawQuery;
+
+            const parsed = this.parseQuickSearchQuery(rawQuery);
+            this.searchTerms = parsed.terms;
+            const minLength = Math.max(
+                1,
+                Number(this.config.quickSearchMinQueryLength) || 1,
+            );
+
+            if (!parsed.normalized || parsed.significantLength < minLength) {
+                this.searchResults = [];
+                this.searchResultButtons = [];
+                this.activeSearchResultIndex = -1;
+                this.searchTotalMatches = 0;
+                this.searchList?.replaceChildren();
+                if (this.searchEmptyState) {
+                    this.searchEmptyState.hidden = false;
+                    this.searchEmptyState.textContent = parsed.normalized
+                        ? `请输入至少 ${minLength} 个字符`
+                        : '输入关键词开始搜索';
+                }
+                this.setSearchStatus(`检索范围：${this.getQuickSearchScopeLabel()}`);
+                this.updateViewMeta();
+                return;
+            }
+
+            if (!this.searchIndexBuilt || this.searchIndexDirty) {
+                this.startSearchIndexBuild();
+                return;
+            }
+
+            this.filterQuickSearchIndex(parsed);
+        }
+
+        countSearchOccurrences(text, term, limit = 8) {
+            if (!term) return 0;
+            let count = 0;
+            let from = 0;
+            while (count < limit) {
+                const index = text.indexOf(term, from);
+                if (index < 0) break;
+                count += 1;
+                from = index + Math.max(1, term.length);
+            }
+            return count;
+        }
+
+        filterQuickSearchIndex(parsed) {
+            const matches = [];
+            for (const entry of this.searchIndex) {
+                let firstMatchIndex = Number.POSITIVE_INFINITY;
+                let occurrenceCount = 0;
+                let allTermsMatch = true;
+
+                for (const term of parsed.terms) {
+                    const index = entry.searchText.indexOf(term);
+                    if (index < 0) {
+                        allTermsMatch = false;
+                        break;
+                    }
+                    firstMatchIndex = Math.min(firstMatchIndex, index);
+                    occurrenceCount += this.countSearchOccurrences(entry.searchText, term);
+                }
+                if (!allTermsMatch) continue;
+
+                const phraseIndex = entry.searchText.indexOf(parsed.normalized);
+                let score = entry.kind === 'heading' ? 70 : 0;
+                if (entry.searchText === parsed.normalized) score += 160;
+                if (entry.searchText.startsWith(parsed.normalized)) score += 65;
+                if (phraseIndex >= 0) score += 38;
+                score += Math.max(0, 28 - firstMatchIndex / 18);
+                score += Math.min(24, occurrenceCount * 3);
+                score -= Math.min(18, entry.fullText.length / 600);
+
+                matches.push({
+                    ...entry,
+                    firstMatchIndex,
+                    score,
+                });
+            }
+
+            matches.sort((a, b) => b.score - a.score || a.order - b.order);
+            this.searchTotalMatches = matches.length;
+            const maxResults = Math.max(
+                1,
+                Number(this.config.quickSearchMaxResults) || 80,
+            );
+            this.searchResults = matches.slice(0, maxResults);
+            this.renderSearchResults();
+        }
+
+        getSearchResultContextLabel(result) {
+            if (Number.isInteger(result?.logicalIndex) && result.logicalIndex >= 0) {
+                return `第 ${result.logicalIndex + 1} 问`;
+            }
+            return this.config.quickSearchScope === 'current-answer'
+                ? '当前回答'
+                : '回答';
+        }
+
+        appendHighlightedSearchSnippet(container, fullText, terms) {
+            const maxLength = Math.max(
+                60,
+                Number(this.config.quickSearchSnippetLength) || 180,
+            );
+            const folded = fullText.toLocaleLowerCase();
+            let firstMatch = Number.POSITIVE_INFINITY;
+            for (const term of terms) {
+                const index = folded.indexOf(term);
+                if (index >= 0) firstMatch = Math.min(firstMatch, index);
+            }
+            if (!Number.isFinite(firstMatch)) firstMatch = 0;
+
+            let start = Math.max(0, firstMatch - Math.floor(maxLength * 0.34));
+            let end = Math.min(fullText.length, start + maxLength);
+            if (end - start < maxLength && start > 0) {
+                start = Math.max(0, end - maxLength);
+            }
+
+            const snippet = fullText.slice(start, end);
+            const foldedSnippet = snippet.toLocaleLowerCase();
+            const ranges = [];
+            for (const term of terms) {
+                let from = 0;
+                let guard = 0;
+                while (guard < 20) {
+                    const index = foldedSnippet.indexOf(term, from);
+                    if (index < 0) break;
+                    ranges.push([index, index + term.length]);
+                    from = index + Math.max(1, term.length);
+                    guard += 1;
+                }
+            }
+            ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+
+            const merged = [];
+            for (const range of ranges) {
+                const previous = merged[merged.length - 1];
+                if (previous && range[0] <= previous[1]) {
+                    previous[1] = Math.max(previous[1], range[1]);
+                } else {
+                    merged.push([...range]);
+                }
+            }
+
+            if (start > 0) container.append('…');
+            let cursor = 0;
+            for (const [rangeStart, rangeEnd] of merged) {
+                if (rangeStart > cursor) container.append(snippet.slice(cursor, rangeStart));
+                const mark = document.createElement('mark');
+                mark.textContent = snippet.slice(rangeStart, rangeEnd);
+                container.appendChild(mark);
+                cursor = rangeEnd;
+            }
+            if (cursor < snippet.length) container.append(snippet.slice(cursor));
+            if (end < fullText.length) container.append('…');
+        }
+
+        renderSearchResults() {
+            if (!this.searchList) return;
+
+            const fragment = document.createDocumentFragment();
+            this.searchResultButtons = [];
+
+            this.searchResults.forEach((result, index) => {
+                const item = document.createElement('li');
+                const button = document.createElement('button');
+                const meta = document.createElement('span');
+                const kind = document.createElement('span');
+                const context = document.createElement('span');
+                const snippet = document.createElement('span');
+
+                button.type = 'button';
+                button.className = 'toc-item search-result';
+                button.dataset.kind = 'search';
+                button.dataset.searchResultIndex = String(index);
+                button.dataset.active = 'false';
+                button.title = result.fullText;
+
+                meta.className = 'search-result-meta';
+                kind.className = 'search-result-kind';
+                kind.textContent = result.kindLabel;
+                context.className = 'search-result-context';
+                context.textContent = this.getSearchResultContextLabel(result);
+                meta.append(kind, context);
+
+                snippet.className = 'search-result-snippet';
+                this.appendHighlightedSearchSnippet(
+                    snippet,
+                    result.fullText,
+                    this.searchTerms,
+                );
+
+                button.append(meta, snippet);
+                item.appendChild(button);
+                fragment.appendChild(item);
+                this.searchResultButtons.push(button);
+            });
+
+            this.searchList.replaceChildren(fragment);
+            if (this.searchEmptyState) {
+                this.searchEmptyState.hidden = this.searchResults.length > 0;
+                this.searchEmptyState.textContent = this.searchResults.length
+                    ? ''
+                    : `未在${this.getQuickSearchScopeLabel()}中找到匹配内容`;
+            }
+
+            const displayed = this.searchResults.length;
+            const indexed = this.searchIndex.length;
+            if (this.searchTotalMatches > displayed) {
+                this.setSearchStatus(
+                    `找到 ${this.searchTotalMatches} 处，显示前 ${displayed} 条 · 已索引 ${indexed} 个文本块`,
+                );
+            } else {
+                this.setSearchStatus(
+                    `找到 ${this.searchTotalMatches} 处 · 已索引 ${indexed} 个文本块`,
+                );
+            }
+
+            this.activeSearchResultIndex = -1;
+            if (this.searchResults.length) this.applyActiveSearchResultIndex(0, false);
+            this.updateViewMeta();
+        }
+
+        applyActiveSearchResultIndex(index, ensureVisible) {
+            if (
+                !Number.isInteger(index) ||
+                index < 0 ||
+                index >= this.searchResultButtons.length
+            ) {
+                return;
+            }
+            if (this.activeSearchResultIndex === index && !ensureVisible) return;
+
+            const previous = this.searchResultButtons[this.activeSearchResultIndex];
+            if (previous) {
+                previous.dataset.active = 'false';
+                previous.removeAttribute('aria-current');
+            }
+
+            this.activeSearchResultIndex = index;
+            const current = this.searchResultButtons[index];
+            if (!current) return;
+            current.dataset.active = 'true';
+            current.setAttribute('aria-current', 'true');
+            if (ensureVisible || (!this.collapsed && this.activeView === 'search')) {
+                this.scrollItemIntoView(this.searchNav, current);
+            }
+        }
+
+        clearSearchTargetHighlight() {
+            window.clearTimeout(this.searchHighlightTimer);
+            this.searchHighlightTimer = 0;
+            if (this.searchHighlightElement?.isConnected) {
+                this.searchHighlightElement.removeAttribute('data-cgpt-search-jump-target');
+            }
+            this.searchHighlightElement = null;
+        }
+
+        highlightSearchTarget(target) {
+            if (!this.config.quickSearchHighlightTarget || !(target instanceof HTMLElement)) {
+                return;
+            }
+            this.clearSearchTargetHighlight();
+            this.searchHighlightElement = target;
+            target.setAttribute('data-cgpt-search-jump-target', '');
+            this.searchHighlightTimer = window.setTimeout(() => {
+                this.clearSearchTargetHighlight();
+            }, 2200);
+        }
+
+        cancelSearchJump() {
+            this.searchJumpToken += 1;
+            for (const timer of this.searchJumpTimers) window.clearTimeout(timer);
+            this.searchJumpTimers.clear();
+            this.clearSearchTargetHighlight();
+        }
+
+        scheduleSearchJumpTask(callback, delay, token) {
+            const timer = window.setTimeout(() => {
+                this.searchJumpTimers.delete(timer);
+                if (token !== this.searchJumpToken) return;
+                callback();
+            }, Math.max(0, Number(delay) || 0));
+            this.searchJumpTimers.add(timer);
+            return timer;
+        }
+
+        getQuickSearchScrollOffset() {
+            return Math.max(
+                0,
+                Number(this.config.quickSearchScrollOffsetPx) || 96,
+            );
+        }
+
+        scrollSearchTarget(target, behavior = 'auto') {
+            if (!(target instanceof HTMLElement) || !target.isConnected) return false;
+            const turn = this.getConversationTurnElement(target) || target.closest(ASSISTANT_SELECTOR);
+            if (turn instanceof HTMLElement) this.revealConversationJumpTarget(turn);
+
+            const targetRect = target.getBoundingClientRect();
+            const offset = this.getQuickSearchScrollOffset();
+            const scrollRoot = this.findScrollRoot(target);
+
+            if (scrollRoot instanceof HTMLElement) {
+                const rootRect = scrollRoot.getBoundingClientRect();
+                const visibleTop = Math.max(0, rootRect.top);
+                const visibleBottom = Math.min(window.innerHeight, rootRect.bottom);
+                const availableHeight = Math.max(1, visibleBottom - visibleTop);
+                const desiredTop = visibleTop + Math.min(offset, availableHeight * 0.3);
+                scrollRoot.scrollBy({ top: targetRect.top - desiredTop, behavior });
+            } else {
+                const desiredTop = Math.min(offset, window.innerHeight * 0.3);
+                window.scrollBy({ top: targetRect.top - desiredTop, behavior });
+            }
+            return true;
+        }
+
+        performSearchJump(target, resultIndex) {
+            if (!(target instanceof HTMLElement) || !target.isConnected) return false;
+
+            this.cancelSearchJump();
+            const token = this.searchJumpToken;
+            this.applyActiveSearchResultIndex(resultIndex, true);
+            this.highlightSearchTarget(target);
+            this.scrollSearchTarget(target, this.getConversationJumpBehavior());
+
+            for (const delay of [360, 820, 1450]) {
+                this.scheduleSearchJumpTask(() => {
+                    if (!target.isConnected) return;
+                    this.scrollSearchTarget(target, 'auto');
+                    this.highlightSearchTarget(target);
+                    this.requestFrame(true);
+                }, delay, token);
+            }
+            return true;
+        }
+
+        findLiveSearchTarget(result) {
+            if (result?.element?.isConnected) return result.element;
+            if (!result?.tagName || !result.fullText) return null;
+
+            const selector = result.tagName.toLowerCase();
+            if (!/^(h[1-6]|p|li|blockquote|pre|tr)$/.test(selector)) return null;
+
+            const candidates = [...document.querySelectorAll(`${ASSISTANT_SELECTOR} ${selector}`)]
+                .filter((element) => element instanceof HTMLElement && element.isConnected);
+            const assistants = [...new Set(candidates.map((element) => (
+                element.closest(ASSISTANT_SELECTOR)
+            )).filter(Boolean))];
+            const contextMap = this.buildSearchAssistantContextMap(assistants);
+            let fallback = null;
+
+            for (const element of candidates) {
+                const text = this.extractSearchBlockText(element);
+                if (text !== result.fullText) continue;
+                const assistant = element.closest(ASSISTANT_SELECTOR);
+                const logicalIndex = contextMap.get(assistant) ?? -1;
+                if (logicalIndex === result.logicalIndex) return element;
+                fallback ||= element;
+            }
+            return fallback;
+        }
+
+        jumpToSearchResult(index) {
+            const result = this.searchResults[index];
+            if (!result) return;
+
+            this.applyActiveSearchResultIndex(index, true);
+            if (this.performSearchJump(result.element, index)) return;
+
+            const conversationIndex = this.conversationItems.findIndex(
+                (item) => item.logicalIndex === result.logicalIndex,
+            );
+            if (conversationIndex < 0) {
+                this.markSearchIndexDirty(true);
+                this.setSearchStatus('目标内容已经重新加载，请稍候后再次点击搜索结果');
+                return;
+            }
+
+            this.cancelSearchJump();
+            const token = this.searchJumpToken;
+            this.jumpToConversation(conversationIndex);
+            for (const delay of [180, 420, 820, 1380, 2100]) {
+                this.scheduleSearchJumpTask(() => {
+                    const target = this.findLiveSearchTarget(result);
+                    if (target) this.performSearchJump(target, index);
+                }, delay, token);
+            }
         }
 
         getConversationTurnElement(element) {
@@ -3184,6 +4389,16 @@
 
             this.conversationItems = items;
             this.lastConversationSignature = this.getConversationSignature();
+            const searchConversationMapSignature = items.map((item, index) => {
+                const identity = item.userElement?.isConnected
+                    ? this.getConversationRecordIdentity(item.userElement, index)
+                    : '';
+                return `${item.logicalIndex}:${identity}`;
+            }).join('|');
+            if (searchConversationMapSignature !== this.searchConversationMapSignature) {
+                this.searchConversationMapSignature = searchConversationMapSignature;
+                this.markSearchIndexDirty(true);
+            }
             this.renderConversationItems();
             const active = this.findActiveConversationIndex();
             this.activeConversationIndex = -1;
@@ -3235,6 +4450,8 @@
             this.lastConversationSignature = '';
             this.pendingConversationLogicalIndex = -1;
             this.pendingConversationUntil = 0;
+            this.searchConversationMapSignature = '';
+            this.markSearchIndexDirty(true);
             if (clearCache) this.clearConversationLabelCacheState();
             this.conversationList?.replaceChildren();
             this.updateViewMeta();
@@ -3533,8 +4750,18 @@
             if (!this.host) return;
 
             const wasHidden = this.host.hidden;
+            const hasSearchableContent = Boolean(
+                this.config.enableQuickSearch &&
+                (
+                    this.config.quickSearchScope === 'current-answer'
+                        ? this.currentAnswer?.isConnected
+                        : this.currentAnswer?.isConnected || document.querySelector(ASSISTANT_SELECTOR)
+                ),
+            );
             const hasAnyNavigation =
-                this.conversationItems.length > 0 || this.headings.length > 0;
+                this.conversationItems.length > 0 ||
+                this.headings.length > 0 ||
+                hasSearchableContent;
             this.host.hidden = !this.isViewportEligible() || !hasAnyNavigation;
 
             if (this.host.hidden && this.transientHoverOpen) {
@@ -3549,6 +4776,9 @@
                 this.applyActiveView();
                 this.applyCollapsedState();
                 this.updateViewMeta();
+                if (this.activeView === 'search' && this.searchInput?.value.trim()) {
+                    this.scheduleQuickSearch(0);
+                }
 
                 if (wasHidden) {
                     window.requestAnimationFrame(() => {
@@ -3556,13 +4786,8 @@
                         this.ensureManualPositionInViewport(true);
 
                         if (!this.collapsed) {
-                            const current = this.activeView === 'conversation'
-                                ? this.conversationItemButtons[this.activeConversationIndex]
-                                : this.itemButtons[this.activeIndex];
-                            const nav = this.activeView === 'conversation'
-                                ? this.conversationNav
-                                : this.tocNav;
-                            if (current) this.scrollItemIntoView(nav, current);
+                            const { nav, button } = this.getActiveViewNavigation();
+                            if (button) this.scrollItemIntoView(nav, button);
                         }
                     });
                 }
