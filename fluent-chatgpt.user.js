@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      2.9.0
-// @description  优化长对话渲染，提供导航、全文搜索、全量加载，以及 Markdown/HTML/附件 ZIP 导出
+// @version      3.0.0
+// @description  优化长对话渲染，提供导航、全文搜索、全量加载，以及可靠的 Markdown/HTML/图片附件 ZIP 归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -106,10 +106,18 @@
         conversationZipIncludeHtmlByDefault: true,
         conversationZipIncludeAssetsByDefault: true,
 
+        // 优先读取当前对话的结构化数据，解析 image_asset_pointer、attachments、citations
+        // 与 file_id，再通过 /backend-api/files/download/{file_id} 获取临时下载地址。
+        conversationExportUseConversationApiAssets: true,
+
         // 单个附件和整个 ZIP 的软限制；超限文件会写入 manifest，但不会拖垮页面。
         conversationExportAssetTimeoutMs: 30000,
         conversationExportMaxAssetBytes: 512 * 1024 * 1024,
         conversationExportMaxZipBytes: 2 * 1024 * 1024 * 1024,
+
+        // 离线 HTML 使用完全自包含的响应式样式，不依赖 ChatGPT 页面类名或外部 CDN。
+        conversationExportHtmlIncludeSidebar: true,
+        conversationExportHtmlMaxWidthPx: 1240,
 
         // 问答预览最多显示 3 行；完整提问仍保留在鼠标悬停提示中。
         // 设为 0 可取消按行限制。
@@ -540,6 +548,13 @@
             this.conversationLoadProgress = { completed: 0, total: 0, failed: 0 };
             this.conversationExportInProgress = false;
             this.conversationAssetProgress = { completed: 0, total: 0, failed: 0 };
+            this.sessionAccessToken = '';
+            this.sessionAccessTokenPromise = null;
+            this.conversationApiSnapshot = null;
+            this.conversationApiSnapshotPromise = null;
+            this.conversationApiSnapshotId = '';
+            this.conversationApiAssetsByIndex = new Map();
+            this.apiDeviceId = '';
             this.exportIncludeMarkdown = this.config.conversationZipIncludeMarkdownByDefault !== false;
             this.exportIncludeHtml = this.config.conversationZipIncludeHtmlByDefault !== false;
             if (!this.exportIncludeMarkdown && !this.exportIncludeHtml) this.exportIncludeMarkdown = true;
@@ -3086,6 +3101,10 @@
             this.conversationArchive.clear();
             this.conversationArchiveFailures.clear();
             this.selectedConversationIndices.clear();
+            this.conversationApiSnapshot = null;
+            this.conversationApiSnapshotPromise = null;
+            this.conversationApiSnapshotId = '';
+            this.conversationApiAssetsByIndex.clear();
             this.clearConversationLabelCacheState();
             this.maxObservedOfficialLogicalIndex = -1;
             this.disconnectCurrentAnswer();
@@ -5802,6 +5821,375 @@
             return element.querySelector('.markdown, [data-message-content]') || element;
         }
 
+        getCurrentConversationId() {
+            const path = String(location.pathname || '');
+            const patterns = [
+                /\/c\/([a-z0-9_-]{12,})/i,
+                /\/conversation\/([a-z0-9_-]{12,})/i,
+            ];
+            for (const pattern of patterns) {
+                const match = pattern.exec(path);
+                if (match?.[1]) return match[1];
+            }
+            return '';
+        }
+
+        getApiDeviceId() {
+            if (this.apiDeviceId) return this.apiDeviceId;
+            const storageKey = 'cgpt-answer-toc-device-id-v1';
+            try {
+                const saved = sessionStorage.getItem(storageKey);
+                if (saved) {
+                    this.apiDeviceId = saved;
+                    return saved;
+                }
+            } catch { }
+            const generated = typeof crypto?.randomUUID === 'function'
+                ? crypto.randomUUID()
+                : `userscript-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+            this.apiDeviceId = generated;
+            try { sessionStorage.setItem(storageKey, generated); } catch { }
+            return generated;
+        }
+
+        async getSessionAccessToken(signal) {
+            if (this.sessionAccessToken) return this.sessionAccessToken;
+            if (!this.sessionAccessTokenPromise) {
+                this.sessionAccessTokenPromise = (async () => {
+                    const response = await fetch('/api/auth/session', {
+                        credentials: 'include',
+                        cache: 'no-store',
+                        signal,
+                        headers: { Accept: 'application/json' },
+                    });
+                    if (!response.ok) throw new Error(`会话令牌请求失败：HTTP ${response.status}`);
+                    const data = await response.json();
+                    const token = String(data?.accessToken || '');
+                    if (token) this.sessionAccessToken = token;
+                    return token;
+                })().finally(() => {
+                    this.sessionAccessTokenPromise = null;
+                });
+            }
+            try {
+                return await this.sessionAccessTokenPromise;
+            } catch {
+                return '';
+            }
+        }
+
+        async fetchChatGptApiJson(path, signal) {
+            const token = await this.getSessionAccessToken(signal);
+            const headers = {
+                Accept: 'application/json',
+                'Oai-Device-Id': this.getApiDeviceId(),
+                'Oai-Language': navigator.language || 'zh-CN',
+            };
+            if (token) headers.Authorization = `Bearer ${token}`;
+            const response = await fetch(path, {
+                method: 'GET',
+                credentials: 'include',
+                redirect: 'follow',
+                cache: 'no-store',
+                signal,
+                headers,
+            });
+            if (!response.ok) throw new Error(`ChatGPT API HTTP ${response.status}`);
+            const contentType = response.headers.get('content-type') || '';
+            const text = await response.text();
+            try {
+                return JSON.parse(text);
+            } catch {
+                throw new Error(`ChatGPT API 未返回 JSON（${contentType || 'unknown'}）`);
+            }
+        }
+
+        async getConversationApiSnapshot(signal, force = false) {
+            if (this.config.conversationExportUseConversationApiAssets === false) return null;
+            const conversationId = this.getCurrentConversationId();
+            if (!conversationId) return null;
+            if (!force && this.conversationApiSnapshot && this.conversationApiSnapshotId === conversationId) {
+                return this.conversationApiSnapshot;
+            }
+            if (!force && this.conversationApiSnapshotPromise && this.conversationApiSnapshotId === conversationId) {
+                return this.conversationApiSnapshotPromise;
+            }
+            this.conversationApiSnapshotId = conversationId;
+            const task = this.fetchChatGptApiJson(
+                `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
+                signal,
+            ).then((snapshot) => {
+                this.conversationApiSnapshot = snapshot;
+                this.conversationApiAssetsByIndex = this.buildConversationApiAssetMap(snapshot);
+                return snapshot;
+            }).finally(() => {
+                if (this.conversationApiSnapshotPromise === task) this.conversationApiSnapshotPromise = null;
+            });
+            this.conversationApiSnapshotPromise = task;
+            return task;
+        }
+
+        getConversationBranchMessages(snapshot) {
+            const mapping = snapshot?.mapping && typeof snapshot.mapping === 'object'
+                ? snapshot.mapping
+                : {};
+            const messages = [];
+            let nodeId = snapshot?.current_node || snapshot?.currentNode || '';
+            const visited = new Set();
+            while (nodeId && mapping[nodeId] && !visited.has(nodeId)) {
+                visited.add(nodeId);
+                const node = mapping[nodeId];
+                if (node?.message) messages.push(node.message);
+                nodeId = node?.parent || '';
+            }
+            if (messages.length) return messages.reverse();
+
+            const roots = Object.values(mapping).filter((node) => !node?.parent);
+            let node = roots[0] || null;
+            while (node) {
+                if (node.message) messages.push(node.message);
+                const children = Array.isArray(node.children) ? node.children : [];
+                node = children.length ? mapping[children[children.length - 1]] : null;
+            }
+            return messages;
+        }
+
+        extractFileIdFromValue(value) {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            const pointer = /^(?:file-service|sediment):\/\/(.+)$/i.exec(raw)?.[1];
+            if (pointer) return pointer.split(/[?#]/)[0];
+            const endpoint = /\/backend-api\/files\/(?:download\/)?([^/?#]+)(?:\/download)?(?:[?#]|$)/i.exec(raw)?.[1];
+            if (endpoint) return decodeURIComponent(endpoint);
+            return /\b(file-[a-z0-9_-]{8,})\b/i.exec(raw)?.[1] || '';
+        }
+
+        getAssetKindFromHints({ mimeType = '', filename = '', signal = '', image = false } = {}) {
+            const mime = String(mimeType || '').toLowerCase();
+            const combined = `${filename} ${signal}`.toLowerCase();
+            if (image || mime.startsWith('image/')) return 'image';
+            if (mime.includes('html') || /(?:artifact|\.html?\b)/i.test(combined)) return 'artifact-html';
+            if (mime.startsWith('audio/')) return 'audio';
+            if (mime.startsWith('video/')) return 'video';
+            return 'file';
+        }
+
+        collectApiAssetsFromMessage(message, logicalIndex) {
+            if (!message || logicalIndex < 0) return [];
+            const role = String(message.author?.role || 'assistant');
+            const assets = [];
+            const seen = new Set();
+            let sequence = 0;
+            const add = ({ fileId = '', url = '', filename = '', label = '', mimeType = '', kind = '', image = false } = {}) => {
+                const normalizedUrl = this.normalizeAssetCandidateUrl(url);
+                const resolvedFileId = fileId || this.extractFileIdFromValue(normalizedUrl);
+                if (!resolvedFileId && !normalizedUrl) return;
+                const dedupe = resolvedFileId ? `id:${resolvedFileId}` : `url:${normalizedUrl}`;
+                if (seen.has(dedupe)) return;
+                seen.add(dedupe);
+                sequence += 1;
+                const safeIdPart = String(resolvedFileId || sequence).replace(/[^a-z0-9_.-]+/gi, '-').slice(0, 64);
+                const finalFilename = filename || label || (image ? 'image' : 'attachment');
+                assets.push({
+                    id: `q${String(logicalIndex + 1).padStart(3, '0')}-${role}-api-${safeIdPart || sequence}`,
+                    logicalIndex,
+                    role,
+                    kind: kind || this.getAssetKindFromHints({ mimeType, filename: finalFilename, signal: label, image }),
+                    label: String(label || finalFilename || '附件').trim() || '附件',
+                    sourceUrl: normalizedUrl,
+                    alternateUrls: [],
+                    fileId: resolvedFileId,
+                    filenameHint: this.sanitizeAssetFilename(finalFilename || `asset-${sequence}`, `asset-${sequence}`),
+                    mimeType: String(mimeType || ''),
+                    byteLength: 0,
+                    blob: null,
+                    apiDerived: true,
+                    capturedAt: new Date().toISOString(),
+                });
+            };
+
+            const parts = Array.isArray(message.content?.parts) ? message.content.parts : [];
+            for (const part of parts) {
+                if (!part || typeof part !== 'object') continue;
+                if (part.content_type === 'image_asset_pointer' && part.asset_pointer) {
+                    add({
+                        fileId: this.extractFileIdFromValue(part.asset_pointer),
+                        url: part.download_url || part.url || '',
+                        filename: part.metadata?.file_name || part.metadata?.name || (part.metadata?.dalle ? 'generated-image.png' : 'image.png'),
+                        label: part.metadata?.dalle?.prompt || part.metadata?.name || '图片',
+                        mimeType: part.metadata?.mime_type || 'image/png',
+                        image: true,
+                    });
+                }
+            }
+
+            for (const attachment of message.metadata?.attachments || []) {
+                add({
+                    fileId: attachment?.id || attachment?.file_id || '',
+                    url: attachment?.download_url || attachment?.url || '',
+                    filename: attachment?.name || attachment?.file_name || 'attachment',
+                    label: attachment?.name || attachment?.title || '附件',
+                    mimeType: attachment?.mime_type || attachment?.content_type || '',
+                });
+            }
+
+            for (const citation of message.metadata?.citations || []) {
+                add({
+                    fileId: citation?.metadata?.file_id || citation?.file_id || '',
+                    url: citation?.metadata?.download_url || citation?.download_url || citation?.url || '',
+                    filename: citation?.metadata?.title || citation?.title || 'citation',
+                    label: citation?.metadata?.title || citation?.title || '引用附件',
+                    mimeType: citation?.metadata?.mime_type || citation?.mime_type || '',
+                });
+            }
+
+            let visitedCount = 0;
+            const visited = new WeakSet();
+            const walk = (value, keyHint = '', depth = 0) => {
+                if (!value || depth > 9 || visitedCount > 2400 || typeof value !== 'object') return;
+                if (visited.has(value)) return;
+                visited.add(value);
+                visitedCount += 1;
+                if (Array.isArray(value)) {
+                    for (const item of value) walk(item, keyHint, depth + 1);
+                    return;
+                }
+                const signal = `${keyHint} ${value.content_type || ''} ${value.type || ''} ${value.kind || ''}`;
+                const fileId = value.file_id || value.fileId || value.asset_id ||
+                    (/(?:attachment|file|asset|image|citation)/i.test(signal) ? value.id : '') ||
+                    this.extractFileIdFromValue(value.asset_pointer || '');
+                const url = value.download_url || value.downloadUrl || value.content_url || value.url || value.href || value.src || '';
+                if (fileId || (url && /(?:file|download|oaiusercontent|oaistatic|blob:|data:|sandbox:)/i.test(String(url)))) {
+                    const filename = value.file_name || value.filename || value.name || value.title || '';
+                    const mimeType = value.mime_type || value.content_type || value.media_type || '';
+                    add({
+                        fileId,
+                        url,
+                        filename: filename || (/image/i.test(signal) ? 'image.png' : 'attachment'),
+                        label: value.title || value.name || filename || (/image/i.test(signal) ? '图片' : '附件'),
+                        mimeType,
+                        image: /image/i.test(signal) || String(mimeType).startsWith('image/'),
+                    });
+                }
+                for (const [key, child] of Object.entries(value)) {
+                    if (['text', 'content', 'parts'].includes(key) && typeof child === 'string') continue;
+                    walk(child, key, depth + 1);
+                }
+            };
+            walk(message.metadata || {}, 'metadata', 0);
+            return assets;
+        }
+
+        buildConversationApiAssetMap(snapshot) {
+            const map = new Map();
+            let logicalIndex = -1;
+            for (const message of this.getConversationBranchMessages(snapshot)) {
+                const role = String(message?.author?.role || '');
+                if (role === 'user') logicalIndex += 1;
+                if (logicalIndex < 0) continue;
+                const assets = this.collectApiAssetsFromMessage(message, logicalIndex);
+                if (!assets.length) continue;
+                if (!map.has(logicalIndex)) map.set(logicalIndex, []);
+                map.get(logicalIndex).push(...assets);
+            }
+            return map;
+        }
+
+        mergeArchiveAsset(existing, incoming) {
+            if (!existing || !incoming) return existing || incoming;
+            if (!existing.fileId && incoming.fileId) existing.fileId = incoming.fileId;
+            if (!existing.sourceUrl && incoming.sourceUrl) existing.sourceUrl = incoming.sourceUrl;
+            existing.alternateUrls = [...new Set([
+                ...(existing.alternateUrls || []),
+                ...(incoming.alternateUrls || []),
+                incoming.sourceUrl || '',
+            ].filter(Boolean))];
+            if (!existing.filenameHint && incoming.filenameHint) existing.filenameHint = incoming.filenameHint;
+            if (!existing.mimeType && incoming.mimeType) existing.mimeType = incoming.mimeType;
+            if ((!existing.label || existing.label === '附件') && incoming.label) existing.label = incoming.label;
+            existing.apiDerived = existing.apiDerived || incoming.apiDerived;
+            return existing;
+        }
+
+        async enrichConversationArchivesWithApiAssets(indices, signal) {
+            let snapshot = null;
+            try {
+                snapshot = await this.getConversationApiSnapshot(signal);
+            } catch (error) {
+                console.warn('[ChatGPT 导航与导出] 无法读取结构化附件信息，将继续使用页面 DOM：', error);
+                return { added: 0, merged: 0, available: false };
+            }
+            if (!snapshot) return { added: 0, merged: 0, available: false };
+            let added = 0;
+            let merged = 0;
+            for (const logicalIndex of indices) {
+                const archive = this.conversationArchive.get(logicalIndex);
+                if (!archive) continue;
+                if (!Array.isArray(archive.assets)) archive.assets = [];
+                const incomingAssets = this.conversationApiAssetsByIndex.get(logicalIndex) || [];
+                const category = (asset) => /image|canvas|svg/i.test(asset?.kind || '')
+                    ? 'image'
+                    : /artifact|html/i.test(asset?.kind || '') ? 'artifact' : 'file';
+                const pairedByOrdinal = new Map();
+                for (const role of ['user', 'assistant', 'tool']) {
+                    for (const group of ['image', 'artifact', 'file']) {
+                        const domCandidates = archive.assets.filter((asset) =>
+                            asset.role === role && category(asset) === group && !asset.fileId && !asset.apiDerived);
+                        const apiCandidates = incomingAssets.filter((asset) =>
+                            asset.role === role && category(asset) === group && asset.fileId);
+                        if (domCandidates.length && domCandidates.length === apiCandidates.length) {
+                            apiCandidates.forEach((asset, index) => pairedByOrdinal.set(asset, domCandidates[index]));
+                        }
+                    }
+                }
+                for (const incoming of incomingAssets) {
+                    const incomingName = this.sanitizeAssetFilename(incoming.filenameHint || incoming.label || '').toLowerCase();
+                    const existing = archive.assets.find((asset) => {
+                        if (incoming.fileId && asset.fileId === incoming.fileId) return true;
+                        if (incoming.fileId && [asset.sourceUrl, ...(asset.alternateUrls || [])]
+                            .some((url) => String(url || '').includes(incoming.fileId))) return true;
+                        const existingName = this.sanitizeAssetFilename(asset.filenameHint || asset.label || '').toLowerCase();
+                        return Boolean(incomingName && existingName && incomingName === existingName && asset.role === incoming.role);
+                    }) || pairedByOrdinal.get(incoming);
+                    if (existing) {
+                        this.mergeArchiveAsset(existing, incoming);
+                        merged += 1;
+                    } else {
+                        let id = incoming.id;
+                        let suffix = 2;
+                        while (archive.assets.some((asset) => asset.id === id)) {
+                            id = `${incoming.id}-${suffix}`;
+                            suffix += 1;
+                        }
+                        archive.assets.push({ ...incoming, id });
+                        added += 1;
+                    }
+                }
+            }
+            if (added || merged) {
+                this.markSearchIndexDirty(false);
+                this.scheduleConversationRebuild(0);
+            }
+            return { added, merged, available: true };
+        }
+
+        async resolveFileDownloadMetadata(fileId, signal) {
+            const id = String(fileId || '').trim();
+            if (!id) return null;
+            const data = await this.fetchChatGptApiJson(
+                `/backend-api/files/download/${encodeURIComponent(id)}`,
+                signal,
+            );
+            const downloadUrl = data?.download_url || data?.downloadUrl || data?.url || '';
+            if (!downloadUrl) throw new Error(`文件 ${id} 没有返回 download_url`);
+            return {
+                downloadUrl: this.normalizeAssetCandidateUrl(downloadUrl),
+                filename: data?.file_name || data?.filename || data?.name || '',
+                mimeType: data?.mime_type || data?.content_type || '',
+                size: Number(data?.size || data?.bytes || 0) || 0,
+            };
+        }
+
         normalizeAssetCandidateUrl(rawValue) {
             const raw = String(rawValue || '').trim();
             if (!raw || /^(?:javascript|mailto|tel):/i.test(raw)) return '';
@@ -5815,15 +6203,18 @@
 
         getLargestImageCandidate(image) {
             if (!(image instanceof HTMLImageElement)) return '';
-            const srcset = image.getAttribute('srcset') || '';
-            const candidates = srcset.split(',').map((item) => {
+            const srcsets = [image.getAttribute('srcset') || ''];
+            for (const source of image.closest('picture')?.querySelectorAll('source[srcset]') || []) {
+                srcsets.push(source.getAttribute('srcset') || '');
+            }
+            const candidates = srcsets.flatMap((srcset) => srcset.split(',').map((item) => {
                 const match = item.trim().match(/^(\S+)(?:\s+(\d+(?:\.\d+)?)(w|x))?$/);
                 if (!match) return null;
                 const weight = match[3] === 'w'
                     ? Number(match[2]) || 0
                     : (Number(match[2]) || 1) * 10000;
                 return { url: match[1], weight };
-            }).filter(Boolean).sort((a, b) => b.weight - a.weight);
+            })).filter(Boolean).sort((a, b) => b.weight - a.weight);
             return this.normalizeAssetCandidateUrl(
                 candidates[0]?.url || image.currentSrc || image.getAttribute('src') || '',
             );
@@ -5949,7 +6340,14 @@
                 addCandidate(image, {
                     kind: 'image',
                     url,
-                    alternateUrls: this.getElementUrlAlternates(image, url),
+                    alternateUrls: [
+                        ...this.getElementUrlAlternates(image, url),
+                        ...[...(image.closest('picture')?.querySelectorAll('source[srcset]') || [])]
+                            .flatMap((source) => String(source.getAttribute('srcset') || '').split(',').map((part) => part.trim().split(/\s+/)[0]))
+                            .map((candidateUrl) => this.normalizeAssetCandidateUrl(candidateUrl))
+                            .filter(Boolean),
+                    ],
+                    fileId: this.extractFileIdFromValue(url),
                     label: image.getAttribute('alt') || image.getAttribute('aria-label') || '图片',
                     filenameHint: image.getAttribute('download') || '',
                     mimeType: /^data:([^;,]+)/i.exec(url)?.[1] || '',
@@ -5965,6 +6363,7 @@
                         : 'file',
                     url,
                     alternateUrls: this.getElementUrlAlternates(anchor, url),
+                    fileId: this.extractFileIdFromValue(url),
                     label: anchor.textContent?.trim() || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || '附件',
                     filenameHint: anchor.getAttribute('download') || '',
                     mimeType: '',
@@ -5985,6 +6384,7 @@
                     kind: /artifact/i.test(signal) ? 'artifact' : 'file-control',
                     url,
                     alternateUrls: alternates.slice(1),
+                    fileId: this.extractFileIdFromValue(url),
                     label: control.textContent?.trim() || control.getAttribute('aria-label') || '附件',
                     filenameHint: '',
                     mimeType: '',
@@ -6081,6 +6481,7 @@
                         label: String(candidate.label || '附件').trim() || '附件',
                         sourceUrl,
                         alternateUrls: [...new Set(candidate.alternateUrls || [])],
+                        fileId: candidate.fileId || this.extractFileIdFromValue(sourceUrl),
                         filenameHint: this.getAssetFilenameHint({ ...candidate, mimeType }, sequence),
                         mimeType,
                         byteLength: inlineBlob?.size || 0,
@@ -6117,13 +6518,22 @@
 
         sanitizeExportHtmlClone(clone) {
             if (!(clone instanceof Element)) return;
-            for (const element of clone.querySelectorAll('*')) {
-                for (const attribute of [...element.attributes]) {
-                    if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
-                }
-                element.removeAttribute('contenteditable');
-                element.removeAttribute('autofocus');
+
+            // 将 KaTeX 的页面专用结构替换为可离线显示的 MathML/LaTeX 容器。
+            const mathRoots = [...clone.querySelectorAll('.katex-display, .katex')]
+                .filter((element) => !element.parentElement?.closest('.katex-display, .katex'));
+            for (const mathRoot of mathRoots) {
+                const latex = this.getMathLatex(mathRoot);
+                const display = mathRoot.matches('.katex-display');
+                const replacement = clone.ownerDocument.createElement(display ? 'div' : 'span');
+                replacement.className = display ? 'math math-display' : 'math math-inline';
+                replacement.setAttribute('data-latex', latex);
+                const mathMl = mathRoot.querySelector('math')?.cloneNode(true);
+                if (mathMl) replacement.appendChild(mathMl);
+                else replacement.textContent = display ? `$$${latex}$$` : `$${latex}$`;
+                mathRoot.replaceWith(replacement);
             }
+
             const selectors = [
                 'script', 'style', 'noscript', 'textarea', 'input', 'select',
                 '[role="tooltip"]', '[data-testid*="copy"]', '[data-testid*="feedback"]',
@@ -6133,6 +6543,7 @@
                 if (removable.hasAttribute('data-cgpt-export-asset-id')) continue;
                 removable.remove();
             }
+
             for (const button of clone.querySelectorAll('button')) {
                 const assetId = button.getAttribute('data-cgpt-export-asset-id');
                 if (!assetId) {
@@ -6142,15 +6553,54 @@
                 const link = clone.ownerDocument.createElement('a');
                 link.href = `cgpt-asset://${assetId}`;
                 link.setAttribute('data-cgpt-export-asset-id', assetId);
-                link.textContent = button.textContent?.trim() || '下载附件';
+                link.className = 'inline-attachment';
+                link.textContent = button.textContent?.trim() || button.getAttribute('aria-label') || '下载附件';
                 button.replaceWith(link);
             }
+
             for (const canvas of clone.querySelectorAll('canvas[data-cgpt-export-asset-id]')) {
                 const image = clone.ownerDocument.createElement('img');
                 image.src = `cgpt-asset://${canvas.getAttribute('data-cgpt-export-asset-id')}`;
                 image.alt = canvas.getAttribute('aria-label') || 'Canvas 图像';
                 image.setAttribute('data-cgpt-export-asset-id', canvas.getAttribute('data-cgpt-export-asset-id'));
                 canvas.replaceWith(image);
+            }
+
+            for (const element of clone.querySelectorAll('*')) {
+                for (const attribute of [...element.attributes]) {
+                    const name = attribute.name.toLowerCase();
+                    const preserve = name === 'data-cgpt-export-asset-id' ||
+                        name === 'href' || name === 'src' || name === 'srcset' || name === 'sizes' ||
+                        name === 'poster' || name === 'data' || name === 'srcdoc' || name === 'type' ||
+                        name === 'alt' || name === 'title' || name === 'download' || name === 'target' ||
+                        name === 'rel' || name === 'colspan' || name === 'rowspan' || name === 'start' ||
+                        name === 'open' || name === 'controls' || name === 'width' || name === 'height' ||
+                        name === 'data-latex' || name === 'class';
+                    if (!preserve || /^on/i.test(name)) element.removeAttribute(attribute.name);
+                }
+                element.removeAttribute('contenteditable');
+                element.removeAttribute('autofocus');
+                element.removeAttribute('hidden');
+
+                const tag = element.tagName.toLowerCase();
+                if (element.classList.contains('math')) {
+                    element.className = element.classList.contains('math-display')
+                        ? 'math math-display'
+                        : 'math math-inline';
+                } else if (element.classList.contains('inline-attachment')) {
+                    element.className = 'inline-attachment';
+                } else {
+                    element.removeAttribute('class');
+                }
+                if (tag === 'img') {
+                    element.setAttribute('loading', 'lazy');
+                    element.setAttribute('decoding', 'async');
+                } else if (tag === 'iframe') {
+                    element.setAttribute('loading', 'lazy');
+                    if (!element.getAttribute('title')) element.setAttribute('title', 'Artifact');
+                } else if (tag === 'a') {
+                    element.setAttribute('rel', 'noopener noreferrer');
+                }
             }
         }
 
@@ -6159,6 +6609,13 @@
             if (!(source instanceof HTMLElement)) return '';
             const clone = source.cloneNode(true);
             this.sanitizeExportHtmlClone(clone);
+            for (const table of [...clone.querySelectorAll('table')]) {
+                if (table.parentElement?.classList.contains('table-wrap')) continue;
+                const wrapper = clone.ownerDocument.createElement('div');
+                wrapper.className = 'table-wrap';
+                table.replaceWith(wrapper);
+                wrapper.appendChild(table);
+            }
             return clone.innerHTML.trim();
         }
 
@@ -6475,7 +6932,13 @@
                 this.updateConversationArchiveUi('全部问答已经缓存');
                 return;
             }
-            await this.loadConversationIndices(missing, { mode: 'load-all', restore: true });
+            const result = await this.loadConversationIndices(missing, { mode: 'load-all', restore: true });
+            if (!result?.aborted) {
+                await this.enrichConversationArchivesWithApiAssets(indices, null).catch((error) => {
+                    console.warn('[ChatGPT 导航与导出] 刷新附件元数据失败：', error);
+                });
+                this.updateConversationArchiveUi(`已加载 ${this.conversationArchive.size} 轮；附件信息已刷新`);
+            }
         }
 
         shiftMarkdownHeadings(markdown, amount) {
@@ -6606,17 +7069,34 @@
                 .replace(/'/g, '&#39;');
         }
 
+        rewriteSrcsetValue(value, urlPathMap) {
+            return String(value || '').split(',').map((part) => {
+                const trimmed = part.trim();
+                if (!trimmed) return '';
+                const match = /^(\S+)(\s+.*)?$/.exec(trimmed);
+                if (!match) return trimmed;
+                const rawUrl = match[1];
+                const normalized = this.normalizeAssetCandidateUrl(rawUrl);
+                const local = urlPathMap.get(normalized) || urlPathMap.get(rawUrl);
+                return `${local || rawUrl}${match[2] || ''}`;
+            }).filter(Boolean).join(', ');
+        }
+
         rewriteArchiveHtmlFragment(html, archive, assetPathMap, urlPathMap) {
             const template = document.createElement('template');
             template.innerHTML = String(html || '');
             const assetsById = new Map((archive?.assets || []).map((asset) => [asset.id, asset]));
+            const resolveAssetReference = (assetId) => {
+                const asset = assetsById.get(assetId);
+                return assetPathMap.get(assetId) || this.getAssetFallbackReference(asset) || '';
+            };
+
             for (const element of template.content.querySelectorAll('*')) {
+                const tag = element.tagName.toLowerCase();
                 const assetId = element.getAttribute('data-cgpt-export-asset-id');
                 if (assetId) {
-                    const asset = assetsById.get(assetId);
-                    const reference = assetPathMap.get(assetId) || this.getAssetFallbackReference(asset);
+                    const reference = resolveAssetReference(assetId);
                     if (reference) {
-                        const tag = element.tagName.toLowerCase();
                         if (tag === 'a') element.setAttribute('href', reference);
                         else if (tag === 'object') element.setAttribute('data', reference);
                         else {
@@ -6626,13 +7106,13 @@
                     }
                     element.removeAttribute('data-cgpt-export-asset-id');
                 }
+
                 for (const attributeName of ['href', 'src', 'poster', 'data']) {
                     const raw = element.getAttribute(attributeName);
                     if (!raw) continue;
                     const tokenMatch = /^cgpt-asset:\/\/([\w.-]+)$/.exec(raw);
                     if (tokenMatch) {
-                        const asset = assetsById.get(tokenMatch[1]);
-                        const replacement = assetPathMap.get(tokenMatch[1]) || this.getAssetFallbackReference(asset);
+                        const replacement = resolveAssetReference(tokenMatch[1]);
                         if (replacement) element.setAttribute(attributeName, replacement);
                         else element.removeAttribute(attributeName);
                         continue;
@@ -6641,31 +7121,75 @@
                     const local = urlPathMap.get(normalized) || urlPathMap.get(raw);
                     if (local) element.setAttribute(attributeName, local);
                 }
-                for (const attribute of [...element.attributes]) {
-                    if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
+
+                if (element.hasAttribute('srcset')) {
+                    const rewritten = this.rewriteSrcsetValue(element.getAttribute('srcset'), urlPathMap);
+                    if (rewritten) element.setAttribute('srcset', rewritten);
+                    else element.removeAttribute('srcset');
                 }
-                if (element.tagName.toLowerCase() === 'a') {
+
+                for (const attribute of [...element.attributes]) {
+                    if (/^on/i.test(attribute.name) || attribute.name.toLowerCase() === 'style') {
+                        element.removeAttribute(attribute.name);
+                    }
+                }
+
+                if (tag === 'a') {
                     element.setAttribute('rel', 'noopener noreferrer');
-                } else if (element.tagName.toLowerCase() === 'iframe') {
+                    const href = element.getAttribute('href') || '';
+                    if (!href.startsWith('#') && !/^(?:javascript|mailto|tel):/i.test(href)) {
+                        element.setAttribute('target', '_blank');
+                    }
+                    if (/^(?:assets\/|\.\/assets\/)/i.test(href)) element.setAttribute('download', '');
+                } else if (tag === 'iframe') {
+                    element.classList.add('artifact-frame');
                     element.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
+                    element.setAttribute('loading', 'lazy');
+                    if (!element.getAttribute('title')) element.setAttribute('title', 'Artifact');
+                } else if (tag === 'img') {
+                    element.setAttribute('loading', 'lazy');
+                    element.setAttribute('decoding', 'async');
                 }
             }
             return template.innerHTML;
         }
 
+        getAssetDisplayMetadata(asset) {
+            const filename = asset?.resolvedFilename || asset?.filenameHint || asset?.label || '附件';
+            const mime = String(asset?.mimeType || asset?.blob?.type || '').trim();
+            const size = Number(asset?.byteLength || asset?.blob?.size || 0) || 0;
+            const sizeLabel = size > 0
+                ? size >= 1024 * 1024
+                    ? `${(size / 1024 / 1024).toFixed(size >= 10 * 1024 * 1024 ? 0 : 1)} MiB`
+                    : `${Math.max(1, Math.round(size / 1024))} KiB`
+                : '';
+            return { filename, mime, sizeLabel };
+        }
+
         buildArchiveAssetHtml(archive, assetPathMap) {
             const assets = Array.isArray(archive?.assets) ? archive.assets : [];
             if (!assets.length) return '';
-            const items = assets.map((asset) => {
+            const cards = assets.map((asset) => {
                 const local = assetPathMap.get(asset.id);
                 const reference = local || this.getAssetFallbackReference(asset);
-                const label = this.escapeHtml(asset.label || asset.filenameHint || '附件');
-                const suffix = local ? '' : reference ? ' <span class="muted">（外部链接）</span>' : ' <span class="muted">（未能获取）</span>';
-                return reference
-                    ? `<li><a href="${this.escapeHtml(reference)}">${label}</a>${suffix}</li>`
-                    : `<li>${label}${suffix}</li>`;
+                const { filename, mime, sizeLabel } = this.getAssetDisplayMetadata(asset);
+                const label = this.escapeHtml(asset.label || filename || '附件');
+                const meta = [mime, sizeLabel].filter(Boolean).map((value) => this.escapeHtml(value)).join(' · ');
+                const status = local ? '已归档' : reference ? '外部链接' : '未能获取';
+                const icon = asset.kind === 'image' ? '图片' : asset.kind === 'artifact-html' ? 'HTML' : '文件';
+                const preview = local && asset.kind === 'image'
+                    ? `<a class="asset-preview" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer"><img src="${this.escapeHtml(reference)}" alt="${label}" loading="lazy" decoding="async"></a>`
+                    : '';
+                const main = reference
+                    ? `<a class="asset-link" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer"${local ? ' download' : ''}>${label}</a>`
+                    : `<span class="asset-link asset-unavailable">${label}</span>`;
+                return `<li class="asset-card ${asset.kind === 'image' ? 'asset-image' : ''}">
+          ${preview}
+          <div class="asset-card-body"><span class="asset-badge">${icon}</span>${main}
+          <div class="asset-meta">${meta ? `${meta} · ` : ''}${status}</div></div>
+        </li>`;
             }).join('');
-            return `<section class="assets"><h4>图片、附件与 Artifacts</h4><ul>${items}</ul></section>`;
+            return `<section class="assets"><h4>图片、附件与 Artifacts</h4><ul class="asset-grid">${cards}</ul></section>`;
         }
 
         buildConversationHtml(indices, options = {}) {
@@ -6673,40 +7197,106 @@
             const title = this.getConversationExportTitle();
             const assetPathMap = options.assetPathMap instanceof Map ? options.assetPathMap : new Map();
             const urlPathMap = options.urlPathMap instanceof Map ? options.urlPathMap : new Map();
+            const maxWidth = Math.max(760, Number(this.config.conversationExportHtmlMaxWidthPx) || 1240);
+            const includeSidebar = this.config.conversationExportHtmlIncludeSidebar !== false && sorted.length > 1;
             const sections = [];
+            const navItems = [];
+
             for (const logicalIndex of sorted) {
                 const archive = this.conversationArchive.get(logicalIndex);
+                const fallbackQuestion = archive?.userText || this.conversationItems.find((item) => item.logicalIndex === logicalIndex)?.fullLabel || `问答 ${logicalIndex + 1}`;
+                const navLabel = this.truncateLabel(this.normalizeConversationText(fallbackQuestion), 86, 86);
+                navItems.push(`<li><a href="#qa-${logicalIndex + 1}"><span class="nav-index">${logicalIndex + 1}</span><span>${this.escapeHtml(navLabel)}</span></a></li>`);
                 const userHtml = archive?.userHtml
                     ? this.rewriteArchiveHtmlFragment(archive.userHtml, archive, assetPathMap, urlPathMap)
-                    : `<p>${this.escapeHtml(archive?.userText || `未能加载第 ${logicalIndex + 1} 轮提问`)}</p>`;
+                    : `<p>${this.escapeHtml(fallbackQuestion)}</p>`;
                 const assistantHtml = archive?.assistantHtml
                     ? this.rewriteArchiveHtmlFragment(archive.assistantHtml, archive, assetPathMap, urlPathMap)
-                    : `<pre>${this.escapeHtml(archive?.assistantMarkdown || '未能加载回答内容')}</pre>`;
+                    : `<pre>${this.escapeHtml(archive?.assistantMarkdown || this.conversationArchiveFailures.get(logicalIndex) || '未能加载回答内容')}</pre>`;
                 const assetHtml = archive ? this.buildArchiveAssetHtml(archive, assetPathMap) : '';
                 sections.push(`
           <article class="qa" id="qa-${logicalIndex + 1}">
-            <h2>问答 ${logicalIndex + 1}</h2>
-            <section class="message user"><h3>用户</h3><div class="message-content">${userHtml}</div></section>
-            <section class="message assistant"><h3>ChatGPT</h3><div class="message-content">${assistantHtml}</div></section>
+            <header class="qa-header"><span class="qa-kicker">问答</span><h2>${logicalIndex + 1}</h2><a class="back-top" href="#page-top" aria-label="返回顶部">↑</a></header>
+            <section class="message user"><header class="message-header"><span class="role-dot"></span><h3>用户</h3></header><div class="message-content">${userHtml}</div></section>
+            <section class="message assistant"><header class="message-header"><span class="role-dot"></span><h3>ChatGPT</h3></header><div class="message-content">${assistantHtml}</div></section>
             ${assetHtml}
           </article>`);
             }
+
+            const sourceUrl = this.escapeHtml(location.href);
             const metadata = this.config.conversationExportIncludeMetadata
-                ? `<p class="metadata">导出时间：${this.escapeHtml(new Date().toLocaleString())}<br>来源：<a href="${this.escapeHtml(location.href)}">${this.escapeHtml(location.href)}</a><br>问答数量：${sorted.length}</p>`
+                ? `<div class="metadata"><span>导出时间：${this.escapeHtml(new Date().toLocaleString())}</span><span>问答数量：${sorted.length}</span><a href="${sourceUrl}" target="_blank" rel="noopener noreferrer">打开原对话</a></div>`
                 : '';
+            const sidebar = includeSidebar
+                ? `<aside class="conversation-nav" aria-label="问答目录"><div class="nav-title">问答目录</div><ol>${navItems.join('')}</ol></aside>`
+                : '';
+
             return `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>${this.escapeHtml(title)}</title>
 <style>
-  :root{color-scheme:light dark}body{max-width:980px;margin:0 auto;padding:32px 24px;font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif;background:#fff;color:#1f2328}a{color:#0969da;overflow-wrap:anywhere}.metadata,.muted{color:#656d76}.qa{padding:12px 0 28px;border-bottom:1px solid #d0d7de}.message{margin:16px 0;padding:16px 18px;border-radius:12px;background:#f6f8fa}.assistant{background:#fff;border:1px solid #d8dee4}.message-content img,.message-content video,.message-content iframe{max-width:100%;height:auto}.message-content iframe{width:100%;min-height:420px;border:1px solid #d0d7de;border-radius:8px}.message-content pre{overflow:auto;padding:14px;border-radius:8px;background:#161b22;color:#f0f6fc}.message-content code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.message-content table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.message-content th,.message-content td{padding:6px 10px;border:1px solid #d0d7de}.assets{margin:12px 0}.assets ul{padding-left:24px}@media(prefers-color-scheme:dark){body{background:#111;color:#e6edf3}.message{background:#1c2128}.assistant{background:#111;border-color:#30363d}.qa{border-color:#30363d}a{color:#58a6ff}.metadata,.muted{color:#8b949e}}
+  :root{
+    color-scheme:light dark;
+    --page:#f7f7f5;--surface:#fff;--surface-soft:#f2f3f1;--surface-user:#eef5ff;
+    --text:#202123;--muted:#666b73;--border:#dcdedb;--accent:#2563eb;--accent-soft:#e8efff;
+    --code:#16181d;--code-text:#f4f6f8;--quote:#eff2f6;--shadow:0 8px 28px rgba(0,0,0,.07);
+  }
+  @media(prefers-color-scheme:dark){:root{
+    --page:#111210;--surface:#191a18;--surface-soft:#222320;--surface-user:#172235;
+    --text:#eceeeb;--muted:#a6aaa4;--border:#343633;--accent:#82aaff;--accent-soft:#253454;
+    --code:#0d0f12;--code-text:#f4f6f8;--quote:#23272d;--shadow:0 10px 32px rgba(0,0,0,.3);
+  }}
+  *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}
+  body{margin:0;background:var(--page);color:var(--text);font:15.5px/1.72 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased;overflow-wrap:anywhere}
+  a{color:var(--accent);text-decoration-thickness:.08em;text-underline-offset:.18em}a:hover{text-decoration-thickness:.12em}
+  .page-header{background:var(--surface);border-bottom:1px solid var(--border)}
+  .page-header-inner{max-width:${maxWidth}px;margin:auto;padding:34px clamp(20px,4vw,54px) 28px}
+  .page-eyebrow{margin:0 0 7px;color:var(--accent);font-size:12px;font-weight:720;letter-spacing:.12em;text-transform:uppercase}
+  h1{margin:0;font-size:clamp(28px,4.2vw,46px);line-height:1.14;letter-spacing:-.025em}
+  .metadata{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:16px;color:var(--muted);font-size:13px}.metadata a{margin-inline-start:auto}
+  .layout{display:grid;grid-template-columns:${includeSidebar ? 'minmax(180px,250px) minmax(0,1fr)' : 'minmax(0,1fr)'};gap:clamp(22px,3vw,42px);max-width:${maxWidth}px;margin:auto;padding:30px clamp(20px,4vw,54px) 64px;align-items:start}
+  .conversation-nav{position:sticky;top:20px;max-height:calc(100vh - 40px);overflow:auto;padding:16px 10px 16px 0;scrollbar-width:thin}
+  .nav-title{padding:0 10px 10px;color:var(--muted);font-size:12px;font-weight:720;letter-spacing:.08em;text-transform:uppercase}
+  .conversation-nav ol{list-style:none;margin:0;padding:0}.conversation-nav li{margin:2px 0}
+  .conversation-nav a{display:flex;gap:9px;align-items:flex-start;padding:8px 10px;border-radius:9px;color:var(--muted);text-decoration:none;font-size:13px;line-height:1.35}
+  .conversation-nav a:hover{background:var(--surface-soft);color:var(--text)}.nav-index{flex:none;display:grid;place-items:center;min-width:22px;height:22px;border:1px solid var(--border);border-radius:6px;font-size:11px;font-weight:700}
+  main{min-width:0}.qa{margin:0 0 36px;scroll-margin-top:24px}.qa-header{display:flex;align-items:baseline;gap:7px;margin-bottom:12px;color:var(--muted)}
+  .qa-header h2{margin:0;color:var(--text);font-size:20px}.qa-kicker{font-size:12px;font-weight:720;letter-spacing:.1em;text-transform:uppercase}.back-top{margin-inline-start:auto;color:var(--muted);text-decoration:none}
+  .message{margin:12px 0;border:1px solid var(--border);border-radius:16px;background:var(--surface);box-shadow:var(--shadow);overflow:hidden}
+  .message.user{background:var(--surface-user)}.message-header{display:flex;align-items:center;gap:8px;padding:13px 18px 0}.message-header h3{margin:0;font-size:13px;letter-spacing:.01em}
+  .role-dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}.assistant .role-dot{background:#16a36a}
+  .message-content{padding:13px 18px 18px;min-width:0}.message-content>:first-child{margin-top:0}.message-content>:last-child{margin-bottom:0}
+  .message-content h1,.message-content h2,.message-content h3,.message-content h4,.message-content h5,.message-content h6{line-height:1.3;letter-spacing:-.012em;margin:1.35em 0 .55em;scroll-margin-top:24px}
+  .message-content h1{font-size:1.62em}.message-content h2{font-size:1.38em}.message-content h3{font-size:1.18em}.message-content h4{font-size:1.05em}
+  .message-content p{margin:.72em 0}.message-content ul,.message-content ol{padding-inline-start:1.55em;margin:.7em 0}.message-content li+li{margin-top:.3em}
+  .message-content blockquote{margin:1em 0;padding:.55em 1em;border-inline-start:4px solid var(--accent);border-radius:0 8px 8px 0;background:var(--quote);color:var(--muted)}
+  .message-content hr{border:0;border-top:1px solid var(--border);margin:1.5em 0}.message-content strong{font-weight:720}
+  .message-content code{padding:.13em .36em;border:1px solid var(--border);border-radius:5px;background:var(--surface-soft);font:0.9em/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .message-content pre{max-width:100%;overflow:auto;margin:1em 0;padding:16px 18px;border-radius:11px;background:var(--code);color:var(--code-text);tab-size:2;white-space:pre}
+  .message-content pre code{padding:0;border:0;background:none;color:inherit;font-size:13px;white-space:pre}
+  .table-wrap{max-width:100%;overflow:auto;margin:1em 0;border:1px solid var(--border);border-radius:10px}.table-wrap table{width:100%;min-width:480px;border-collapse:collapse;background:var(--surface)}
+  .table-wrap th,.table-wrap td{padding:9px 12px;border-bottom:1px solid var(--border);border-inline-end:1px solid var(--border);text-align:start;vertical-align:top}.table-wrap th{background:var(--surface-soft);font-weight:700}.table-wrap tr:last-child>*{border-bottom:0}.table-wrap tr>*:last-child{border-inline-end:0}
+  .message-content img,.asset-preview img{display:block;max-width:100%;height:auto;margin:1em auto;border-radius:10px;object-fit:contain}.message-content video,.message-content audio{max-width:100%}
+  .artifact-frame,.message-content iframe{display:block;width:100%;min-height:min(68vh,720px);margin:1em 0;border:1px solid var(--border);border-radius:11px;background:#fff}
+  .message-content details{margin:.8em 0;padding:.65em .8em;border:1px solid var(--border);border-radius:9px;background:var(--surface-soft)}.message-content summary{cursor:pointer;font-weight:650}
+  .math-display{display:block;max-width:100%;overflow:auto;padding:.55em 0;text-align:center}.math-inline{display:inline}.math math{font-size:1.05em}
+  .inline-attachment{display:inline-flex;align-items:center;gap:6px;padding:.45em .65em;border:1px solid var(--border);border-radius:8px;background:var(--surface-soft);text-decoration:none}
+  .assets{margin:16px 0 0;padding:16px 18px;border:1px solid var(--border);border-radius:14px;background:var(--surface)}.assets h4{margin:0 0 12px;font-size:14px}
+  .asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:10px;list-style:none;margin:0;padding:0}.asset-card{display:flex;min-width:0;gap:11px;padding:11px;border:1px solid var(--border);border-radius:10px;background:var(--surface-soft)}
+  .asset-card.asset-image{display:block}.asset-preview{display:block;margin-bottom:9px}.asset-preview img{width:100%;max-height:280px;margin:0;background:var(--surface);object-fit:contain}.asset-card-body{min-width:0}.asset-badge{display:inline-block;margin:0 7px 4px 0;padding:2px 6px;border-radius:5px;background:var(--accent-soft);color:var(--accent);font-size:10px;font-weight:750;letter-spacing:.04em}
+  .asset-link{font-weight:650;word-break:break-word}.asset-unavailable{color:var(--muted)}.asset-meta{margin-top:3px;color:var(--muted);font-size:11.5px}
+  @media(max-width:820px){.layout{display:block;padding-inline:16px}.conversation-nav{position:static;max-height:none;margin:0 0 24px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}.conversation-nav ol{display:flex;gap:6px;overflow:auto}.conversation-nav li{flex:0 0 min(280px,78vw)}.page-header-inner{padding-inline:18px}.metadata a{margin-inline-start:0}.message-content{padding-inline:14px}.message-header{padding-inline:14px}}
+  @media(max-width:520px){body{font-size:15px}.page-header-inner{padding-top:24px}.message{border-radius:12px}.asset-grid{grid-template-columns:1fr}.qa{margin-bottom:28px}.artifact-frame,.message-content iframe{min-height:420px}}
+  @media print{body{background:#fff;color:#000}.page-header{border:0}.conversation-nav,.back-top{display:none}.layout{display:block;max-width:none;padding:0}.message,.assets{box-shadow:none;break-inside:avoid}.qa{break-before:auto}.message-content a{color:inherit}.artifact-frame{min-height:300px}}
 </style>
 </head>
-<body>
-<header><h1>${this.escapeHtml(title)}</h1>${metadata}</header>
-<main>${sections.join('\n')}</main>
+<body id="page-top">
+<header class="page-header"><div class="page-header-inner"><p class="page-eyebrow">ChatGPT 对话归档</p><h1>${this.escapeHtml(title)}</h1>${metadata}</div></header>
+<div class="layout">${sidebar}<main>${sections.join('\n')}</main></div>
 </body>
 </html>`;
         }
@@ -6801,6 +7391,28 @@
             }
         }
 
+        normalizeGmBinaryResponse(value, contentType = '') {
+            if (value instanceof Blob) return value;
+            if (value == null) throw new Error('跨域请求没有返回内容');
+            if (value instanceof ArrayBuffer) {
+                return new Blob([value], { type: contentType || 'application/octet-stream' });
+            }
+            if (ArrayBuffer.isView(value)) {
+                const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+                return new Blob([bytes], { type: contentType || 'application/octet-stream' });
+            }
+            const tag = Object.prototype.toString.call(value);
+            if (tag === '[object ArrayBuffer]' || (typeof value === 'object' && Number.isFinite(value.byteLength))) {
+                try {
+                    return new Blob([new Uint8Array(value)], { type: contentType || 'application/octet-stream' });
+                } catch { }
+            }
+            if (typeof value === 'string') {
+                return new Blob([value], { type: contentType || 'text/plain;charset=utf-8' });
+            }
+            throw new Error(`跨域请求返回了无法识别的二进制类型：${tag}`);
+        }
+
         fetchAssetWithGmRequest(url, signal) {
             if (typeof GM_xmlhttpRequest !== 'function') {
                 return Promise.reject(new Error('GM_xmlhttpRequest 不可用'));
@@ -6819,6 +7431,7 @@
                     responseType: 'arraybuffer',
                     timeout: Math.max(2000, Number(this.config.conversationExportAssetTimeoutMs) || 30000),
                     anonymous: false,
+                    headers: { Accept: '*/*' },
                     onload: (response) => {
                         const status = Number(response.status) || 0;
                         if (status && (status < 200 || status >= 300)) {
@@ -6828,19 +7441,19 @@
                         const headers = String(response.responseHeaders || '');
                         const contentType = /^content-type:\s*(.+)$/im.exec(headers)?.[1]?.trim() || '';
                         const contentDisposition = /^content-disposition:\s*(.+)$/im.exec(headers)?.[1]?.trim() || '';
-                        const buffer = response.response;
-                        if (!(buffer instanceof ArrayBuffer)) {
-                            finish(reject, new Error('跨域请求没有返回二进制内容'));
-                            return;
+                        try {
+                            const blob = this.normalizeGmBinaryResponse(response.response ?? response.responseText, contentType);
+                            finish(resolve, {
+                                blob,
+                                finalUrl: response.finalUrl || url,
+                                contentType: contentType || blob.type || '',
+                                contentDisposition,
+                            });
+                        } catch (error) {
+                            finish(reject, error);
                         }
-                        finish(resolve, {
-                            blob: new Blob([buffer], { type: contentType || 'application/octet-stream' }),
-                            finalUrl: response.finalUrl || url,
-                            contentType,
-                            contentDisposition,
-                        });
                     },
-                    onerror: () => finish(reject, new Error('跨域附件请求失败')),
+                    onerror: (response) => finish(reject, new Error(`跨域附件请求失败${response?.status ? `：HTTP ${response.status}` : ''}`)),
                     ontimeout: () => finish(reject, new Error('附件下载超时')),
                     onabort: () => finish(reject, new DOMException('Aborted', 'AbortError')),
                 });
@@ -6853,6 +7466,93 @@
             });
         }
 
+        async unwrapAssetDownloadResponse(result, asset, signal, visitedUrls) {
+            const contentType = String(result?.contentType || result?.blob?.type || '').toLowerCase();
+            const finalUrl = this.normalizeAssetCandidateUrl(result?.finalUrl || '');
+            const mayBeJson = contentType.includes('json') || (!contentType && result?.blob?.size <= 1024 * 1024);
+            if (mayBeJson && result?.blob?.size <= 2 * 1024 * 1024) {
+                let text = '';
+                try { text = await result.blob.text(); } catch { }
+                const trimmed = text.trim();
+                if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                    try {
+                        const data = JSON.parse(trimmed);
+                        const downloadUrl = data?.download_url || data?.downloadUrl || data?.url || data?.file?.download_url || '';
+                        if (downloadUrl) {
+                            const normalized = this.normalizeAssetCandidateUrl(downloadUrl);
+                            if (normalized && !visitedUrls.has(normalized)) {
+                                const nested = await this.fetchBinaryAssetCandidates([normalized], asset, signal, visitedUrls);
+                                if (!nested.resolvedFilename) {
+                                    nested.resolvedFilename = data?.file_name || data?.filename || data?.name || '';
+                                }
+                                return nested;
+                            }
+                        }
+                        const apiError = data?.detail || data?.error?.message || data?.message;
+                        if (apiError) throw new Error(String(apiError));
+                    } catch (error) {
+                        if (error instanceof SyntaxError) {
+                            // JSON 探测失败时仍按普通二进制处理。
+                        } else {
+                            throw error;
+                        }
+                    }
+                }
+            }
+
+            if (contentType.includes('text/html') && result?.blob?.size <= 2 * 1024 * 1024) {
+                const text = await result.blob.text().catch(() => '');
+                if (/<title>\s*(?:log\s*in|sign\s*in|chatgpt)/i.test(text) || /\/auth\/login/i.test(finalUrl)) {
+                    throw new Error('附件地址返回了登录页面，签名链接可能已经失效');
+                }
+            }
+
+            const maxAsset = Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0);
+            if (result.blob.size > maxAsset) {
+                throw new Error(`附件超过大小限制（${Math.round(result.blob.size / 1024 / 1024)} MiB）`);
+            }
+            const dispositionName = this.parseContentDispositionFilename(result.contentDisposition);
+            let urlName = '';
+            try {
+                const part = decodeURIComponent(new URL(finalUrl || location.href).pathname.split('/').filter(Boolean).pop() || '');
+                if (/\.[a-z0-9]{1,10}$/i.test(part)) urlName = part;
+            } catch { }
+            return { ...result, resolvedFilename: dispositionName || urlName || '' };
+        }
+
+        async fetchBinaryAssetCandidates(candidates, asset, signal, visitedUrls = new Set()) {
+            const errors = [];
+            const unique = [...new Set((candidates || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))];
+            for (const url of unique) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                if (visitedUrls.has(url)) continue;
+                visitedUrls.add(url);
+                if (/^sandbox:/i.test(url)) {
+                    errors.push(`${url}: sandbox 链接需要 file_id 才能解析`);
+                    continue;
+                }
+
+                try {
+                    const result = await this.fetchAssetWithPageFetch(url, signal);
+                    return await this.unwrapAssetDownloadResponse(result, asset, signal, visitedUrls);
+                } catch (error) {
+                    if (error?.name === 'AbortError') throw error;
+                    errors.push(`${url}: 页面请求 ${error?.message || error}`);
+                }
+
+                if (/^https?:/i.test(url)) {
+                    try {
+                        const result = await this.fetchAssetWithGmRequest(url, signal);
+                        return await this.unwrapAssetDownloadResponse(result, asset, signal, visitedUrls);
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        errors.push(`${url}: 跨域请求 ${error?.message || error}`);
+                    }
+                }
+            }
+            throw new Error(errors.join('；') || '没有可读取的附件地址');
+        }
+
         async fetchArchiveAsset(asset, signal) {
             if (asset?.blob instanceof Blob) {
                 return {
@@ -6860,42 +7560,40 @@
                     finalUrl: asset.sourceUrl || '',
                     contentType: asset.blob.type || asset.mimeType || '',
                     contentDisposition: '',
+                    resolvedFilename: asset.filenameHint || '',
                 };
             }
-            const candidates = [asset?.sourceUrl, ...(asset?.alternateUrls || [])]
-                .map((value) => this.normalizeAssetCandidateUrl(value))
-                .filter((value, index, array) => value && array.indexOf(value) === index);
+
+            const candidates = [];
+            let metadata = null;
+            const fileId = asset?.fileId || this.extractFileIdFromValue(asset?.sourceUrl);
             const errors = [];
-            for (const url of candidates) {
-                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-                if (/^sandbox:/i.test(url)) {
-                    errors.push(`${url}: sandbox 链接没有暴露可直接读取的下载地址`);
-                    continue;
-                }
+            if (fileId) {
                 try {
-                    const result = await this.fetchAssetWithPageFetch(url, signal);
-                    if (result.blob.size > Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0)) {
-                        throw new Error(`附件超过大小限制（${Math.round(result.blob.size / 1024 / 1024)} MiB）`);
+                    metadata = await this.resolveFileDownloadMetadata(fileId, signal);
+                    if (metadata.size > Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0)) {
+                        throw new Error(`附件超过大小限制（${Math.round(metadata.size / 1024 / 1024)} MiB）`);
                     }
-                    return result;
+                    if (metadata.downloadUrl) candidates.push(metadata.downloadUrl);
                 } catch (error) {
                     if (error?.name === 'AbortError') throw error;
-                    errors.push(`${url}: ${error?.message || error}`);
-                }
-                if (/^https?:/i.test(url)) {
-                    try {
-                        const result = await this.fetchAssetWithGmRequest(url, signal);
-                        if (result.blob.size > Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0)) {
-                            throw new Error(`附件超过大小限制（${Math.round(result.blob.size / 1024 / 1024)} MiB）`);
-                        }
-                        return result;
-                    } catch (error) {
-                        if (error?.name === 'AbortError') throw error;
-                        errors.push(`${url}: ${error?.message || error}`);
-                    }
+                    errors.push(`file_id ${fileId}: ${error?.message || error}`);
                 }
             }
-            throw new Error(errors.join('；') || '没有可读取的附件地址');
+            candidates.push(asset?.sourceUrl, ...(asset?.alternateUrls || []));
+
+            try {
+                const result = await this.fetchBinaryAssetCandidates(candidates, asset, signal);
+                return {
+                    ...result,
+                    contentType: result.contentType || metadata?.mimeType || asset?.mimeType || result.blob.type || '',
+                    resolvedFilename: result.resolvedFilename || metadata?.filename || asset?.filenameHint || '',
+                };
+            } catch (error) {
+                if (error?.name === 'AbortError') throw error;
+                errors.push(error?.message || String(error));
+            }
+            throw new Error(errors.filter(Boolean).join('；') || '没有可读取的附件地址');
         }
 
         ensureAssetFilenameExtension(filename, mimeType) {
@@ -6946,6 +7644,7 @@
                         label: asset.label,
                         kind: asset.kind,
                         sourceUrl: asset.sourceUrl || '',
+                        fileId: asset.fileId || '',
                         included: false,
                         reason: '用户未勾选“图片和附件”',
                     });
@@ -6956,9 +7655,11 @@
             const entries = this.getArchiveAssetsForIndices(indices);
             const uniqueJobs = new Map();
             for (const entry of entries) {
-                const key = entry.asset.sourceUrl || entry.asset.blob
-                    ? `${entry.asset.kind}|${entry.asset.sourceUrl || entry.asset.id}`
-                    : entry.asset.id;
+                const key = entry.asset.fileId
+                    ? `file-id|${entry.asset.fileId}`
+                    : entry.asset.sourceUrl || entry.asset.blob
+                        ? `${entry.asset.kind}|${entry.asset.sourceUrl || entry.asset.id}`
+                        : entry.asset.id;
                 if (!uniqueJobs.has(key)) uniqueJobs.set(key, { ...entry, refs: [] });
                 uniqueJobs.get(key).refs.push(entry);
             }
@@ -6980,13 +7681,16 @@
                     }
                     const dispositionName = this.parseContentDispositionFilename(result.contentDisposition);
                     const filename = this.ensureAssetFilenameExtension(
-                        dispositionName || asset.filenameHint || asset.label || 'asset',
+                        dispositionName || result.resolvedFilename || asset.filenameHint || asset.label || 'asset',
                         result.contentType || asset.mimeType || result.blob.type,
                     );
                     const path = this.createUniqueAssetPath(logicalIndex, filename, usedPaths);
                     plannedZipBytes += result.blob.size;
                     files.push({ path, blob: result.blob, asset, logicalIndex });
                     for (const ref of job.refs) {
+                        ref.asset.byteLength = result.blob.size;
+                        ref.asset.mimeType = result.contentType || ref.asset.mimeType || result.blob.type || '';
+                        if (result.resolvedFilename) ref.asset.resolvedFilename = result.resolvedFilename;
                         tokenPathMap.set(ref.asset.id, path);
                         for (const url of [ref.asset.sourceUrl, ...(ref.asset.alternateUrls || [])]) {
                             if (!url) continue;
@@ -6999,6 +7703,7 @@
                             label: ref.asset.label,
                             kind: ref.asset.kind,
                             sourceUrl: ref.asset.sourceUrl || '',
+                            fileId: ref.asset.fileId || '',
                             included: true,
                             path,
                             size: result.blob.size,
@@ -7015,6 +7720,7 @@
                             label: ref.asset.label,
                             kind: ref.asset.kind,
                             sourceUrl: ref.asset.sourceUrl || '',
+                            fileId: ref.asset.fileId || '',
                             included: false,
                             reason: error?.message || String(error),
                         });
@@ -7036,8 +7742,9 @@
                 'assets/：成功获取的图片、文件和 HTML Artifacts。',
                 'manifest.json：每个资源的来源、导出路径和失败原因。',
                 '',
-                '说明：页面没有暴露真实下载 URL、链接已过期、登录权限、CORS、文件过大，',
-                '或 sandbox: 链接只能由 ChatGPT 应用内部解析时，附件可能无法被打包。',
+                '资源解析会优先使用对话数据中的 file_id 换取临时下载地址，再以页面 DOM 地址作为后备。',
+                'manifest.json 会记录 file_id、来源 URL、归档路径和失败原因。',
+                '如果签名链接已过期、账号无权限、文件超过限制，或页面未提供 file_id，附件仍可能无法打包。',
             ];
             if (failures.length) {
                 lines.push('', `未打包资源：${failures.length} 个`, '');
@@ -7076,6 +7783,11 @@
                     this.conversationLoadAbortController = controller;
                 }
 
+                this.updateConversationArchiveUi('正在解析图片和附件元数据…');
+                await this.enrichConversationArchivesWithApiAssets(uniqueIndices, controller.signal).catch((error) => {
+                    console.warn('[ChatGPT 导航与导出] API 附件元数据解析失败，将使用页面 DOM 作为后备：', error);
+                });
+
                 const assetPlan = await this.prepareZipAssets(
                     uniqueIndices,
                     this.exportIncludeAssets,
@@ -7106,7 +7818,7 @@
                 }
 
                 const manifest = {
-                    version: 1,
+                    version: 2,
                     generatedAt: new Date().toISOString(),
                     source: location.href,
                     title: this.getConversationExportTitle(),
@@ -7449,6 +8161,7 @@
 
     const startAnswerToc = () => {
         const controller = new AnswerTocController(CONFIG);
+        if (window.__CGPT_TOC_TEST_MODE__) window.__cgptAnswerTocController = controller;
         controller.start();
     };
 
