@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      3.5.0
-// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持严格校验原始生成文件、图片、附件与 Artifacts 的离线归档
+// @version      3.7.0
+// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持严格校验原始生成文件、图片、附件与 Artifacts 的离线归档，并保证导出 HTML/Markdown 使用可移植的本地附件链接，且不同文本附件不会错误复用同一二进制内容
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -6602,19 +6602,18 @@
 
             const mergedAssets = [];
             for (const asset of assets) {
-                const same = mergedAssets.find((existing) =>
-                    (asset.fileId && existing.fileId === asset.fileId) ||
-                    (asset.artifactId && existing.artifactId === asset.artifactId) ||
-                    (asset.sourceUrl && existing.sourceUrl === asset.sourceUrl) ||
-                    (asset.filenameHint && existing.filenameHint === asset.filenameHint &&
-                        (/^sandbox:/i.test(asset.sourceUrl || '') || /^sandbox:/i.test(existing.sourceUrl || '')) &&
-                        (asset.fileId || existing.fileId))
-                );
+                // 只允许使用强身份合并 API 资源。不能再按“同名 .txt + 任一方有 file_id”合并，
+                // 否则同一轮生成的多个文本文件可能被折叠为一个资源，并共享第一份文件内容。
+                const same = mergedAssets.find((existing) => this.assetsShareStrongIdentity(existing, asset));
                 if (!same) {
                     mergedAssets.push(asset);
                     continue;
                 }
-                this.mergeArchiveAsset(same, asset);
+                const merged = this.mergeArchiveAsset(same, asset);
+                if (!merged) {
+                    mergedAssets.push(asset);
+                    continue;
+                }
                 if (!same.kind || same.kind === 'file') same.kind = asset.kind || same.kind;
                 if (!same.blob && asset.blob) same.blob = asset.blob;
             }
@@ -6636,8 +6635,91 @@
             return map;
         }
 
+        getAssetStrongFileIds(asset) {
+            return new Set([
+                asset?.originalFileId || '',
+                asset?.fileId || '',
+                ...(asset?.fileIdCandidates || []),
+                this.extractFileIdFromValue(asset?.sourceUrl || ''),
+            ].map((value) => String(value || '').trim()).filter(Boolean));
+        }
+
+        getAssetStrongUrls(asset) {
+            const values = [
+                asset?.sourceUrl,
+                ...(asset?.originalUrls || []),
+                ...(asset?.alternateUrls || []),
+            ];
+            return new Set(values
+                .map((value) => this.normalizeAssetCandidateUrl(value))
+                .filter((value) => value && !/^sandbox:/i.test(value) && !this.isPreviewAssetUrl(value)));
+        }
+
+        assetsShareStrongIdentity(first, second) {
+            if (!first || !second) return false;
+            if (first === second) return true;
+            if (first.blob instanceof Blob && second.blob instanceof Blob && first.blob === second.blob) return true;
+
+            const firstIds = this.getAssetStrongFileIds(first);
+            const secondIds = this.getAssetStrongFileIds(second);
+            for (const id of firstIds) if (secondIds.has(id)) return true;
+
+            const firstArtifact = String(first.artifactId || '').trim();
+            const secondArtifact = String(second.artifactId || '').trim();
+            if (firstArtifact && secondArtifact && firstArtifact === secondArtifact) return true;
+
+            const firstUrls = this.getAssetStrongUrls(first);
+            const secondUrls = this.getAssetStrongUrls(second);
+            for (const url of firstUrls) if (secondUrls.has(url)) return true;
+            return false;
+        }
+
+        assetsHaveConflictingStrongIdentity(first, second) {
+            const firstIds = this.getAssetStrongFileIds(first);
+            const secondIds = this.getAssetStrongFileIds(second);
+            if (firstIds.size && secondIds.size) {
+                let shared = false;
+                for (const id of firstIds) if (secondIds.has(id)) shared = true;
+                if (!shared) return true;
+            }
+            const firstArtifact = String(first?.artifactId || '').trim();
+            const secondArtifact = String(second?.artifactId || '').trim();
+            return Boolean(firstArtifact && secondArtifact && firstArtifact !== secondArtifact);
+        }
+
+        normalizeAssetMatchFilename(value) {
+            return this.sanitizeAssetFilename(value || '', '')
+                .normalize('NFKC')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+        }
+
+        isGenericAssetMatchFilename(value) {
+            const name = this.normalizeAssetMatchFilename(value);
+            if (!name) return true;
+            const stem = name.replace(/\.[a-z0-9]{1,12}$/i, '').trim();
+            return /^(?:attachment|file|document|download|output|result|artifact|canvas|image|picture|附件|文件|文档|图片|下载|结果|未命名|untitled)(?:[-_ ]?\d+)?$/i.test(stem);
+        }
+
+        assetMetadataCompatibleForMerge(first, second) {
+            const firstSize = Number(first?.expectedSize) || 0;
+            const secondSize = Number(second?.expectedSize) || 0;
+            if (firstSize && secondSize && firstSize !== secondSize) return false;
+            const firstExt = this.normalizeAssetExtension(this.getAssetFilenameExtension(first?.originalFilename || first?.filenameHint || ''));
+            const secondExt = this.normalizeAssetExtension(this.getAssetFilenameExtension(second?.originalFilename || second?.filenameHint || ''));
+            if (firstExt && secondExt && firstExt !== secondExt) return false;
+            const firstMime = String(first?.originalMimeType || first?.mimeType || '').split(';')[0].trim().toLowerCase();
+            const secondMime = String(second?.originalMimeType || second?.mimeType || '').split(';')[0].trim().toLowerCase();
+            if (firstMime && secondMime && firstMime !== secondMime) return false;
+            return true;
+        }
+
         mergeArchiveAsset(existing, incoming) {
             if (!existing || !incoming) return existing || incoming;
+            // 两边都有明确但不同的 file_id / artifact_id 时绝不合并。
+            // 旧版会把不同附件的候选 ID 并到同一个数组，后续缓存键因此发生碰撞。
+            if (this.assetsHaveConflictingStrongIdentity(existing, incoming)) return null;
             if (!existing.fileId && incoming.fileId) existing.fileId = incoming.fileId;
             existing.fileIdCandidates = [...new Set([...(existing.fileIdCandidates || []), ...(incoming.fileIdCandidates || []), incoming.fileId || ''].filter(Boolean))];
             if (!existing.originalFileId && incoming.originalFileId) existing.originalFileId = incoming.originalFileId;
@@ -6684,40 +6766,51 @@
                 const category = (asset) => /image|canvas|svg/i.test(asset?.kind || '')
                     ? 'image'
                     : /artifact|html/i.test(asset?.kind || '') ? 'artifact' : 'file';
-                const pairedByOrdinal = new Map();
-                for (const role of ['user', 'assistant', 'tool']) {
-                    for (const group of ['image', 'artifact', 'file']) {
-                        const domCandidates = archive.assets.filter((asset) =>
-                            asset.role === role && category(asset) === group && !asset.fileId && !asset.apiDerived);
-                        const apiCandidates = incomingAssets.filter((asset) =>
-                            asset.role === role && category(asset) === group && asset.fileId);
-                        if (domCandidates.length && domCandidates.length === apiCandidates.length) {
-                            apiCandidates.forEach((asset, index) => pairedByOrdinal.set(asset, domCandidates[index]));
-                        }
-                    }
-                }
+
+                const unmatchedDom = new Set(archive.assets);
+                const incomingNameCounts = new Map();
+                const domNameCounts = new Map();
+                const nameKey = (asset) => {
+                    const name = this.normalizeAssetMatchFilename(asset?.originalFilename || asset?.filenameHint || asset?.label || '');
+                    return `${asset?.role || ''}|${category(asset)}|${name}`;
+                };
+                for (const asset of incomingAssets) incomingNameCounts.set(nameKey(asset), (incomingNameCounts.get(nameKey(asset)) || 0) + 1);
+                for (const asset of archive.assets) domNameCounts.set(nameKey(asset), (domNameCounts.get(nameKey(asset)) || 0) + 1);
+
                 for (const incoming of incomingAssets) {
-                    const incomingName = this.sanitizeAssetFilename(incoming.filenameHint || incoming.label || '').toLowerCase();
-                    const existing = archive.assets.find((asset) => {
-                        if (incoming.fileId && asset.fileId === incoming.fileId) return true;
-                        if (incoming.fileId && [asset.sourceUrl, ...(asset.alternateUrls || [])]
-                            .some((url) => String(url || '').includes(incoming.fileId))) return true;
-                        const existingName = this.sanitizeAssetFilename(asset.filenameHint || asset.label || '').toLowerCase();
-                        return Boolean(incomingName && existingName && incomingName === existingName && asset.role === incoming.role);
-                    }) || pairedByOrdinal.get(incoming);
-                    if (existing) {
-                        this.mergeArchiveAsset(existing, incoming);
-                        merged += 1;
-                    } else {
-                        let id = incoming.id;
-                        let suffix = 2;
-                        while (archive.assets.some((asset) => asset.id === id)) {
-                            id = `${incoming.id}-${suffix}`;
-                            suffix += 1;
+                    let existing = archive.assets.find((asset) => this.assetsShareStrongIdentity(asset, incoming));
+
+                    // 文件名只允许作为“双方都唯一、不是泛化名称、类型/大小兼容”的弱后备。
+                    // 不再按 ordinal 盲配，也不再把多个同扩展名文本附件合并。
+                    if (!existing) {
+                        const incomingName = this.normalizeAssetMatchFilename(incoming.originalFilename || incoming.filenameHint || incoming.label || '');
+                        const key = nameKey(incoming);
+                        if (incomingName && !this.isGenericAssetMatchFilename(incomingName) &&
+                            incomingNameCounts.get(key) === 1 && domNameCounts.get(key) === 1) {
+                            const matches = archive.assets.filter((asset) => unmatchedDom.has(asset) &&
+                                nameKey(asset) === key && !this.assetsHaveConflictingStrongIdentity(asset, incoming) &&
+                                this.assetMetadataCompatibleForMerge(asset, incoming));
+                            if (matches.length === 1) existing = matches[0];
                         }
-                        archive.assets.push({ ...incoming, id });
-                        added += 1;
                     }
+
+                    if (existing) {
+                        const result = this.mergeArchiveAsset(existing, incoming);
+                        if (result) {
+                            unmatchedDom.delete(existing);
+                            merged += 1;
+                            continue;
+                        }
+                    }
+
+                    let id = incoming.id;
+                    let suffix = 2;
+                    while (archive.assets.some((asset) => asset.id === id)) {
+                        id = `${incoming.id}-${suffix}`;
+                        suffix += 1;
+                    }
+                    archive.assets.push({ ...incoming, id });
+                    added += 1;
                 }
             }
             if (added || merged) {
@@ -8576,33 +8669,302 @@
             return (normalized || 'ChatGPT Conversation').slice(0, max).trim();
         }
 
-        getAssetFallbackReference(asset) {
-            const candidates = [asset?.sourceUrl, ...(asset?.alternateUrls || [])]
-                .map((value) => String(value || '').trim())
-                .filter(Boolean);
-            return candidates[0] || '';
+        isNonPortableArchiveReference(value) {
+            const raw = String(value || '').trim();
+            if (!raw) return false;
+            return /^(?:sandbox|blob|file|filesystem|attachment|oai-file|file-service|sediment|artifact|canvas|canmore|textdoc|document):/i.test(raw) ||
+                /^(?:\/?mnt\/data\/|\/?backend-api\/)/i.test(raw);
         }
 
-        replaceArchiveAssetTokens(markdown, archive, assetPathMap = new Map()) {
-            const assetsById = new Map((archive?.assets || []).map((asset) => [asset.id, asset]));
-            return String(markdown || '').replace(/cgpt-asset:\/\/([\w.-]+)/g, (match, assetId) => {
-                const local = assetPathMap.get(assetId);
-                if (local) return encodeURI(local);
-                const fallback = this.getAssetFallbackReference(assetsById.get(assetId));
-                return fallback || '#asset-not-available';
+        getPortableAssetFallbackReference(asset) {
+            const candidates = [
+                ...(asset?.originalUrls || []),
+                asset?.sourceUrl,
+                ...(asset?.alternateUrls || []),
+                ...(asset?.previewUrls || []),
+            ]
+                .map((value) => String(value || '').trim())
+                .filter(Boolean);
+            return candidates.find((value) => !this.isNonPortableArchiveReference(value)) || '';
+        }
+
+        getAssetFallbackReference(asset) {
+            return this.getPortableAssetFallbackReference(asset);
+        }
+
+        toArchiveLocalReference(path) {
+            const clean = String(path || '')
+                .trim()
+                .replace(/^[.][\/]+/, '')
+                .replace(/^[\/]+/, '')
+                .replace(/\\/g, '/');
+            if (!clean) return '';
+            return `./${clean.split('/').filter(Boolean).map((part) => encodeURIComponent(part)).join('/')}`;
+        }
+
+        decodeArchiveReference(value) {
+            let current = String(value || '').trim();
+            for (let index = 0; index < 2; index += 1) {
+                try {
+                    const decoded = decodeURIComponent(current);
+                    if (decoded === current) break;
+                    current = decoded;
+                } catch {
+                    break;
+                }
+            }
+            return current;
+        }
+
+        getArchiveReferenceBasename(value) {
+            let raw = this.decodeArchiveReference(value).replace(/\\/g, '/').trim();
+            if (!raw) return '';
+            raw = raw.replace(/^(?:sandbox|file|filesystem|attachment|oai-file|file-service|sediment|artifact|canvas|canmore|textdoc|document):(?:\/\/)?/i, '');
+            raw = raw.split(/[?#]/)[0];
+            try {
+                if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) raw = decodeURIComponent(new URL(raw, location.href).pathname);
+            } catch { }
+            const name = raw.split('/').filter(Boolean).pop() || '';
+            return this.sanitizeAssetFilename(name, '').normalize('NFKC').toLowerCase();
+        }
+
+        getArchiveReferenceKeys(value, logicalIndex = -1) {
+            const raw = String(value || '').trim();
+            if (!raw) return [];
+            const keys = [];
+            const seen = new Set();
+            const add = (key, strong = false) => {
+                if (!key || seen.has(key)) return;
+                seen.add(key);
+                keys.push({ key, strong });
+            };
+            const addValue = (candidate) => {
+                const text = String(candidate || '').trim();
+                if (!text) return;
+                add(`exact:${text}`, true);
+                const decoded = this.decodeArchiveReference(text);
+                if (decoded && decoded !== text) add(`exact:${decoded}`, true);
+                const normalized = this.normalizeAssetCandidateUrl(text);
+                if (normalized) add(`exact:${normalized}`, true);
+                const fileId = this.extractFileIdFromValue(text);
+                const artifactId = this.extractArtifactIdFromValue(text);
+                if (fileId) add(`file:${fileId}`, true);
+                if (artifactId) add(`artifact:${artifactId}`, true);
+                let pathKey = decoded.replace(/\\/g, '/').replace(/[?#].*$/, '');
+                pathKey = pathKey.replace(/^(?:sandbox|file|filesystem|attachment|oai-file|file-service|sediment|artifact|canvas|canmore|textdoc|document):(?:\/\/)?/i, '');
+                if (pathKey) {
+                    add(`path:${pathKey.toLowerCase()}`, false);
+                    if (logicalIndex >= 0) add(`q:${logicalIndex}|path:${pathKey.toLowerCase()}`, false);
+                }
+                const basename = this.getArchiveReferenceBasename(text);
+                if (basename) {
+                    add(`name:${basename}`, false);
+                    if (logicalIndex >= 0) add(`q:${logicalIndex}|name:${basename}`, false);
+                }
+            };
+            addValue(raw);
+            return keys;
+        }
+
+        registerArchivePathAlias(map, key, path, strong = false) {
+            if (!(map instanceof Map) || !key || !path) return;
+            if (!map.has(key)) {
+                map.set(key, path);
+                return;
+            }
+            const existing = map.get(key);
+            if (existing === path) return;
+            // 同名弱别名发生冲突时标记为歧义，避免把不同附件错误地指向同一文件。
+            // 强别名冲突也不覆盖，宁可禁用链接也不误链。
+            map.set(key, '');
+        }
+
+        registerArchiveReferencePath(map, value, path, logicalIndex = -1) {
+            for (const { key, strong } of this.getArchiveReferenceKeys(value, logicalIndex)) {
+                this.registerArchivePathAlias(map, key, path, strong);
+            }
+            const raw = String(value || '').trim();
+            if (raw) this.registerArchivePathAlias(map, raw, path, true);
+            const normalized = this.normalizeAssetCandidateUrl(raw);
+            if (normalized) this.registerArchivePathAlias(map, normalized, path, true);
+        }
+
+        registerArchiveFilenamePath(map, value, path, logicalIndex = -1) {
+            const filename = this.sanitizeAssetFilename(value || '', '').normalize('NFKC').toLowerCase();
+            if (!filename) return;
+            this.registerArchivePathAlias(map, `name:${filename}`, path, false);
+            if (logicalIndex >= 0) this.registerArchivePathAlias(map, `q:${logicalIndex}|name:${filename}`, path, false);
+        }
+
+        registerArchiveAssetPathAliases(map, path, asset, logicalIndex = -1, result = null) {
+            if (!(map instanceof Map) || !path || !asset) return;
+            for (const value of [
+                asset.sourceUrl,
+                ...(asset.alternateUrls || []),
+                ...(asset.originalUrls || []),
+                ...(asset.previewUrls || []),
+                result?.finalUrl,
+            ]) {
+                if (value) this.registerArchiveReferencePath(map, value, path, logicalIndex);
+            }
+            for (const fileId of [
+                asset.originalFileId,
+                ...(asset.fileIdCandidates || []),
+                asset.fileId,
+                result?.resolvedFileId,
+            ].filter(Boolean)) {
+                this.registerArchivePathAlias(map, `file:${fileId}`, path, true);
+            }
+            for (const artifactId of [asset.artifactId].filter(Boolean)) {
+                this.registerArchivePathAlias(map, `artifact:${artifactId}`, path, true);
+            }
+            for (const filename of [
+                asset.resolvedFilename,
+                asset.originalFilename,
+                asset.filenameHint,
+                result?.resolvedFilename,
+                this.parseContentDispositionFilename(result?.contentDisposition || ''),
+                String(path).split('/').pop(),
+            ]) {
+                this.registerArchiveFilenamePath(map, filename, path, logicalIndex);
+            }
+            const label = String(asset.label || '').trim();
+            if (/\.[a-z0-9]{1,12}$/i.test(label)) this.registerArchiveFilenamePath(map, label, path, logicalIndex);
+        }
+
+        resolveArchiveReferencePath(value, logicalIndex = -1, referencePathMap = new Map()) {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            if (/^(?:\.\/)?assets\//i.test(raw)) {
+                const clean = raw.replace(/^\.\//, '').split('/').map((part) => this.decodeArchiveReference(part)).join('/');
+                return clean;
+            }
+            for (const direct of [raw, this.normalizeAssetCandidateUrl(raw)]) {
+                const path = direct && referencePathMap.get(direct);
+                if (path) return path;
+            }
+            const keys = this.getArchiveReferenceKeys(raw, logicalIndex);
+            // 优先当前问答中的别名，再使用全局唯一别名。
+            keys.sort((a, b) => (a.key.startsWith(`q:${logicalIndex}|`) ? -1 : 0) - (b.key.startsWith(`q:${logicalIndex}|`) ? -1 : 0));
+            for (const { key } of keys) {
+                const path = referencePathMap.get(key);
+                if (path) return path;
+            }
+            return '';
+        }
+
+        resolveArchiveAssetPath(asset, logicalIndex = -1, referencePathMap = new Map()) {
+            if (!asset) return '';
+            for (const fileId of [asset.originalFileId, ...(asset.fileIdCandidates || []), asset.fileId].filter(Boolean)) {
+                const path = referencePathMap.get(`file:${fileId}`);
+                if (path) return path;
+            }
+            if (asset.artifactId) {
+                const path = referencePathMap.get(`artifact:${asset.artifactId}`);
+                if (path) return path;
+            }
+            for (const value of [
+                asset.sourceUrl,
+                ...(asset.alternateUrls || []),
+                ...(asset.originalUrls || []),
+                ...(asset.previewUrls || []),
+            ]) {
+                const path = this.resolveArchiveReferencePath(value, logicalIndex, referencePathMap);
+                if (path) return path;
+            }
+            for (const filename of [asset.resolvedFilename, asset.originalFilename, asset.filenameHint, asset.label]) {
+                const normalized = this.sanitizeAssetFilename(filename || '', '').normalize('NFKC').toLowerCase();
+                if (!normalized) continue;
+                const contextual = logicalIndex >= 0 ? referencePathMap.get(`q:${logicalIndex}|name:${normalized}`) : '';
+                if (contextual) return contextual;
+                const global = referencePathMap.get(`name:${normalized}`);
+                if (global) return global;
+            }
+            return '';
+        }
+
+        reconcileArchiveAssetPathMappings(indices, assetPathMap, referencePathMap) {
+            let reconciled = 0;
+            // 多次迭代：某个 DOM 占位附件一旦通过文件名映射到 API 原文件，立刻注册其 sandbox URL，
+            // 后续正文中未被标注的同一链接也可以被精确改写。
+            for (let pass = 0; pass < 3; pass += 1) {
+                let changed = 0;
+                for (const logicalIndex of indices) {
+                    const archive = this.conversationArchive.get(logicalIndex);
+                    for (const asset of archive?.assets || []) {
+                        if (assetPathMap.has(asset.id)) continue;
+                        const path = this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap);
+                        if (!path) continue;
+                        assetPathMap.set(asset.id, path);
+                        this.registerArchiveAssetPathAliases(referencePathMap, path, asset, logicalIndex);
+                        changed += 1;
+                        reconciled += 1;
+                    }
+                }
+                if (!changed) break;
+            }
+            return reconciled;
+        }
+
+
+        reconcileAssetManifestAliases(manifest, assetPathMap, files) {
+            const fileByPath = new Map((files || []).map((file) => [file.path, file]));
+            let reconciled = 0;
+            for (const item of manifest || []) {
+                if (item.included || item.skipped) continue;
+                const path = assetPathMap.get(item.id);
+                if (!path) continue;
+                const file = fileByPath.get(path);
+                item.included = true;
+                item.reconciledAlias = true;
+                item.path = path;
+                item.size = Number(file?.blob?.size || item.size || 0) || 0;
+                item.mimeType = file?.blob?.type || item.mimeType || '';
+                item.reason = '';
+                reconciled += 1;
+            }
+            return reconciled;
+        }
+
+        rewriteMarkdownArchiveReferences(markdown, archive, referencePathMap = new Map()) {
+            const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
+            return String(markdown || '').replace(/(!?\[[^\]\n]*\]\()([^)]+)(\))/g, (match, prefix, destination, suffix) => {
+                const raw = String(destination || '').trim().replace(/^<|>$/g, '');
+                const local = this.resolveArchiveReferencePath(raw, logicalIndex, referencePathMap);
+                if (local) return `${prefix}${this.toArchiveLocalReference(local)}${suffix}`;
+                if (this.isNonPortableArchiveReference(raw)) return `${prefix}#asset-not-available${suffix}`;
+                return match;
             });
         }
 
-        buildArchiveAssetMarkdown(archive, assetPathMap = new Map()) {
+        replaceArchiveAssetTokens(markdown, archive, assetPathMap = new Map(), referencePathMap = new Map()) {
+            const assetsById = new Map((archive?.assets || []).map((asset) => [asset.id, asset]));
+            const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
+            const tokenRewritten = String(markdown || '').replace(/cgpt-asset:\/\/([\w.-]+)/g, (match, assetId) => {
+                const asset = assetsById.get(assetId);
+                const local = assetPathMap.get(assetId) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap);
+                if (local) return this.toArchiveLocalReference(local);
+                const fallback = this.getPortableAssetFallbackReference(asset);
+                return fallback || '#asset-not-available';
+            });
+            return this.rewriteMarkdownArchiveReferences(tokenRewritten, archive, referencePathMap);
+        }
+
+        buildArchiveAssetMarkdown(archive, assetPathMap = new Map(), referencePathMap = new Map()) {
             const assets = Array.isArray(archive?.assets) ? archive.assets : [];
             if (!assets.length) return '';
+            const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
             const lines = ['#### 图片、附件与 Artifacts', ''];
+            const seen = new Set();
             for (const asset of assets) {
-                const local = assetPathMap.get(asset.id);
-                const reference = local || this.getAssetFallbackReference(asset);
+                const localPath = assetPathMap.get(asset.id) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap);
+                const reference = localPath ? this.toArchiveLocalReference(localPath) : this.getPortableAssetFallbackReference(asset);
+                const dedupeKey = localPath ? `local:${localPath}` : reference ? `reference:${reference}` : `asset:${asset.id}`;
+                if (seen.has(dedupeKey)) continue;
+                seen.add(dedupeKey);
                 const label = this.escapeMarkdownInline(asset.label || asset.filenameHint || '附件');
-                const suffix = local ? '' : reference ? '（外部链接）' : '（未能获取）';
-                lines.push(reference ? `- [${label}](${encodeURI(reference)})${suffix}` : `- ${label}${suffix}`);
+                const suffix = localPath ? '' : reference ? '（外部链接）' : '（未能获取）';
+                lines.push(reference ? `- [${label}](${reference})${suffix}` : `- ${label}${suffix}`);
             }
             return `${lines.join('\n')}\n`;
         }
@@ -8611,6 +8973,7 @@
             const sorted = [...indices].sort((a, b) => a - b);
             const title = this.getConversationExportTitle();
             const assetPathMap = options.assetPathMap instanceof Map ? options.assetPathMap : new Map();
+            const referencePathMap = options.urlPathMap instanceof Map ? options.urlPathMap : new Map();
             const includeAssetAppendix = options.includeAssetAppendix !== false;
             const lines = [`# ${title}`, ''];
             if (this.config.conversationExportIncludeMetadata) {
@@ -8630,6 +8993,7 @@
                         archive.userMarkdown || archive.userText,
                         archive,
                         assetPathMap,
+                        referencePathMap,
                     );
                     lines.push(this.shiftMarkdownHeadings(userMarkdown, shift), '');
                 } else {
@@ -8642,6 +9006,7 @@
                         archive.assistantMarkdown,
                         archive,
                         assetPathMap,
+                        referencePathMap,
                     );
                     lines.push(this.shiftMarkdownHeadings(assistantMarkdown, shift), '');
                 } else {
@@ -8649,7 +9014,7 @@
                     lines.push(`_${reason}_`, '');
                 }
                 if (archive && includeAssetAppendix) {
-                    const appendix = this.buildArchiveAssetMarkdown(archive, assetPathMap);
+                    const appendix = this.buildArchiveAssetMarkdown(archive, assetPathMap, referencePathMap);
                     if (appendix) lines.push(appendix, '');
                 }
                 lines.push('---', '');
@@ -8666,26 +9031,43 @@
                 .replace(/'/g, '&#39;');
         }
 
-        rewriteSrcsetValue(value, urlPathMap) {
+        rewriteSrcsetValue(value, archive, referencePathMap) {
+            const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
             return String(value || '').split(',').map((part) => {
                 const trimmed = part.trim();
                 if (!trimmed) return '';
                 const match = /^(\S+)(\s+.*)?$/.exec(trimmed);
                 if (!match) return trimmed;
                 const rawUrl = match[1];
-                const normalized = this.normalizeAssetCandidateUrl(rawUrl);
-                const local = urlPathMap.get(normalized) || urlPathMap.get(rawUrl);
-                return `${local || rawUrl}${match[2] || ''}`;
+                const local = this.resolveArchiveReferencePath(rawUrl, logicalIndex, referencePathMap);
+                if (local) return `${this.toArchiveLocalReference(local)}${match[2] || ''}`;
+                if (this.isNonPortableArchiveReference(rawUrl)) return '';
+                return `${rawUrl}${match[2] || ''}`;
             }).filter(Boolean).join(', ');
         }
 
-        rewriteArchiveHtmlFragment(html, archive, assetPathMap, urlPathMap) {
+        rewriteArchiveHtmlFragment(html, archive, assetPathMap, referencePathMap) {
             const template = document.createElement('template');
             template.innerHTML = String(html || '');
             const assetsById = new Map((archive?.assets || []).map((asset) => [asset.id, asset]));
+            const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
+            const resolveAssetPath = (assetId) => {
+                const asset = assetsById.get(assetId);
+                return assetPathMap.get(assetId) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap) || '';
+            };
             const resolveAssetReference = (assetId) => {
                 const asset = assetsById.get(assetId);
-                return assetPathMap.get(assetId) || this.getAssetFallbackReference(asset) || '';
+                const local = resolveAssetPath(assetId);
+                if (local) return this.toArchiveLocalReference(local);
+                return this.getPortableAssetFallbackReference(asset) || '';
+            };
+            const markUnavailableLink = (element) => {
+                if (!(element instanceof Element)) return;
+                element.setAttribute('href', '#asset-not-available');
+                element.removeAttribute('target');
+                element.removeAttribute('download');
+                element.classList.add('asset-unavailable-link');
+                if (!element.getAttribute('title')) element.setAttribute('title', '该附件未能写入本地归档');
             };
 
             for (const element of template.content.querySelectorAll('*')) {
@@ -8698,8 +9080,10 @@
                         else if (tag === 'object') element.setAttribute('data', reference);
                         else {
                             element.setAttribute('src', reference);
-                            if (tag === 'iframe' && assetPathMap.has(assetId)) element.removeAttribute('srcdoc');
+                            if (tag === 'iframe' && resolveAssetPath(assetId)) element.removeAttribute('srcdoc');
                         }
+                    } else if (tag === 'a') {
+                        markUnavailableLink(element);
                     }
                     element.removeAttribute('data-cgpt-export-asset-id');
                 }
@@ -8711,16 +9095,21 @@
                     if (tokenMatch) {
                         const replacement = resolveAssetReference(tokenMatch[1]);
                         if (replacement) element.setAttribute(attributeName, replacement);
+                        else if (attributeName === 'href' && tag === 'a') markUnavailableLink(element);
                         else element.removeAttribute(attributeName);
                         continue;
                     }
-                    const normalized = this.normalizeAssetCandidateUrl(raw);
-                    const local = urlPathMap.get(normalized) || urlPathMap.get(raw);
-                    if (local) element.setAttribute(attributeName, local);
+                    const local = this.resolveArchiveReferencePath(raw, logicalIndex, referencePathMap);
+                    if (local) {
+                        element.setAttribute(attributeName, this.toArchiveLocalReference(local));
+                    } else if (this.isNonPortableArchiveReference(raw)) {
+                        if (attributeName === 'href' && tag === 'a') markUnavailableLink(element);
+                        else element.removeAttribute(attributeName);
+                    }
                 }
 
                 if (element.hasAttribute('srcset')) {
-                    const rewritten = this.rewriteSrcsetValue(element.getAttribute('srcset'), urlPathMap);
+                    const rewritten = this.rewriteSrcsetValue(element.getAttribute('srcset'), archive, referencePathMap);
                     if (rewritten) element.setAttribute('srcset', rewritten);
                     else element.removeAttribute('srcset');
                 }
@@ -8732,12 +9121,16 @@
                 }
 
                 if (tag === 'a') {
-                    element.setAttribute('rel', 'noopener noreferrer');
+                    // 本地归档链接应优先“打开/显示”文件，而不是强制再次下载。
+                    element.removeAttribute('download');
                     const href = element.getAttribute('href') || '';
-                    if (!href.startsWith('#') && !/^(?:javascript|mailto|tel):/i.test(href)) {
+                    if (href === '#asset-not-available' || href.startsWith('#')) {
+                        element.removeAttribute('target');
+                        element.setAttribute('rel', 'noopener noreferrer');
+                    } else if (!/^(?:javascript|mailto|tel):/i.test(href)) {
                         element.setAttribute('target', '_blank');
+                        element.setAttribute('rel', 'noopener noreferrer');
                     }
-                    if (/^(?:assets\/|\.\/assets\/)/i.test(href)) element.setAttribute('download', '');
                 } else if (tag === 'iframe') {
                     element.classList.add('artifact-frame');
                     element.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
@@ -8763,28 +9156,33 @@
             return { filename, mime, sizeLabel };
         }
 
-        buildArchiveAssetHtml(archive, assetPathMap) {
+        buildArchiveAssetHtml(archive, assetPathMap, referencePathMap = new Map()) {
             const assets = (Array.isArray(archive?.assets) ? archive.assets : [])
                 .filter((asset) => asset?.presentation !== 'inline-icon' && asset?.kind !== 'inline-icon');
             if (!assets.length) return '';
+            const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
+            const seen = new Set();
             const cards = assets.map((asset) => {
-                const local = assetPathMap.get(asset.id);
-                const reference = local || this.getAssetFallbackReference(asset);
+                const localPath = assetPathMap.get(asset.id) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap);
+                const reference = localPath ? this.toArchiveLocalReference(localPath) : this.getPortableAssetFallbackReference(asset);
+                const dedupeKey = localPath ? `local:${localPath}` : reference ? `reference:${reference}` : `asset:${asset.id}`;
+                if (seen.has(dedupeKey)) return '';
+                seen.add(dedupeKey);
                 const { filename, mime, sizeLabel } = this.getAssetDisplayMetadata(asset);
                 const label = this.escapeHtml(asset.label || filename || '附件');
                 const meta = [mime, sizeLabel].filter(Boolean).map((value) => this.escapeHtml(value)).join(' · ');
-                const status = local ? '已归档' : reference ? '外部链接' : '未能获取';
+                const status = localPath ? '本地归档' : reference ? '外部链接' : '未能获取';
                 const isImage = /image|canvas|svg/i.test(asset.kind || '') || String(mime).startsWith('image/');
                 const isHtmlArtifact = /artifact-html/i.test(asset.kind || '') || /text\/html/i.test(mime) || /\.html?(?:$|[?#])/i.test(reference || filename);
                 const icon = isImage ? '图片' : isHtmlArtifact ? 'Artifact' : /artifact/i.test(asset.kind || '') ? '源码' : '文件';
                 let preview = '';
-                if (local && isImage) {
+                if (localPath && isImage) {
                     preview = `<a class="asset-preview" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer"><img class="content-image" src="${this.escapeHtml(reference)}" alt="${label}" loading="lazy" decoding="async"></a>`;
-                } else if (local && isHtmlArtifact) {
+                } else if (localPath && isHtmlArtifact) {
                     preview = `<iframe class="artifact-frame asset-artifact-preview" src="${this.escapeHtml(reference)}" title="${label}" sandbox="allow-scripts allow-forms allow-modals allow-popups" loading="lazy"></iframe>`;
                 }
                 const main = reference
-                    ? `<a class="asset-link" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer"${local ? ' download' : ''}>${label}</a>`
+                    ? `<a class="asset-link" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer">${label}</a>`
                     : `<span class="asset-link asset-unavailable">${label}</span>`;
                 return `<li class="asset-card ${isImage ? 'asset-image' : ''} ${isHtmlArtifact ? 'asset-artifact' : ''}">
           ${preview}
@@ -8816,7 +9214,7 @@
                 const assistantHtml = archive?.assistantHtml
                     ? this.rewriteArchiveHtmlFragment(archive.assistantHtml, archive, assetPathMap, urlPathMap)
                     : `<pre>${this.escapeHtml(archive?.assistantMarkdown || this.conversationArchiveFailures.get(logicalIndex) || '未能加载回答内容')}</pre>`;
-                const assetHtml = archive ? this.buildArchiveAssetHtml(archive, assetPathMap) : '';
+                const assetHtml = archive ? this.buildArchiveAssetHtml(archive, assetPathMap, urlPathMap) : '';
                 sections.push(`
           <article class="qa" id="qa-${logicalIndex + 1}">
             <header class="qa-header"><span class="qa-kicker">问答</span><h2>${logicalIndex + 1}</h2><a class="back-top" href="#page-top" aria-label="返回顶部">↑</a></header>
@@ -8895,7 +9293,7 @@
   .assets{margin:16px 0 0;padding:16px 18px;border:1px solid var(--border);border-radius:14px;background:var(--surface)}.assets h4{margin:0 0 12px;font-size:14px}
   .asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:10px;list-style:none;margin:0;padding:0}.asset-card{display:flex;min-width:0;gap:11px;padding:11px;border:1px solid var(--border);border-radius:10px;background:var(--surface-soft)}
   .asset-card.asset-image,.asset-card.asset-artifact{display:block}.asset-preview{display:block;margin-bottom:9px}.asset-preview img{width:100%;max-height:280px;margin:0;background:var(--surface);object-fit:contain}.asset-artifact-preview{min-height:360px;max-height:72vh;margin:0 0 10px}.asset-card-body{min-width:0}.asset-badge{display:inline-block;margin:0 7px 4px 0;padding:2px 6px;border-radius:5px;background:var(--accent-soft);color:var(--accent);font-size:10px;font-weight:750;letter-spacing:.04em}
-  .asset-link{font-weight:650;word-break:break-word}.asset-unavailable{color:var(--muted)}.asset-meta{margin-top:3px;color:var(--muted);font-size:11.5px}
+  .asset-link{font-weight:650;word-break:break-word}.asset-unavailable,.asset-unavailable-link{color:var(--muted)}.asset-unavailable-link{text-decoration:underline dotted;text-underline-offset:3px;cursor:not-allowed}.asset-meta{margin-top:3px;color:var(--muted);font-size:11.5px}
   @media(max-width:820px){.layout{display:block;padding-inline:16px}.conversation-nav{position:static;max-height:none;margin:0 0 24px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}.conversation-nav ol{display:flex;gap:6px;overflow:auto}.conversation-nav li{flex:0 0 min(280px,78vw)}.page-header-inner{padding-inline:18px}.metadata a{margin-inline-start:0}.message-content{padding-inline:14px}.message-header{padding-inline:14px}}
   @media(max-width:520px){body{font-size:15px}.page-header-inner{padding-top:24px}.message{border-radius:12px}.asset-grid{grid-template-columns:1fr}.qa{margin-bottom:28px}.artifact-frame,.message-content iframe{min-height:420px}}
   @media print{body{background:#fff;color:#000}.page-header{border:0}.conversation-nav,.back-top{display:none}.layout{display:block;max-width:none;padding:0}.message,.assets{box-shadow:none;break-inside:avoid}.qa{break-before:auto}.message-content a{color:inherit}.artifact-frame{min-height:300px}}
@@ -10046,13 +10444,24 @@
         }
 
         async fetchArchiveAsset(asset, signal) {
-            const key = this.getAssetFetchCacheKey(asset);
-            if (!key) return this.fetchArchiveAssetUncached(asset, signal);
+            const baseKey = this.getAssetFetchCacheKey(asset);
+            if (!baseKey) return this.fetchArchiveAssetUncached(asset, signal);
+            let key = baseKey;
 
             const cached = this.assetBinaryCache.get(key);
             if (cached) {
                 const value = await cached;
-                return { ...value, cacheHit: true };
+                if (this.isCachedAssetResultCompatible(value, asset)) {
+                    return { ...value, cacheHit: true };
+                }
+                // 缓存身份发生冲突时不能覆盖另一资源的有效缓存；改用资源级隔离键重新获取。
+                key = `${baseKey}|isolated:${asset.id || this.getAssetCacheFingerprint(asset)}`;
+                const isolatedCached = this.assetBinaryCache.get(key);
+                if (isolatedCached) {
+                    const isolatedValue = await isolatedCached;
+                    if (this.isCachedAssetResultCompatible(isolatedValue, asset)) return { ...isolatedValue, cacheHit: true };
+                    this.assetBinaryCache.delete(key);
+                }
             }
 
             const failure = this.assetFailureCache.get(key);
@@ -10066,6 +10475,7 @@
             this.assetBinaryCache.set(key, task);
             try {
                 const value = await task;
+                // 新下载结果已经经过原文件格式/大小校验；身份兼容检查只用于阻止跨资源缓存复用。
                 const itemLimit = Math.max(0, Number(this.config.conversationExportBinaryCacheMaxItemBytes) || 0);
                 const totalLimit = Math.max(0, Number(this.config.conversationExportBinaryCacheMaxBytes) || 0);
                 const size = Number(value?.blob?.size) || 0;
@@ -10112,16 +10522,64 @@
             return candidate;
         }
 
+        getAssetCacheFingerprint(asset) {
+            const filename = this.normalizeAssetMatchFilename(asset?.originalFilename || asset?.filenameHint || asset?.label || '');
+            const size = Number(asset?.expectedSize) || 0;
+            const mime = String(asset?.originalMimeType || asset?.mimeType || '').split(';')[0].trim().toLowerCase();
+            const basename = this.getArchiveReferenceBasename(asset?.sourceUrl || '');
+            const stable = [filename, size || '', mime, basename].join('|');
+            // 元数据完全缺失时必须包含资源 id，宁可少去重，也不能让不同附件共享二进制。
+            return encodeURIComponent(stable || String(asset?.id || 'asset')).slice(0, 420);
+        }
+
         getAssetFetchCacheKey(asset) {
             if (!asset) return '';
-            const fileIds = [...new Set([asset.originalFileId || '', ...(asset.fileIdCandidates || []), asset.fileId || '', this.extractFileIdFromValue(asset.sourceUrl)].filter(Boolean))];
-            if (fileIds.length) return `original-v3|file-ids|${fileIds.join(',')}`;
+            const fileIds = [...new Set([asset.originalFileId || '', asset.fileId || '', ...(asset.fileIdCandidates || []), this.extractFileIdFromValue(asset.sourceUrl)].filter(Boolean))];
+            const fingerprint = this.getAssetCacheFingerprint(asset);
+            const primaryFileId = String(asset.originalFileId || asset.fileId || fileIds[0] || '').trim();
+            if (primaryFileId) return `original-v4|file-id|${primaryFileId}|${fingerprint}`;
             const artifactId = String(asset.artifactId || this.extractArtifactIdFromValue(asset.sourceUrl) || '').trim();
-            if (artifactId) return `original-v2|artifact-id|${artifactId}`;
+            if (artifactId) return `original-v4|artifact-id|${artifactId}|${fingerprint}`;
             const source = this.getStableAssetUrlKey(asset.sourceUrl || '');
-            if (source) return `original-v2|${asset.kind || 'asset'}|${source}`;
-            if (asset.blob instanceof Blob) return `blob|${asset.id || asset.filenameHint || asset.label || asset.blob.size}`;
-            return String(asset.id || asset.filenameHint || asset.label || 'asset');
+            if (source) return `original-v4|${asset.kind || 'asset'}|${source}|${fingerprint}`;
+            if (asset.blob instanceof Blob) return `blob-v2|${asset.id || fingerprint}|${asset.blob.size}|${asset.blob.type || ''}`;
+            return `asset-v2|${asset.id || fingerprint}`;
+        }
+
+        canAssetsShareFetchedBinary(first, second) {
+            if (!first || !second) return false;
+            if (first === second) return true;
+            if (first.blob instanceof Blob && second.blob instanceof Blob && first.blob === second.blob) return true;
+            if (!this.assetsShareStrongIdentity(first, second)) return false;
+            if (!this.assetMetadataCompatibleForMerge(first, second)) return false;
+            const firstName = this.normalizeAssetMatchFilename(first.originalFilename || first.filenameHint || '');
+            const secondName = this.normalizeAssetMatchFilename(second.originalFilename || second.filenameHint || '');
+            if (firstName && secondName && firstName !== secondName) return false;
+            return true;
+        }
+
+        isCachedAssetResultCompatible(result, asset) {
+            if (!result?.blob || !asset) return false;
+            const resolvedId = String(result.resolvedFileId || '').trim();
+            const expectedIds = this.getAssetStrongFileIds(asset);
+            if (resolvedId && expectedIds.size && !expectedIds.has(resolvedId)) return false;
+            const expectedSize = Number(asset.expectedSize) || 0;
+            if (expectedSize) {
+                const tolerance = Math.max(
+                    Number(this.config.conversationExportOriginalSizeToleranceBytes) || 16384,
+                    expectedSize * (Number(this.config.conversationExportOriginalSizeToleranceRatio) || 0.015),
+                );
+                if (Math.abs(result.blob.size - expectedSize) > tolerance) return false;
+            }
+            const expectedName = this.normalizeAssetMatchFilename(asset.originalFilename || asset.filenameHint || '');
+            const actualName = this.normalizeAssetMatchFilename(
+                this.parseContentDispositionFilename(result.contentDisposition || '') || result.resolvedFilename || '',
+            );
+            if (expectedName && actualName && expectedName !== actualName) return false;
+            const expectedExt = this.normalizeAssetExtension(this.getAssetFilenameExtension(expectedName));
+            const actualExt = this.normalizeAssetExtension(this.getAssetFilenameExtension(actualName));
+            if (expectedExt && actualExt && expectedExt !== actualExt) return false;
+            return true;
         }
 
         getAdaptiveAssetConcurrency() {
@@ -10249,7 +10707,14 @@
             }
             const uniqueJobs = new Map();
             for (const entry of fetchEntries) {
-                const key = this.getAssetFetchCacheKey(entry.asset) || entry.asset.id;
+                const baseKey = this.getAssetFetchCacheKey(entry.asset) || entry.asset.id;
+                let key = baseKey;
+                let suffix = 2;
+                while (uniqueJobs.has(key) && !this.canAssetsShareFetchedBinary(uniqueJobs.get(key).asset, entry.asset)) {
+                    // 即使上游错误地给不同文件复用了同一个 file_id，也必须拆成独立任务。
+                    key = `${baseKey}|isolated:${entry.asset.id || suffix}`;
+                    suffix += 1;
+                }
                 if (!uniqueJobs.has(key)) uniqueJobs.set(key, { ...entry, key, refs: [] });
                 uniqueJobs.get(key).refs.push(entry);
             }
@@ -10291,16 +10756,7 @@
                         ref.asset.mimeType = result.contentType || ref.asset.mimeType || result.blob.type || '';
                         if (result.resolvedFilename) ref.asset.resolvedFilename = result.resolvedFilename;
                         tokenPathMap.set(ref.asset.id, path);
-                        for (const url of [
-                            ref.asset.sourceUrl,
-                            ...(ref.asset.alternateUrls || []),
-                            ...(ref.asset.originalUrls || []),
-                            ...(ref.asset.previewUrls || []),
-                        ]) {
-                            if (!url) continue;
-                            urlPathMap.set(url, path);
-                            urlPathMap.set(this.normalizeAssetCandidateUrl(url), path);
-                        }
+                        this.registerArchiveAssetPathAliases(urlPathMap, path, ref.asset, ref.logicalIndex, result);
                         manifest.push({
                             logicalIndex: ref.logicalIndex,
                             id: ref.asset.id,
@@ -10316,6 +10772,7 @@
                             size: result.blob.size,
                             mimeType: result.contentType || ref.asset.mimeType || result.blob.type || '',
                             cacheHit: Boolean(result.cacheHit),
+                            fetchIdentityKey: job.key,
                             fetchDurationMs: Number(result.fetchDurationMs) || 0,
                             attemptCount: Number(result.attemptCount) || 0,
                             resolvedVia: result.resolvedVia || '',
@@ -10355,6 +10812,9 @@
             };
 
             await this.runBoundedAssetWorkers(jobs, concurrency, processJob, signal);
+            this.reconcileArchiveAssetPathMappings(indices, tokenPathMap, urlPathMap);
+            this.reconcileAssetManifestAliases(manifest, tokenPathMap, files);
+            this.conversationAssetProgress.failed = manifest.filter((item) => !item.included && !item.skipped).length;
             files.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
             manifest.sort((a, b) => (a.logicalIndex - b.logicalIndex) || String(a.id).localeCompare(String(b.id)));
             return { tokenPathMap, urlPathMap, files, manifest };
@@ -10434,6 +10894,7 @@
                 if (this.exportIncludeMarkdown) {
                     const markdown = this.buildConversationMarkdown(uniqueIndices, {
                         assetPathMap: assetPlan.tokenPathMap,
+                        urlPathMap: assetPlan.urlPathMap,
                         includeAssetAppendix: true,
                     });
                     await zip.add(`${documentBase}.md`, new Blob([markdown], { type: 'text/markdown;charset=utf-8' }));
@@ -10452,7 +10913,7 @@
                 }
 
                 const manifest = {
-                    version: 8,
+                    version: 9,
                     generatedAt: new Date().toISOString(),
                     source: location.href,
                     title: this.getConversationExportTitle(),
