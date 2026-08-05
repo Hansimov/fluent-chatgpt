@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      3.4.0
-// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持生成文件、图片、附件与 Artifacts 的离线归档
+// @version      3.5.0
+// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持严格校验原始生成文件、图片、附件与 Artifacts 的离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -114,6 +114,18 @@
         // 优先读取当前对话的结构化数据，解析 image_asset_pointer、attachments、citations
         // 与 file_id，再通过 /backend-api/files/download/{file_id} 获取临时下载地址。
         conversationExportUseConversationApiAssets: true,
+
+        // 原文件模式：只要存在 file_id，就优先解析 ChatGPT 保存的原始文件，
+        // 不再把页面中的缩略图、预览图、预览 HTML 或渲染产物当作原文件。
+        conversationExportRequireOriginalAssets: true,
+        conversationExportAllowPreviewFallback: false,
+
+        // 使用文件名、MIME、文件头和结构化元数据大小校验下载结果。
+        // 原文件大小存在于消息元数据时，允许极小的传输头/容器差异。
+        conversationExportValidateOriginalAssets: true,
+        conversationExportOriginalSizeToleranceBytes: 16 * 1024,
+        conversationExportOriginalSizeToleranceRatio: 0.015,
+        conversationExportSignatureProbeBytes: 2 * 1024 * 1024,
 
         // 安全策略：全量加载、Markdown 导出准备和 ZIP 导出准备都只做“被动发现”，
         // 绝不自动点击文件卡、下载按钮、导出菜单或 Artifact 控件。
@@ -6240,11 +6252,18 @@
             const seen = new Map();
             let sequence = 0;
             const add = ({
-                fileId = '', artifactId = '', url = '', alternateUrls = [], filename = '', label = '',
-                mimeType = '', kind = '', image = false, blob = null, sourcePath = '', signal = '', captureMethod = 'conversation-api',
+                fileId = '', fileIds = [], originalFileId = '', artifactId = '', url = '', alternateUrls = [], originalUrls = [], previewUrls = [],
+                filename = '', originalFilename = '', label = '', mimeType = '', originalMimeType = '', expectedSize = 0,
+                kind = '', image = false, blob = null, sourcePath = '', signal = '', captureMethod = 'conversation-api',
             } = {}) => {
                 const normalizedUrl = this.normalizeAssetCandidateUrl(url || sourcePath);
-                const resolvedFileId = this.extractFileIdFromValue(fileId, 'file_id') || this.extractFileIdFromValue(normalizedUrl);
+                const fileIdCandidates = [...new Set([
+                    this.extractFileIdFromValue(originalFileId, 'original_file_id'),
+                    ...(fileIds || []).map((value) => this.extractFileIdFromValue(value, 'file_id')),
+                    this.extractFileIdFromValue(fileId, 'file_id'),
+                    this.extractFileIdFromValue(normalizedUrl),
+                ].filter(Boolean))];
+                const resolvedFileId = fileIdCandidates[0] || '';
                 const resolvedArtifactId = this.extractArtifactIdFromValue(artifactId, 'artifact_id') || this.extractArtifactIdFromValue(normalizedUrl);
                 const inlineBlob = blob instanceof Blob ? blob : null;
                 if (!resolvedFileId && !resolvedArtifactId && !normalizedUrl && !inlineBlob) return;
@@ -6254,6 +6273,8 @@
                     mimeType,
                     filename: filename || label,
                     fileId: resolvedFileId,
+                    fileIdCandidates,
+                    originalFileId: this.extractFileIdFromValue(originalFileId, 'original_file_id') || '',
                     artifactId: resolvedArtifactId,
                     image,
                     blob: inlineBlob,
@@ -6279,6 +6300,19 @@
                         ...(alternateUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean),
                         normalizedUrl && normalizedUrl !== existing.sourceUrl ? normalizedUrl : '',
                     ].filter(Boolean))];
+                    existing.originalUrls = [...new Set([
+                        ...(existing.originalUrls || []),
+                        ...(originalUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean),
+                    ])];
+                    existing.previewUrls = [...new Set([
+                        ...(existing.previewUrls || []),
+                        ...(previewUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean),
+                    ])];
+                    existing.fileIdCandidates = [...new Set([...(existing.fileIdCandidates || []), ...fileIdCandidates].filter(Boolean))];
+                    if (!existing.originalFileId && originalFileId) existing.originalFileId = this.extractFileIdFromValue(originalFileId, 'original_file_id') || '';
+                    if (!existing.originalFilename && originalFilename) existing.originalFilename = this.sanitizeAssetFilename(originalFilename, existing.filenameHint || 'asset');
+                    if (!existing.originalMimeType && originalMimeType) existing.originalMimeType = String(originalMimeType);
+                    if (!existing.expectedSize && Number(expectedSize) > 0) existing.expectedSize = Number(expectedSize);
                     if (inlineBlob && (!existing.blob || inlineBlob.size > (existing.blob.size || 0))) {
                         existing.blob = inlineBlob;
                         existing.byteLength = inlineBlob.size;
@@ -6303,10 +6337,15 @@
                     label: String(label || inferredName || '附件').trim() || '附件',
                     sourceUrl: normalizedUrl,
                     alternateUrls: [...new Set((alternateUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))],
+                    originalUrls: [...new Set((originalUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))],
+                    previewUrls: [...new Set((previewUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))],
                     fileId: resolvedFileId,
                     artifactId: resolvedArtifactId,
                     filenameHint: this.sanitizeAssetFilename(inferredName || `asset-${sequence}`, `asset-${sequence}`),
+                    originalFilename: originalFilename ? this.sanitizeAssetFilename(originalFilename, inferredName || `asset-${sequence}`) : '',
                     mimeType: String(mimeType || inlineBlob?.type || ''),
+                    originalMimeType: String(originalMimeType || ''),
+                    expectedSize: Number(expectedSize) > 0 ? Number(expectedSize) : 0,
                     byteLength: inlineBlob?.size || 0,
                     blob: inlineBlob,
                     apiDerived: true,
@@ -6327,6 +6366,8 @@
                 if (fileId || artifactId) {
                     add({
                         fileId,
+                        originalFileId: /(?:original|source|upload)[_-]?file[_-]?id/i.test(keySignal) ? fileId : '',
+                        fileIds: [fileId],
                         artifactId,
                         url: urls[0] || '',
                         alternateUrls: urls.slice(1),
@@ -6403,10 +6444,17 @@
                 if (part.content_type === 'image_asset_pointer' && part.asset_pointer) {
                     add({
                         fileId: this.extractFileIdFromValue(part.asset_pointer, 'asset_pointer'),
-                        url: part.download_url || part.downloadUrl || part.url || part.asset_pointer || '',
+                        fileIds: [part.original_file_id, part.source_file_id, part.upload_id, part.file_id, part.asset_pointer].filter(Boolean),
+                        originalFileId: part.original_file_id || part.source_file_id || part.upload_id || '',
+                        url: part.download_url || part.downloadUrl || part.original_url || part.originalUrl || part.asset_pointer || '',
+                        originalUrls: [part.download_url, part.downloadUrl, part.original_url, part.originalUrl, part.file_url, part.fileUrl].filter(Boolean),
+                        previewUrls: [part.preview_url, part.previewUrl, part.thumbnail_url, part.thumbnailUrl, part.url, part.src].filter(Boolean),
                         filename: part.metadata?.file_name || part.metadata?.name || (part.metadata?.dalle ? 'generated-image.png' : 'image.png'),
+                        originalFilename: part.metadata?.file_name || part.metadata?.filename || part.metadata?.name || '',
                         label: part.metadata?.dalle?.prompt || part.metadata?.name || '图片',
                         mimeType: part.metadata?.mime_type || 'image/png',
+                        originalMimeType: part.metadata?.mime_type || '',
+                        expectedSize: Number(part.metadata?.size || part.metadata?.byte_size || part.metadata?.bytes || 0) || 0,
                         image: true,
                     });
                 }
@@ -6422,8 +6470,9 @@
                         captureMethod: 'conversation-api-inline-artifact',
                     });
                 }
+                const consumedPartKeys = /^(?:file_id|fileId|original_file_id|originalFileId|source_file_id|sourceFileId|upload_id|uploadId|asset_pointer|download_url|downloadUrl|signed_url|signedUrl|original_url|originalUrl|file_url|fileUrl|content_url|contentUrl|preview_url|previewUrl|thumbnail_url|thumbnailUrl|sandbox_path|path|url|href|src|file_name|filename|name|title|mime_type|media_type|content_type|size|byte_size|bytes|content_length)$/;
                 for (const [key, value] of Object.entries(part)) {
-                    if (typeof value === 'string') addStringReferences(value, `content.parts.${key}`, {
+                    if (typeof value === 'string' && !consumedPartKeys.test(key)) addStringReferences(value, `content.parts.${key}`, {
                         filename: part.file_name || part.filename || part.name || '',
                         label: part.title || part.name || '',
                         mimeType: part.mime_type || part.media_type || '',
@@ -6450,13 +6499,28 @@
                     const genericFileId = /^(?:attachments|files|generated_files|assets)$/.test(collectionName) ? item.id : '';
                     const genericArtifactId = collectionName === 'artifacts' ? item.id : '';
                     add({
-                        fileId: item.file_id || item.fileId || metadata.file_id || metadata.fileId || genericFileId || '',
+                        fileId: item.original_file_id || item.originalFileId || item.source_file_id || item.sourceFileId || item.upload_id ||
+                            item.file_id || item.fileId || metadata.original_file_id || metadata.source_file_id || metadata.upload_id || metadata.file_id || metadata.fileId || genericFileId || '',
+                        fileIds: [item.original_file_id, item.originalFileId, item.source_file_id, item.sourceFileId, item.upload_id, item.uploadId,
+                        item.file_id, item.fileId, item.asset_pointer, metadata.original_file_id, metadata.source_file_id, metadata.upload_id,
+                        metadata.file_id, metadata.fileId, metadata.asset_pointer, genericFileId].filter(Boolean),
+                        originalFileId: item.original_file_id || item.originalFileId || item.source_file_id || item.sourceFileId || item.upload_id || item.uploadId ||
+                            metadata.original_file_id || metadata.source_file_id || metadata.upload_id || '',
                         artifactId: item.artifact_id || item.artifactId || item.canvas_id || item.canvasId || item.textdoc_id || metadata.artifact_id || metadata.canvas_id || genericArtifactId || '',
-                        url: item.download_url || item.downloadUrl || item.content_url || item.url || item.href || item.src || metadata.download_url || metadata.url || '',
+                        url: item.download_url || item.downloadUrl || item.signed_url || item.signedUrl || item.original_url || item.originalUrl ||
+                            item.file_url || item.fileUrl || item.content_url || metadata.download_url || metadata.downloadUrl || metadata.original_url || metadata.file_url ||
+                            item.url || item.href || item.src || metadata.url || '',
                         alternateUrls: [item.asset_pointer, item.sandbox_path, item.path, metadata.asset_pointer, metadata.sandbox_path].filter(Boolean),
+                        originalUrls: [item.download_url, item.downloadUrl, item.signed_url, item.signedUrl, item.original_url, item.originalUrl,
+                        item.file_url, item.fileUrl, metadata.download_url, metadata.downloadUrl, metadata.signed_url, metadata.original_url, metadata.file_url].filter(Boolean),
+                        previewUrls: [item.preview_url, item.previewUrl, item.thumbnail_url, item.thumbnailUrl, item.url, item.href, item.src,
+                        metadata.preview_url, metadata.thumbnail_url, metadata.url].filter(Boolean),
                         filename: item.name || item.file_name || item.filename || item.title || metadata.title || metadata.file_name || '',
+                        originalFilename: item.file_name || item.filename || item.name || metadata.file_name || metadata.filename || '',
                         label: item.title || item.name || item.file_name || metadata.title || '附件',
                         mimeType: item.mime_type || item.content_type || item.media_type || metadata.mime_type || metadata.content_type || payload?.mimeType || '',
+                        originalMimeType: item.mime_type || item.media_type || metadata.mime_type || metadata.media_type || '',
+                        expectedSize: Number(item.size || item.byte_size || item.bytes || item.content_length || metadata.size || metadata.byte_size || metadata.bytes || 0) || 0,
                         kind: payload?.kind || (/artifact|canvas/i.test(signal) ? 'artifact' : ''),
                         blob: payload?.blob || null,
                         image: /image/i.test(signal) || String(item.mime_type || '').startsWith('image/'),
@@ -6485,23 +6549,35 @@
                 const signal = `${keyPath} ${value.content_type || ''} ${value.type || ''} ${value.kind || ''} ${value.format || ''}`;
                 const filename = value.file_name || value.filename || value.name || value.title || '';
                 const mimeType = value.mime_type || value.media_type || (typeof value.content_type === 'string' && value.content_type.includes('/') ? value.content_type : '') || '';
-                const fileId = value.file_id || value.fileId || value.upload_id || value.uploadId || value.asset_pointer ||
-                    (/(?:attachment|file|asset|image|generated[_ -]?file)/i.test(signal) && !/(?:citation|content[_ -]?reference|search[_ -]?result)/i.test(signal) ? value.id : '') || '';
+                const originalFileId = value.original_file_id || value.originalFileId || value.source_file_id || value.sourceFileId || value.upload_id || value.uploadId || '';
+                const fileIds = [originalFileId, value.file_id, value.fileId, value.asset_pointer,
+                    (/(?:attachment|file|asset|image|generated[_ -]?file)/i.test(signal) && !/(?:citation|content[_ -]?reference|search[_ -]?result)/i.test(signal) ? value.id : '')].filter(Boolean);
+                const fileId = fileIds[0] || '';
                 const artifactId = value.artifact_id || value.artifactId || value.canvas_id || value.canvasId ||
                     value.canmore_id || value.textdoc_id || value.document_id ||
                     (/(?:artifact|canvas|canmore|textdoc|writing[_ -]?block)/i.test(signal) ? value.id : '') || '';
-                const url = value.download_url || value.downloadUrl || value.signed_url || value.signedUrl ||
-                    value.content_url || value.file_url || value.url || value.href || value.src || value.sandbox_path || value.path || '';
+                const originalUrls = [value.download_url, value.downloadUrl, value.signed_url, value.signedUrl,
+                value.original_url, value.originalUrl, value.file_url, value.fileUrl].filter(Boolean);
+                const previewUrls = [value.preview_url, value.previewUrl, value.thumbnail_url, value.thumbnailUrl,
+                value.preview, value.thumbnail, value.src, value.url, value.href].filter((item) => typeof item === 'string');
+                const url = originalUrls[0] || value.content_url || value.contentUrl || value.url || value.href || value.src || value.sandbox_path || value.path || '';
                 const payload = this.inferArtifactPayload(value, signal, filename || `artifact-${sequence + 1}`);
                 if (fileId || artifactId || url || payload) {
                     add({
                         fileId,
+                        fileIds,
+                        originalFileId,
                         artifactId,
                         url,
                         alternateUrls: [value.asset_pointer, value.sandbox_path, value.path].filter(Boolean),
+                        originalUrls,
+                        previewUrls,
                         filename: filename || payload?.filename || (/image/i.test(signal) ? 'image.png' : artifactId ? 'artifact' : 'attachment'),
+                        originalFilename: value.file_name || value.filename || value.name || '',
                         label: value.title || value.name || filename || (artifactId ? 'Artifact' : /image/i.test(signal) ? '图片' : '附件'),
                         mimeType: mimeType || payload?.mimeType || '',
+                        originalMimeType: value.mime_type || value.media_type || '',
+                        expectedSize: Number(value.size || value.byte_size || value.bytes || value.content_length || 0) || 0,
                         kind: payload?.kind || (/artifact|canvas|canmore|textdoc/i.test(signal) ? 'artifact' : ''),
                         blob: payload?.blob || null,
                         image: /image/i.test(signal) || String(mimeType).startsWith('image/'),
@@ -6509,9 +6585,12 @@
                         captureMethod: payload ? 'conversation-api-inline-artifact' : 'conversation-api-recursive',
                     });
                 }
+                const consumedAssetKeys = /^(?:file_id|fileId|original_file_id|originalFileId|source_file_id|sourceFileId|upload_id|uploadId|asset_pointer|artifact_id|artifactId|canvas_id|canvasId|canmore_id|textdoc_id|document_id|download_url|downloadUrl|signed_download_url|signedDownloadUrl|signed_url|signedUrl|original_url|originalUrl|file_url|fileUrl|content_url|contentUrl|preview_url|previewUrl|thumbnail_url|thumbnailUrl|sandbox_path|path|url|href|src|file_name|filename|original_filename|originalFilename|name|title|mime_type|mimeType|media_type|content_type|size|byte_size|bytes|content_length|contentLength)$/;
                 for (const [key, child] of Object.entries(value)) {
                     if (typeof child === 'string') {
-                        addStringReferences(child, `${keyPath}.${key}`, { filename, label: value.title || value.name || '', mimeType });
+                        if (!consumedAssetKeys.test(key)) {
+                            addStringReferences(child, `${keyPath}.${key}`, { filename, label: value.title || value.name || '', mimeType });
+                        }
                     } else {
                         walk(child, `${keyPath}.${key}`, depth + 1);
                     }
@@ -6560,6 +6639,8 @@
         mergeArchiveAsset(existing, incoming) {
             if (!existing || !incoming) return existing || incoming;
             if (!existing.fileId && incoming.fileId) existing.fileId = incoming.fileId;
+            existing.fileIdCandidates = [...new Set([...(existing.fileIdCandidates || []), ...(incoming.fileIdCandidates || []), incoming.fileId || ''].filter(Boolean))];
+            if (!existing.originalFileId && incoming.originalFileId) existing.originalFileId = incoming.originalFileId;
             if (!existing.artifactId && incoming.artifactId) existing.artifactId = incoming.artifactId;
             if (!existing.sourceUrl && incoming.sourceUrl) existing.sourceUrl = incoming.sourceUrl;
             if (!(existing.blob instanceof Blob) && incoming.blob instanceof Blob) {
@@ -6571,8 +6652,13 @@
                 ...(incoming.alternateUrls || []),
                 incoming.sourceUrl || '',
             ].filter(Boolean))];
+            existing.originalUrls = [...new Set([...(existing.originalUrls || []), ...(incoming.originalUrls || [])].filter(Boolean))];
+            existing.previewUrls = [...new Set([...(existing.previewUrls || []), ...(incoming.previewUrls || [])].filter(Boolean))];
             if (!existing.filenameHint && incoming.filenameHint) existing.filenameHint = incoming.filenameHint;
+            if (!existing.originalFilename && incoming.originalFilename) existing.originalFilename = incoming.originalFilename;
             if (!existing.mimeType && incoming.mimeType) existing.mimeType = incoming.mimeType;
+            if (!existing.originalMimeType && incoming.originalMimeType) existing.originalMimeType = incoming.originalMimeType;
+            if (!existing.expectedSize && Number(incoming.expectedSize) > 0) existing.expectedSize = Number(incoming.expectedSize);
             if ((!existing.label || existing.label === '附件') && incoming.label) existing.label = incoming.label;
             existing.apiDerived = existing.apiDerived || incoming.apiDerived;
             existing.captureMethod = existing.captureMethod || incoming.captureMethod || '';
@@ -6684,30 +6770,47 @@
         extractDownloadMetadataFromJson(data) {
             if (!data || typeof data !== 'object') return null;
             const visited = new WeakSet();
-            let result = null;
-            const walk = (value, depth = 0) => {
-                if (!value || typeof value !== 'object' || depth > 8 || result?.downloadUrl) return;
-                if (visited.has(value)) return;
+            const candidates = [];
+            const filenameKeys = ['file_name', 'filename', 'original_filename', 'originalFilename', 'name', 'title'];
+            const mimeKeys = ['mime_type', 'mimeType', 'media_type', 'content_type'];
+            const sizeKeys = ['size', 'bytes', 'byte_size', 'content_length', 'contentLength'];
+            const keyScores = new Map([
+                ['download_url', 120], ['downloadUrl', 120], ['signed_download_url', 118], ['signedDownloadUrl', 118],
+                ['signed_url', 115], ['signedUrl', 115], ['original_url', 112], ['originalUrl', 112],
+                ['file_url', 105], ['fileUrl', 105], ['content_url', 90], ['contentUrl', 90],
+                ['location', 80], ['url', 40], ['href', 35],
+                ['preview_url', -100], ['previewUrl', -100], ['thumbnail_url', -120], ['thumbnailUrl', -120],
+            ]);
+            const walk = (value, depth = 0, inherited = {}) => {
+                if (!value || typeof value !== 'object' || depth > 10 || visited.has(value)) return;
                 visited.add(value);
                 if (Array.isArray(value)) {
-                    for (const item of value) walk(item, depth + 1);
+                    for (const item of value) walk(item, depth + 1, inherited);
                     return;
                 }
-                const url = value.download_url || value.downloadUrl || value.signed_url || value.signedUrl ||
-                    value.file_url || value.content_url || value.url || value.href || value.location || '';
-                if (typeof url === 'string' && /^(?:https?:|blob:|data:|\/)/i.test(url)) {
-                    result = {
-                        downloadUrl: this.normalizeAssetCandidateUrl(url),
-                        filename: value.file_name || value.filename || value.name || value.title || '',
-                        mimeType: value.mime_type || value.content_type || value.media_type || '',
-                        size: Number(value.size || value.bytes || value.byte_size || value.content_length || 0) || 0,
-                    };
-                    return;
+                const local = { ...inherited };
+                for (const key of filenameKeys) if (!local.filename && typeof value[key] === 'string') local.filename = value[key];
+                for (const key of mimeKeys) if (!local.mimeType && typeof value[key] === 'string') local.mimeType = value[key];
+                for (const key of sizeKeys) if (!local.size && Number(value[key]) > 0) local.size = Number(value[key]);
+                for (const [key, score] of keyScores) {
+                    const raw = value[key];
+                    if (typeof raw !== 'string') continue;
+                    const url = this.normalizeAssetCandidateUrl(raw);
+                    if (!url || !/^(?:https?:|blob:|data:|\/)/i.test(url)) continue;
+                    candidates.push({
+                        downloadUrl: url,
+                        filename: local.filename || '',
+                        mimeType: local.mimeType || '',
+                        size: local.size || 0,
+                        score: score - depth,
+                        preview: score < 0 || this.isPreviewAssetUrl(url),
+                    });
                 }
-                for (const child of Object.values(value)) walk(child, depth + 1);
+                for (const child of Object.values(value)) walk(child, depth + 1, local);
             };
-            walk(data, 0);
-            return result;
+            walk(data, 0, {});
+            candidates.sort((a, b) => b.score - a.score);
+            return candidates.find((item) => !item.preview) || candidates[0] || null;
         }
 
         async resolveFileDownloadMetadata(fileId, signal) {
@@ -6854,11 +6957,19 @@
             const map = {
                 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
                 'image/webp': 'webp', 'image/svg+xml': 'svg', 'image/avif': 'avif',
-                'application/pdf': 'pdf', 'application/zip': 'zip',
+                'application/pdf': 'pdf', 'application/zip': 'zip', 'application/gzip': 'gz',
+                'application/x-7z-compressed': '7z', 'application/vnd.rar': 'rar',
+                'application/msword': 'doc', 'application/vnd.ms-excel': 'xls', 'application/vnd.ms-powerpoint': 'ppt',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+                'application/vnd.oasis.opendocument.text': 'odt',
+                'application/vnd.oasis.opendocument.spreadsheet': 'ods',
+                'application/vnd.oasis.opendocument.presentation': 'odp',
                 'application/json': 'json', 'text/plain': 'txt', 'text/markdown': 'md',
-                'text/html': 'html', 'text/csv': 'csv', 'application/xml': 'xml',
-                'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'video/mp4': 'mp4',
-                'video/webm': 'webm',
+                'text/html': 'html', 'text/csv': 'csv', 'text/tab-separated-values': 'tsv', 'application/xml': 'xml',
+                'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/ogg': 'ogg', 'audio/flac': 'flac',
+                'video/mp4': 'mp4', 'video/webm': 'webm',
             };
             return map[mime] || '';
         }
@@ -9260,9 +9371,11 @@
             });
         }
 
-        async unwrapAssetDownloadResponse(result, asset, signal, visitedUrls) {
+        async unwrapAssetDownloadResponse(result, asset, signal, visitedUrls, sourceUrl = '', options = null) {
             const contentType = String(result?.contentType || result?.blob?.type || '').toLowerCase();
-            const finalUrl = this.normalizeAssetCandidateUrl(result?.finalUrl || '');
+            const finalUrl = this.normalizeAssetCandidateUrl(result?.finalUrl || sourceUrl || '');
+            const profile = this.getExpectedAssetProfile(asset);
+            const expectedJson = profile.extension === 'json' || /application\/json/.test(profile.mimeType);
             const mayBeJson = contentType.includes('json') || (!contentType && result?.blob?.size <= 1024 * 1024);
             if (mayBeJson && result?.blob?.size <= 2 * 1024 * 1024) {
                 let text = '';
@@ -9271,33 +9384,31 @@
                 if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
                     try {
                         const data = JSON.parse(trimmed);
-                        const downloadUrl = data?.download_url || data?.downloadUrl || data?.url || data?.file?.download_url || '';
-                        if (downloadUrl) {
-                            const normalized = this.normalizeAssetCandidateUrl(downloadUrl);
+                        const metadata = this.extractDownloadMetadataFromJson(data);
+                        if (metadata?.downloadUrl && !metadata.preview) {
+                            const normalized = this.normalizeAssetCandidateUrl(metadata.downloadUrl);
                             if (normalized && !visitedUrls.has(normalized)) {
-                                const nested = await this.fetchBinaryAssetCandidates([normalized], asset, signal, visitedUrls);
-                                if (!nested.resolvedFilename) {
-                                    nested.resolvedFilename = data?.file_name || data?.filename || data?.name || '';
-                                }
+                                const nested = await this.fetchBinaryAssetCandidates([normalized], {
+                                    ...asset,
+                                    originalFilename: metadata.filename || asset?.originalFilename || '',
+                                    originalMimeType: metadata.mimeType || asset?.originalMimeType || '',
+                                    expectedSize: metadata.size || asset?.expectedSize || 0,
+                                    originalUrls: [...new Set([...(asset?.originalUrls || []), normalized])],
+                                }, signal, visitedUrls, options);
+                                if (!nested.resolvedFilename) nested.resolvedFilename = metadata.filename || '';
                                 return nested;
                             }
                         }
                         const apiError = data?.detail || data?.error?.message || data?.message;
-                        if (apiError) throw new Error(String(apiError));
+                        if (apiError && !expectedJson) throw new Error(String(apiError));
+                        if (!expectedJson) throw new Error('文件端点返回 JSON 元数据，但没有可用的原文件下载地址');
                     } catch (error) {
                         if (error instanceof SyntaxError) {
-                            // JSON 探测失败时仍按普通二进制处理。
+                            // JSON 探测失败时继续进行文件头校验。
                         } else {
                             throw error;
                         }
                     }
-                }
-            }
-
-            if (contentType.includes('text/html') && result?.blob?.size <= 2 * 1024 * 1024) {
-                const text = await result.blob.text().catch(() => '');
-                if (/<title>\s*(?:log\s*in|sign\s*in|chatgpt)/i.test(text) || /\/auth\/login/i.test(finalUrl)) {
-                    throw new Error('附件地址返回了登录页面，签名链接可能已经失效');
                 }
             }
 
@@ -9309,45 +9420,230 @@
             let urlName = '';
             try {
                 const part = decodeURIComponent(new URL(finalUrl || location.href).pathname.split('/').filter(Boolean).pop() || '');
-                if (/\.[a-z0-9]{1,10}$/i.test(part)) urlName = part;
+                if (/\.[a-z0-9]{1,12}$/i.test(part)) urlName = part;
             } catch { }
-            return { ...result, resolvedFilename: dispositionName || urlName || '' };
+            const validated = await this.validateDownloadedAsset({ ...result, resolvedFilename: dispositionName || urlName || '' }, asset, sourceUrl || finalUrl, options);
+            return { ...validated, resolvedFilename: dispositionName || urlName || asset?.originalFilename || '' };
         }
 
-        sortAssetCandidateUrls(candidates, asset = null) {
+        getAssetFilenameExtension(value) {
+            const match = /\.([a-z0-9]{1,12})$/i.exec(String(value || '').split(/[?#]/)[0].trim());
+            return match ? match[1].toLowerCase() : '';
+        }
+
+        normalizeAssetExtension(extension) {
+            const ext = String(extension || '').toLowerCase().replace(/^\./, '');
+            const aliases = { jpeg: 'jpg', jpe: 'jpg', tif: 'tiff', htm: 'html', markdown: 'md', tgz: 'gz' };
+            return aliases[ext] || ext;
+        }
+
+        isPreviewAssetUrl(rawUrl) {
+            const url = this.normalizeAssetCandidateUrl(rawUrl);
+            if (!url) return false;
+            if (/^(?:blob|data):/i.test(url)) return false;
+            try {
+                const parsed = new URL(url, location.href);
+                if (/(?:^|\/)(?:thumbnail|thumb|preview|rendition|render|resize|cropped?|image-proxy|proxy-image)(?:\/|$)/i.test(parsed.pathname)) return true;
+                if (/\/_next\/image(?:\/|$)/i.test(parsed.pathname) || /\/cdn-cgi\/image(?:\/|$)/i.test(parsed.pathname)) return true;
+                const previewKeys = /^(?:w|width|h|height|q|quality|fit|crop|resize|dpr|thumb|thumbnail|preview|fm|format|auto)$/i;
+                if ([...parsed.searchParams.keys()].some((key) => previewKeys.test(key))) return true;
+                const disposition = parsed.searchParams.get('response-content-disposition') || parsed.searchParams.get('content-disposition') || '';
+                if (/\binline\b/i.test(disposition)) return true;
+            } catch { }
+            return false;
+        }
+
+        isExplicitOriginalAssetUrl(rawUrl, asset = null) {
+            const url = this.normalizeAssetCandidateUrl(rawUrl);
+            if (!url) return false;
+            if ((asset?.originalUrls || []).map((item) => this.normalizeAssetCandidateUrl(item)).includes(url)) return true;
+            if (this.isPreviewAssetUrl(url)) return false;
+            if (/^(?:data|blob):/i.test(url)) return !asset?.fileId;
+            try {
+                const parsed = new URL(url, location.href);
+                if (/\/backend-api\/(?:files\/download\/[^/]+|files\/[^/]+\/(?:download|content)|file\/[^/]+\/download)(?:[/?#]|$)/i.test(parsed.href)) return true;
+                if (/(?:^|\/)(?:download|original)(?:[/?#]|$)/i.test(parsed.pathname)) return true;
+                const disposition = parsed.searchParams.get('response-content-disposition') || parsed.searchParams.get('content-disposition') || '';
+                if (/\battachment\b/i.test(disposition)) return true;
+                if (/^(?:1|true|yes)$/i.test(parsed.searchParams.get('download') || parsed.searchParams.get('dl') || '')) return true;
+                const expectedExt = this.normalizeAssetExtension(this.getAssetFilenameExtension(asset?.originalFilename || asset?.filenameHint || ''));
+                const urlExt = this.normalizeAssetExtension(this.getAssetFilenameExtension(parsed.pathname));
+                // 存在 file_id 时，单凭 URL 后缀不足以证明它是原文件；页面预览地址也常带原扩展名。
+                if (!asset?.fileId && urlExt && (!expectedExt || urlExt === expectedExt)) return true;
+            } catch { }
+            return false;
+        }
+
+        getExpectedAssetProfile(asset = null) {
+            const filename = this.sanitizeAssetFilename(asset?.originalFilename || asset?.filenameHint || asset?.label || '', 'asset');
+            const extension = this.normalizeAssetExtension(this.getAssetFilenameExtension(filename));
+            const mimeType = String(asset?.originalMimeType || asset?.mimeType || '').split(';')[0].trim().toLowerCase();
+            const expectedSize = Number(asset?.expectedSize || 0) || 0;
+            const kind = String(asset?.kind || '').toLowerCase();
+            return { filename, extension, mimeType, expectedSize, kind };
+        }
+
+        async sniffDownloadedBlob(blob) {
+            const maxProbe = Math.max(64 * 1024, Number(this.config.conversationExportSignatureProbeBytes) || 2 * 1024 * 1024);
+            const firstSize = Math.min(blob.size, maxProbe);
+            const first = new Uint8Array(await blob.slice(0, firstSize).arrayBuffer());
+            let tail = first;
+            if (blob.size > firstSize) {
+                const tailSize = Math.min(blob.size, maxProbe);
+                tail = new Uint8Array(await blob.slice(Math.max(0, blob.size - tailSize)).arrayBuffer());
+            }
+            const starts = (...values) => values.every((value, index) => first[index] === value);
+            const latin1Decoder = new TextDecoder('latin1');
+            const ascii = (bytes, start = 0, length = bytes.length - start) => {
+                const end = Math.min(bytes.length, start + length);
+                return latin1Decoder.decode(bytes.subarray(start, end));
+            };
+            const prefix = ascii(first, 0, Math.min(first.length, 8192));
+            const trimmed = prefix.replace(/^\uFEFF/, '').trimStart();
+            const result = { type: 'binary', extension: '', mimeType: '', container: '', textKind: '', signature: '' };
+            if (starts(0x25, 0x50, 0x44, 0x46, 0x2d)) return { ...result, type: 'pdf', extension: 'pdf', mimeType: 'application/pdf', signature: 'PDF' };
+            if (starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return { ...result, type: 'image', extension: 'png', mimeType: 'image/png', signature: 'PNG' };
+            if (starts(0xff, 0xd8, 0xff)) return { ...result, type: 'image', extension: 'jpg', mimeType: 'image/jpeg', signature: 'JPEG' };
+            if (/^GIF8[79]a/.test(prefix)) return { ...result, type: 'image', extension: 'gif', mimeType: 'image/gif', signature: 'GIF' };
+            if (/^RIFF/.test(prefix) && ascii(first, 8, 4) === 'WEBP') return { ...result, type: 'image', extension: 'webp', mimeType: 'image/webp', signature: 'WEBP' };
+            if (/^RIFF/.test(prefix) && ascii(first, 8, 4) === 'WAVE') return { ...result, type: 'audio', extension: 'wav', mimeType: 'audio/wav', signature: 'WAV' };
+            if (starts(0x42, 0x4d)) return { ...result, type: 'image', extension: 'bmp', mimeType: 'image/bmp', signature: 'BMP' };
+            if (starts(0x49, 0x49, 0x2a, 0x00) || starts(0x4d, 0x4d, 0x00, 0x2a)) return { ...result, type: 'image', extension: 'tiff', mimeType: 'image/tiff', signature: 'TIFF' };
+            if (starts(0x00, 0x00, 0x01, 0x00)) return { ...result, type: 'image', extension: 'ico', mimeType: 'image/x-icon', signature: 'ICO' };
+            if (starts(0x1f, 0x8b)) return { ...result, type: 'archive', extension: 'gz', mimeType: 'application/gzip', signature: 'GZIP' };
+            if (starts(0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c)) return { ...result, type: 'archive', extension: '7z', mimeType: 'application/x-7z-compressed', signature: '7Z' };
+            if (/^Rar!\x1a\x07/.test(prefix)) return { ...result, type: 'archive', extension: 'rar', mimeType: 'application/vnd.rar', signature: 'RAR' };
+            if (starts(0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1)) return { ...result, type: 'ole', extension: 'ole', mimeType: 'application/x-ole-storage', signature: 'OLE' };
+            if (/^OggS/.test(prefix)) return { ...result, type: 'audio', extension: 'ogg', mimeType: 'audio/ogg', signature: 'OGG' };
+            if (/^fLaC/.test(prefix)) return { ...result, type: 'audio', extension: 'flac', mimeType: 'audio/flac', signature: 'FLAC' };
+            if (/^ID3/.test(prefix) || (first[0] === 0xff && (first[1] & 0xe0) === 0xe0)) return { ...result, type: 'audio', extension: 'mp3', mimeType: 'audio/mpeg', signature: 'MP3' };
+            if (first.length >= 12 && ascii(first, 4, 4) === 'ftyp') return { ...result, type: 'video', extension: 'mp4', mimeType: 'video/mp4', signature: 'ISO-BMFF' };
+            if (starts(0x1a, 0x45, 0xdf, 0xa3)) return { ...result, type: 'video', extension: 'webm', mimeType: 'video/webm', signature: 'EBML' };
+            if (/^SQLite format 3\x00/.test(prefix)) return { ...result, type: 'database', extension: 'sqlite', mimeType: 'application/vnd.sqlite3', signature: 'SQLite' };
+            if (starts(0x50, 0x4b, 0x03, 0x04) || starts(0x50, 0x4b, 0x05, 0x06) || starts(0x50, 0x4b, 0x07, 0x08)) {
+                const zipText = `${ascii(first)}\n${tail === first ? '' : ascii(tail)}`;
+                if (/(?:^|\W)word\//.test(zipText) || /word\/document\.xml/.test(zipText)) return { ...result, type: 'office', extension: 'docx', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', container: 'zip', signature: 'OOXML-DOCX' };
+                if (/(?:^|\W)xl\//.test(zipText) || /xl\/workbook\.xml/.test(zipText)) return { ...result, type: 'office', extension: 'xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', container: 'zip', signature: 'OOXML-XLSX' };
+                if (/(?:^|\W)ppt\//.test(zipText) || /ppt\/presentation\.xml/.test(zipText)) return { ...result, type: 'office', extension: 'pptx', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', container: 'zip', signature: 'OOXML-PPTX' };
+                if (/mimetypeapplication\/vnd\.oasis\.opendocument\.text/.test(zipText)) return { ...result, type: 'office', extension: 'odt', mimeType: 'application/vnd.oasis.opendocument.text', container: 'zip', signature: 'ODT' };
+                if (/mimetypeapplication\/vnd\.oasis\.opendocument\.spreadsheet/.test(zipText)) return { ...result, type: 'office', extension: 'ods', mimeType: 'application/vnd.oasis.opendocument.spreadsheet', container: 'zip', signature: 'ODS' };
+                if (/mimetypeapplication\/vnd\.oasis\.opendocument\.presentation/.test(zipText)) return { ...result, type: 'office', extension: 'odp', mimeType: 'application/vnd.oasis.opendocument.presentation', container: 'zip', signature: 'ODP' };
+                return { ...result, type: 'archive', extension: 'zip', mimeType: 'application/zip', container: 'zip', signature: 'ZIP' };
+            }
+            const nulCount = first.slice(0, Math.min(first.length, 4096)).reduce((count, byte) => count + (byte === 0 ? 1 : 0), 0);
+            const likelyText = first.length === 0 || nulCount < Math.max(2, Math.min(first.length, 4096) * 0.01);
+            if (likelyText) {
+                if (/^<!doctype\s+html|^<html\b|<body\b|<title\b/i.test(trimmed)) return { ...result, type: 'text', extension: 'html', mimeType: 'text/html', textKind: 'html', signature: 'HTML' };
+                if (/^[{[]/.test(trimmed)) {
+                    try { JSON.parse(new TextDecoder().decode(first)); return { ...result, type: 'text', extension: 'json', mimeType: 'application/json', textKind: 'json', signature: 'JSON' }; } catch { }
+                }
+                if (/^<\?xml\b|^<svg\b/i.test(trimmed)) {
+                    const svg = /^<svg\b/i.test(trimmed);
+                    return { ...result, type: svg ? 'image' : 'text', extension: svg ? 'svg' : 'xml', mimeType: svg ? 'image/svg+xml' : 'application/xml', textKind: svg ? 'svg' : 'xml', signature: svg ? 'SVG' : 'XML' };
+                }
+                return { ...result, type: 'text', extension: 'txt', mimeType: 'text/plain', textKind: 'plain', signature: 'TEXT' };
+            }
+            return result;
+        }
+
+        assetExtensionsCompatible(expected, actual, sniff) {
+            const exp = this.normalizeAssetExtension(expected);
+            const act = this.normalizeAssetExtension(actual);
+            if (!exp || !act || act === 'bin') return true;
+            if (exp === act) return true;
+            const groups = [
+                new Set(['jpg', 'jpeg']), new Set(['tif', 'tiff']),
+                new Set(['zip', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp']),
+                new Set(['txt', 'md', 'csv', 'tsv', 'yaml', 'yml', 'xml', 'json', 'html', 'css', 'js', 'ts', 'py', 'sql']),
+                new Set(['mp4', 'm4v', 'mov']),
+            ];
+            if (groups.some((group) => group.has(exp) && group.has(act))) {
+                if (['docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp'].includes(exp) && sniff?.extension && sniff.extension !== 'zip') return sniff.extension === exp;
+                return true;
+            }
+            if (['doc', 'xls', 'ppt'].includes(exp) && sniff?.extension === 'ole') return true;
+            return false;
+        }
+
+        async validateDownloadedAsset(result, asset, sourceUrl = '', options = null) {
+            if (this.config.conversationExportValidateOriginalAssets === false) return { ...result, validation: { verified: false, reason: 'disabled' } };
+            const strictOriginal = options?.strictOriginal !== false && this.config.conversationExportRequireOriginalAssets !== false;
+            const profile = this.getExpectedAssetProfile(asset);
+            const sniff = await this.sniffDownloadedBlob(result.blob);
+            const resultName = this.parseContentDispositionFilename(result.contentDisposition) || result.resolvedFilename || '';
+            const resultExt = this.normalizeAssetExtension(this.getAssetFilenameExtension(resultName));
+            const expectedExt = profile.extension || this.normalizeAssetExtension(this.getMimeExtension(profile.mimeType));
+            const actualExt = sniff.extension || resultExt || this.normalizeAssetExtension(this.getMimeExtension(result.contentType || result.blob.type));
+            const artifactHtml = /artifact|canvas|html/.test(profile.kind) || expectedExt === 'html' || /text\/html/.test(profile.mimeType);
+            if (!artifactHtml && sniff.textKind === 'html') throw new Error('附件地址返回的是 HTML 预览页，而不是原文件');
+            if (sniff.textKind === 'json' && expectedExt !== 'json' && !/application\/json/.test(profile.mimeType)) {
+                throw new Error('附件端点返回的是 JSON 元数据，而不是原文件');
+            }
+            const expectedIsImage = /^image\//.test(profile.mimeType) || /^(?:png|jpg|gif|webp|avif|svg|bmp|tiff|ico)$/.test(expectedExt) || /image/.test(profile.kind);
+            if (!expectedIsImage && sniff.type === 'image' && expectedExt) throw new Error(`下载结果是 ${sniff.signature || '图片'} 预览，不是 ${expectedExt.toUpperCase()} 原文件`);
+            if (expectedExt && actualExt && !this.assetExtensionsCompatible(expectedExt, actualExt, sniff)) {
+                throw new Error(`文件格式校验失败：期望 ${expectedExt.toUpperCase()}，实际为 ${(actualExt || sniff.signature || '未知').toUpperCase()}`);
+            }
+            let sizeMatched = null;
+            if (profile.expectedSize > 0) {
+                const tolerance = Math.max(
+                    Number(this.config.conversationExportOriginalSizeToleranceBytes) || 16384,
+                    profile.expectedSize * (Number(this.config.conversationExportOriginalSizeToleranceRatio) || 0.015),
+                );
+                sizeMatched = Math.abs(result.blob.size - profile.expectedSize) <= tolerance;
+                if (strictOriginal && !sizeMatched) {
+                    throw new Error(`原文件大小校验失败：期望 ${profile.expectedSize} 字节，实际 ${result.blob.size} 字节`);
+                }
+            }
+            if (strictOriginal && asset?.fileId && this.isPreviewAssetUrl(sourceUrl)) {
+                throw new Error('候选地址是缩略图或预览地址，已拒绝作为原文件');
+            }
+            return {
+                ...result,
+                contentType: sniff.mimeType || result.contentType || result.blob.type || profile.mimeType || '',
+                validation: {
+                    verified: true,
+                    strictOriginal,
+                    signature: sniff.signature || '',
+                    detectedExtension: actualExt || '',
+                    expectedExtension: expectedExt || '',
+                    expectedSize: profile.expectedSize || 0,
+                    actualSize: result.blob.size,
+                    sizeMatched,
+                    sourceWasPreview: this.isPreviewAssetUrl(sourceUrl),
+                },
+            };
+        }
+
+        sortAssetCandidateUrls(candidates, asset = null, options = null) {
             const unique = [...new Set((candidates || [])
                 .map((value) => this.normalizeAssetCandidateUrl(value))
                 .filter(Boolean))];
-            const directSourceKeys = new Set([
-                asset?.sourceUrl,
-                ...(asset?.alternateUrls || []),
-            ].map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean));
+            const originalKeys = new Set((asset?.originalUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean));
+            const strictOriginal = options?.strictOriginal !== false && this.config.conversationExportRequireOriginalAssets !== false;
             const score = (url) => {
-                if (/^data:/i.test(url)) return 0;
-                if (/^blob:/i.test(url)) return 1;
-                const routePriority = this.getAssetRoutePriority(url);
-                const isBackendRoute = Boolean(this.getAssetRouteKey(url));
-                if (directSourceKeys.has(url) && this.isUsableDirectAssetUrl(url)) return 2;
-                if (/^https?:/i.test(url) && !isBackendRoute) {
-                    try {
-                        const parsed = new URL(url, location.href);
-                        const signed = /(?:token|sig|signature|expires?|x-amz-|x-goog-|policy|key-pair-id)/i.test(parsed.search);
-                        const fileLike = /(?:\/download(?:[/?#]|$)|\.[a-z0-9]{2,10}(?:[?#]|$))/i.test(parsed.href);
-                        if (signed || fileLike || parsed.origin !== location.origin) return 3;
-                    } catch { }
-                    return 5;
-                }
-                if (isBackendRoute) return 4 + routePriority;
-                return 100;
+                if (strictOriginal && asset?.fileId && this.isPreviewAssetUrl(url)) return 1000;
+                if (originalKeys.has(url)) return 0;
+                if (/\/backend-api\/files\/download\/[^/]+(?:[/?#]|$)/i.test(url)) return 1;
+                if (/\/backend-api\/(?:files\/[^/]+\/download|file\/[^/]+\/download)(?:[/?#]|$)/i.test(url)) return 2;
+                if (/\/backend-api\/files\/[^/]+\/content(?:[/?#]|$)/i.test(url)) return 3;
+                if (this.isExplicitOriginalAssetUrl(url, asset)) return 4;
+                if (/\/backend-api\/files\/[^/]+\/(?:signed-url|download-url)(?:[/?#]|$)/i.test(url)) return 5;
+                if (/\/backend-api\/files\/[^/]+(?:[/?#]|$)/i.test(url)) return 6;
+                if (/^data:/i.test(url)) return asset?.fileId ? 90 : 7;
+                if (/^blob:/i.test(url)) return asset?.fileId ? 91 : 8;
+                if (this.isPreviewAssetUrl(url)) return 100;
+                if (/^https?:/i.test(url)) return 20;
+                return 200;
             };
             return unique.sort((a, b) => score(a) - score(b));
         }
 
-        async fetchBinaryAssetCandidates(candidates, asset, signal, visitedUrls = new Set()) {
+        async fetchBinaryAssetCandidates(candidates, asset, signal, visitedUrls = new Set(), options = null) {
             const errors = [];
             const startedAt = performance.now();
             let attemptCount = 0;
-            const sorted = this.sortAssetCandidateUrls(candidates, asset);
+            const sorted = this.sortAssetCandidateUrls(candidates, asset, options);
             const unsuppressed = sorted.filter((url) => !this.isAssetRouteSuppressed(url));
             const unique = unsuppressed.length ? unsuppressed : sorted.slice(0, 1);
             for (const url of unique) {
@@ -9405,7 +9701,7 @@
                                     }
                                 },
                             });
-                        const unwrapped = await this.unwrapAssetDownloadResponse(result, asset, signal, visitedUrls);
+                        const unwrapped = await this.unwrapAssetDownloadResponse(result, asset, signal, visitedUrls, url, options);
                         if (originKey) this.assetFetchMethodPreference.set(originKey, method);
                         this.recordAssetRouteResult(url, true, null, performance.now() - attemptStartedAt);
                         this.finishAssetRouteProbe(routeProbe, { success: true });
@@ -9595,90 +9891,132 @@
         }
 
         async fetchArchiveAssetUncached(asset, signal) {
-            if (asset?.blob instanceof Blob) {
-                return {
+            const fileIds = [...new Set([
+                asset?.originalFileId || '',
+                ...(asset?.fileIdCandidates || []),
+                asset?.fileId || '',
+                this.extractFileIdFromValue(asset?.sourceUrl),
+            ].filter(Boolean))];
+            const fileId = fileIds[0] || '';
+            const artifactId = asset?.artifactId || this.extractArtifactIdFromValue(asset?.sourceUrl);
+            const strictOriginal = this.config.conversationExportRequireOriginalAssets !== false;
+            const allowPreviewFallback = this.config.conversationExportAllowPreviewFallback === true;
+            const errors = [];
+
+            // 没有 file_id 的内联 Blob（data/blob/canvas/inline artifact）本身就是唯一可用内容。
+            // 存在 file_id 时，DOM 中捕获的 Blob 通常只是预览图或渲染结果，不能优先返回。
+            if (asset?.blob instanceof Blob && !fileId) {
+                const memoryResult = await this.validateDownloadedAsset({
                     blob: asset.blob,
                     finalUrl: asset.sourceUrl || '',
                     contentType: asset.blob.type || asset.mimeType || '',
                     contentDisposition: '',
-                    resolvedFilename: asset.filenameHint || '',
+                    resolvedFilename: asset.originalFilename || asset.filenameHint || '',
+                }, asset, asset.sourceUrl || '', { strictOriginal: false });
+                return {
+                    ...memoryResult,
                     attemptCount: 0,
                     fetchDurationMs: 0,
                     resolvedVia: 'memory',
                 };
             }
 
-            const fileId = asset?.fileId || this.extractFileIdFromValue(asset?.sourceUrl);
-            const artifactId = asset?.artifactId || this.extractArtifactIdFromValue(asset?.sourceUrl);
-            const errors = [];
             let metadata = null;
+            const explicitOriginals = [...new Set([
+                ...(asset?.originalUrls || []),
+                ...[asset?.sourceUrl, ...(asset?.alternateUrls || [])].filter((url) => this.isExplicitOriginalAssetUrl(url, asset)),
+            ].map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))];
+            const previewCandidates = [...new Set([
+                ...(asset?.previewUrls || []),
+                asset?.sourceUrl || '',
+                ...(asset?.alternateUrls || []),
+            ].map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))]
+                .filter((url) => !explicitOriginals.includes(url));
 
-            const directCandidates = [asset?.sourceUrl, ...(asset?.alternateUrls || [])]
-                .filter((value) => this.isUsableDirectAssetUrl(value));
-            if (fileId) {
-                const cachedMetadata = this.fileDownloadMetadataCache.get(String(fileId));
-                if (cachedMetadata && !(cachedMetadata instanceof Promise)) {
-                    metadata = cachedMetadata;
-                    if (metadata?.blob instanceof Blob) {
-                        return {
-                            blob: metadata.blob,
-                            finalUrl: metadata.downloadUrl || asset.sourceUrl || '',
-                            contentType: metadata.mimeType || metadata.blob.type || asset.mimeType || '',
-                            contentDisposition: metadata.contentDisposition || '',
-                            resolvedFilename: metadata.filename || asset.filenameHint || '',
-                            attemptCount: 0,
-                            fetchDurationMs: 0,
-                            resolvedVia: 'metadata-cache',
-                        };
+            if (fileIds.length) {
+                let originalErrorCount = 0;
+                for (const candidateFileId of fileIds) {
+                    let metadata = null;
+                    const perIdAsset = { ...asset, fileId: candidateFileId };
+                    const cachedMetadata = this.fileDownloadMetadataCache.get(String(candidateFileId));
+                    const perIdOriginals = [...explicitOriginals];
+                    if (cachedMetadata && !(cachedMetadata instanceof Promise)) {
+                        metadata = cachedMetadata;
+                        if (metadata?.blob instanceof Blob) {
+                            try {
+                                const validated = await this.validateDownloadedAsset({
+                                    blob: metadata.blob,
+                                    finalUrl: metadata.downloadUrl || '',
+                                    contentType: metadata.mimeType || metadata.blob.type || asset.mimeType || '',
+                                    contentDisposition: metadata.contentDisposition || '',
+                                    resolvedFilename: metadata.filename || asset.originalFilename || asset.filenameHint || '',
+                                }, { ...perIdAsset, expectedSize: metadata.size || asset.expectedSize || 0 }, metadata.downloadUrl || '', { strictOriginal: true });
+                                return { ...validated, attemptCount: 0, fetchDurationMs: 0, resolvedVia: 'metadata-cache', resolvedFileId: candidateFileId };
+                            } catch {
+                                this.fileDownloadMetadataCache.delete(String(candidateFileId));
+                            }
+                        }
+                        if (metadata?.downloadUrl) perIdOriginals.unshift(metadata.downloadUrl);
                     }
-                    if (metadata?.downloadUrl) directCandidates.unshift(metadata.downloadUrl);
-                }
-            }
 
-            const primaryCandidates = [...directCandidates];
-            if (fileId) primaryCandidates.push(...this.getFileEndpointCandidates(fileId, asset?.sourceUrl));
-            if (primaryCandidates.length) {
-                try {
-                    const result = await this.fetchBinaryAssetCandidates(primaryCandidates, asset, signal);
-                    if (fileId) {
-                        this.fileDownloadMetadataCache.set(String(fileId), {
+                    const originalCandidates = [...new Set([
+                        ...perIdOriginals,
+                        ...this.getFileEndpointCandidates(candidateFileId, asset?.sourceUrl),
+                    ].filter(Boolean))];
+                    try {
+                        const result = await this.fetchBinaryAssetCandidates(originalCandidates, perIdAsset, signal, new Set(), { strictOriginal: true });
+                        this.fileDownloadMetadataCache.set(String(candidateFileId), {
                             downloadUrl: result.finalUrl || '',
-                            filename: result.resolvedFilename || asset?.filenameHint || '',
-                            mimeType: result.contentType || result.blob.type || asset?.mimeType || '',
+                            filename: result.resolvedFilename || asset?.originalFilename || asset?.filenameHint || '',
+                            mimeType: result.contentType || result.blob.type || asset?.originalMimeType || asset?.mimeType || '',
                             size: result.blob.size,
                             contentDisposition: result.contentDisposition || '',
                         });
+                        return { ...result, resolvedFileId: candidateFileId };
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        originalErrorCount += 1;
+                        errors.push(`原文件 ${candidateFileId}: ${error?.message || error}`);
                     }
-                    return {
-                        ...result,
-                        contentType: result.contentType || metadata?.mimeType || asset?.mimeType || result.blob.type || '',
-                        resolvedFilename: result.resolvedFilename || metadata?.filename || asset?.filenameHint || '',
-                    };
-                } catch (error) {
-                    if (error?.name === 'AbortError') throw error;
-                    errors.push(error?.message || String(error));
+                }
+
+                if (allowPreviewFallback && previewCandidates.length) {
+                    try {
+                        const fallback = await this.fetchBinaryAssetCandidates(previewCandidates, asset, signal, new Set(), { strictOriginal: false });
+                        return { ...fallback, resolvedVia: `${fallback.resolvedVia || 'network'}-preview-fallback`, previewFallback: true };
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        errors.push(`预览后备: ${error?.message || error}`);
+                    }
+                }
+            } else {
+                const directCandidates = [...explicitOriginals, ...previewCandidates]
+                    .filter((value) => this.isUsableDirectAssetUrl(value));
+                if (directCandidates.length) {
+                    try {
+                        return await this.fetchBinaryAssetCandidates(directCandidates, asset, signal, new Set(), { strictOriginal });
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        errors.push(error?.message || String(error));
+                    }
                 }
             }
 
-            // Artifact 端点属于昂贵的猜测性后备。只有直接 URL/file_id 均失败或不存在时才探测，
-            // 避免一个本来可直接下载的资源先等待多批无效 Artifact 路由。
             if (artifactId) {
                 try {
                     const resolvedArtifact = await this.resolveArtifactAsset(asset, signal);
                     if (resolvedArtifact?.blob instanceof Blob) {
-                        return {
+                        const validated = await this.validateDownloadedAsset({
                             blob: resolvedArtifact.blob,
                             finalUrl: asset.sourceUrl || '',
                             contentType: resolvedArtifact.mimeType || resolvedArtifact.blob.type || asset.mimeType || '',
                             contentDisposition: '',
                             resolvedFilename: resolvedArtifact.filename || asset.filenameHint || '',
-                            attemptCount: 1,
-                            fetchDurationMs: 0,
-                            resolvedVia: 'artifact-endpoint',
-                        };
+                        }, asset, asset.sourceUrl || '', { strictOriginal: false });
+                        return { ...validated, attemptCount: 1, fetchDurationMs: 0, resolvedVia: 'artifact-endpoint' };
                     }
                     if (resolvedArtifact?.candidates?.length) {
-                        const result = await this.fetchBinaryAssetCandidates(resolvedArtifact.candidates, asset, signal);
+                        const result = await this.fetchBinaryAssetCandidates(resolvedArtifact.candidates, asset, signal, new Set(), { strictOriginal: false });
                         return {
                             ...result,
                             contentType: result.contentType || resolvedArtifact.mimeType || asset.mimeType || result.blob.type || '',
@@ -9691,7 +10029,20 @@
                 }
             }
 
-            throw new Error(errors.filter(Boolean).join('；') || '没有可读取的附件地址');
+            if (asset?.blob instanceof Blob && allowPreviewFallback) {
+                const fallback = await this.validateDownloadedAsset({
+                    blob: asset.blob,
+                    finalUrl: asset.sourceUrl || '',
+                    contentType: asset.blob.type || asset.mimeType || '',
+                    contentDisposition: '',
+                    resolvedFilename: asset.filenameHint || '',
+                }, asset, asset.sourceUrl || '', { strictOriginal: false });
+                return { ...fallback, attemptCount: 0, fetchDurationMs: 0, resolvedVia: 'memory-preview-fallback', previewFallback: true };
+            }
+
+            throw new Error(errors.filter(Boolean).join('；') || (fileIds.length
+                ? '无法取得并验证原文件；为避免误导，未使用页面预览内容代替'
+                : '没有可读取的附件地址'));
         }
 
         async fetchArchiveAsset(asset, signal) {
@@ -9763,12 +10114,12 @@
 
         getAssetFetchCacheKey(asset) {
             if (!asset) return '';
-            const fileId = String(asset.fileId || this.extractFileIdFromValue(asset.sourceUrl) || '').trim();
-            if (fileId) return `file-id|${fileId}`;
+            const fileIds = [...new Set([asset.originalFileId || '', ...(asset.fileIdCandidates || []), asset.fileId || '', this.extractFileIdFromValue(asset.sourceUrl)].filter(Boolean))];
+            if (fileIds.length) return `original-v3|file-ids|${fileIds.join(',')}`;
             const artifactId = String(asset.artifactId || this.extractArtifactIdFromValue(asset.sourceUrl) || '').trim();
-            if (artifactId) return `artifact-id|${artifactId}`;
+            if (artifactId) return `original-v2|artifact-id|${artifactId}`;
             const source = this.getStableAssetUrlKey(asset.sourceUrl || '');
-            if (source) return `${asset.kind || 'asset'}|${source}`;
+            if (source) return `original-v2|${asset.kind || 'asset'}|${source}`;
             if (asset.blob instanceof Blob) return `blob|${asset.id || asset.filenameHint || asset.label || asset.blob.size}`;
             return String(asset.id || asset.filenameHint || asset.label || 'asset');
         }
@@ -9928,7 +10279,7 @@
                     }
                     const dispositionName = this.parseContentDispositionFilename(result.contentDisposition);
                     const filename = this.ensureAssetFilenameExtension(
-                        dispositionName || result.resolvedFilename || asset.filenameHint || asset.label || 'asset',
+                        dispositionName || result.resolvedFilename || asset.originalFilename || asset.filenameHint || asset.label || 'asset',
                         result.contentType || asset.mimeType || result.blob.type,
                     );
                     const path = this.createUniqueAssetPath(logicalIndex, filename, usedPaths);
@@ -9940,7 +10291,12 @@
                         ref.asset.mimeType = result.contentType || ref.asset.mimeType || result.blob.type || '';
                         if (result.resolvedFilename) ref.asset.resolvedFilename = result.resolvedFilename;
                         tokenPathMap.set(ref.asset.id, path);
-                        for (const url of [ref.asset.sourceUrl, ...(ref.asset.alternateUrls || [])]) {
+                        for (const url of [
+                            ref.asset.sourceUrl,
+                            ...(ref.asset.alternateUrls || []),
+                            ...(ref.asset.originalUrls || []),
+                            ...(ref.asset.previewUrls || []),
+                        ]) {
                             if (!url) continue;
                             urlPathMap.set(url, path);
                             urlPathMap.set(this.normalizeAssetCandidateUrl(url), path);
@@ -9963,6 +10319,12 @@
                             fetchDurationMs: Number(result.fetchDurationMs) || 0,
                             attemptCount: Number(result.attemptCount) || 0,
                             resolvedVia: result.resolvedVia || '',
+                            resolvedFileId: result.resolvedFileId || ref.asset.fileId || '',
+                            previewFallback: Boolean(result.previewFallback),
+                            validation: result.validation || null,
+                            expectedSize: Number(ref.asset.expectedSize) || 0,
+                            originalFilename: ref.asset.originalFilename || '',
+                            originalMimeType: ref.asset.originalMimeType || '',
                         });
                     }
                 } catch (error) {
@@ -10011,7 +10373,8 @@
                 '',
                 '资源解析默认只使用结构化对话数据、React 控件属性、DOM、多个文件端点以及已经打开的 Artifact 面板快照。',
                 '全量加载和导出准备不会自动点击文件卡、下载按钮或导出菜单；这是为了避免页面原生下载处理器连续触发浏览器下载。',
-                'manifest.json 会记录 file_id / artifact_id、捕获方式、来源 URL、归档路径和失败原因。',
+                'manifest.json 会记录 file_id / artifact_id、最终采用的原文件 ID、文件头校验、大小校验、来源 URL、归档路径和失败原因。',
+                '原文件模式不会用缩略图、预览页或渲染产物冒充附件；无法验证原文件时会记录失败并跳过。',
                 '如果签名链接已过期、账号无权限、文件超过限制，或页面未提供 file_id，附件仍可能无法打包。',
             ];
             if (skipped.length) {
@@ -10089,7 +10452,7 @@
                 }
 
                 const manifest = {
-                    version: 7,
+                    version: 8,
                     generatedAt: new Date().toISOString(),
                     source: location.href,
                     title: this.getConversationExportTitle(),
