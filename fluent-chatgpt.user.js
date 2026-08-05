@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      3.0.0
-// @description  优化长对话渲染，提供导航、全文搜索、全量加载，以及可靠的 Markdown/HTML/图片附件 ZIP 归档
+// @version      3.4.0
+// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持生成文件、图片、附件与 Artifacts 的离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      *
 // ==/UserScript==
 
@@ -106,12 +107,85 @@
         conversationZipIncludeHtmlByDefault: true,
         conversationZipIncludeAssetsByDefault: true,
 
+        // 网页来源 favicon、站点图标、头像等装饰性小图默认不打包。
+        // 它们往往占附件候选的大多数，但对离线阅读价值很低；关闭可显著缩短获取阶段。
+        conversationExportIncludeDecorativeIcons: false,
+
         // 优先读取当前对话的结构化数据，解析 image_asset_pointer、attachments、citations
         // 与 file_id，再通过 /backend-api/files/download/{file_id} 获取临时下载地址。
         conversationExportUseConversationApiAssets: true,
 
-        // 单个附件和整个 ZIP 的软限制；超限文件会写入 manifest，但不会拖垮页面。
+        // 安全策略：全量加载、Markdown 导出准备和 ZIP 导出准备都只做“被动发现”，
+        // 绝不自动点击文件卡、下载按钮、导出菜单或 Artifact 控件。
+        // v3.1.0 的自动点击探测会触发 ChatGPT 自身的下载处理器，导致“加载全部”时连续下载文件。
+        conversationArchivePassiveAssetDiscoveryOnly: true,
+        conversationArchiveDownloadQuarantine: true,
+
+        // 危险的交互式控件探测已默认彻底关闭。只有把 passive 设为 false、下面两个开关设为 true，
+        // 并由代码显式传入 allowInteractiveProbe:true 时才可能运行；正常 UI 流程不会传入该参数。
+        conversationExportProbeInteractiveControls: false,
+        conversationExportEnableDangerousAutomaticControlActivation: false,
+        conversationExportInteractiveProbeTimeoutMs: 1800,
+        conversationExportInteractiveProbeSettleMs: 300,
+        conversationExportMaxProbeControlsPerMessage: 16,
+        conversationExportMaxNestedProbeControls: 8,
+
+        // 尝试从 React 控件属性中补取 DOM 未公开的 file_id、artifact_id、文件名和临时地址。
+        // 只扫描疑似文件/Artifact 控件附近的属性，并设置遍历上限。
+        conversationExportProbeReactProperties: true,
+        conversationExportMaxReactHintControlsPerMessage: 10,
+
+        // 尝试从当前页面已打开或经卡片打开的 Canvas / Artifact 面板中提取 iframe、
+        // srcdoc、源码编辑器内容、Canvas 位图与 SVG。关闭后仍保留结构化 API 和普通 DOM 解析。
+        conversationExportCaptureArtifactPanels: true,
+        conversationExportMaxArtifactSourceBytes: 16 * 1024 * 1024,
+
+        // 附件任务采用较高但有上限的并发。桌面 4G/有线网络默认 10；
+        // 节省流量、低内存或慢速网络会自动降到 2～6。允许范围 1～16。
+        conversationExportAssetConcurrency: 10,
+
+        // Artifact 端点按小批次并行解析，并限制候选路由数量与总探测预算。
+        // 旧版会为每个 Artifact 轮询十余个猜测路由，这是实际环境中最主要的长尾之一。
+        conversationExportArtifactResolveConcurrency: 4,
+        conversationExportArtifactEndpointCandidateLimit: 6,
+        conversationExportArtifactResolveBudgetMs: 9000,
+
+        // file_id 只尝试优先级最高的少量端点；某条后端路由一旦被证实无效，
+        // 会在当前页面会话中熔断，后续文件不再重复等待同一错误路由。
+        conversationExportFileEndpointCandidateLimit: 5,
+        conversationExportRouteFailureCooldownMs: 10 * 60 * 1000,
+        conversationExportRouteTimeoutFailureThreshold: 2,
+
+        // 连接/首字节、正文无进展和绝对上限分开控制。
+        // 大文件只要持续有数据就不会像旧版那样在固定 30 秒后被中断并重新尝试。
+        conversationExportAssetHeaderTimeoutMs: 3800,
+        conversationExportAssetIdleTimeoutMs: 30000,
+        conversationExportAssetHardTimeoutMs: 10 * 60 * 1000,
         conversationExportAssetTimeoutMs: 30000,
+
+        // 跨域签名地址优先走 GM_xmlhttpRequest。GM 已返回 HTTP/超时错误时默认不再
+        // 再走一次几乎必然失败的页面 fetch，避免每个失效链接产生双倍等待。
+        conversationExportCrossOriginPreferGm: true,
+        conversationExportCrossOriginFallbackAfterGmFailure: false,
+
+        // 让 Tampermonkey 直接返回 Blob，避免大附件先复制成 ArrayBuffer、再复制进 Blob。
+        // 现代 Chromium/Tampermonkey 支持该响应类型；关闭后回退到 arraybuffer。
+        conversationExportGmPreferBlobResponse: true,
+
+        // 具有不同临时签名参数、但路径相同的同一资源按稳定 URL 去重。
+        conversationExportStableUrlDedupe: true,
+
+        // 同一次页面会话内复用已成功获取的二进制资源；短期缓存失败结果，避免重复导出时
+        // 对同一个失效地址再次等待完整超时。失败缓存到期后仍可重试。
+        conversationExportAssetFailureCacheTtlMs: 60000,
+        conversationExportProgressUpdateIntervalMs: 90,
+
+        // 成功二进制只缓存中小型文件，避免一次大归档长期占用过多内存。
+        // 正在进行的同一资源请求仍会始终合并，不会重复下载。
+        conversationExportBinaryCacheMaxItemBytes: 64 * 1024 * 1024,
+        conversationExportBinaryCacheMaxBytes: 256 * 1024 * 1024,
+
+        // 单个附件和整个 ZIP 的软限制；超限文件会写入 manifest，但不会拖垮页面。
         conversationExportMaxAssetBytes: 512 * 1024 * 1024,
         conversationExportMaxZipBytes: 2 * 1024 * 1024 * 1024,
 
@@ -554,6 +628,27 @@
             this.conversationApiSnapshotPromise = null;
             this.conversationApiSnapshotId = '';
             this.conversationApiAssetsByIndex = new Map();
+            this.fileDownloadMetadataCache = new Map();
+            this.artifactResolutionCache = new Map();
+
+            // ZIP 附件获取缓存。成功结果在当前对话页面内复用；失败只短期缓存，
+            // 避免重复点击“全部 ZIP”时再次等待同一失效端点。
+            this.assetBinaryCache = new Map();
+            this.assetBinaryCacheBytes = 0;
+            this.assetFailureCache = new Map();
+            this.assetFetchMethodPreference = new Map();
+            this.assetRouteStats = new Map();
+            this.assetRouteProbePromises = new Map();
+            this.assetProgressLastUiAt = 0;
+            this.assetProgressActive = 0;
+            this.assetProgressBytes = 0;
+            this.assetProgressStartedAt = 0;
+            this.assetFetchAttemptSequence = 0;
+
+            this.interactiveProbeRunId = 0;
+            this.downloadQuarantineSequence = 0;
+            this.lastDownloadQuarantineStats = null;
+            this.apiAccountId = '';
             this.apiDeviceId = '';
             this.exportIncludeMarkdown = this.config.conversationZipIncludeMarkdownByDefault !== false;
             this.exportIncludeHtml = this.config.conversationZipIncludeHtmlByDefault !== false;
@@ -3105,6 +3200,16 @@
             this.conversationApiSnapshotPromise = null;
             this.conversationApiSnapshotId = '';
             this.conversationApiAssetsByIndex.clear();
+            this.fileDownloadMetadataCache.clear();
+            this.artifactResolutionCache.clear();
+            this.assetBinaryCache.clear();
+            this.assetBinaryCacheBytes = 0;
+            this.assetFailureCache.clear();
+            this.assetFetchMethodPreference.clear();
+            this.assetRouteStats.clear();
+            this.assetRouteProbePromises.clear();
+            this.assetProgressStartedAt = 0;
+            this.assetFetchAttemptSequence = 0;
             this.clearConversationLabelCacheState();
             this.maxObservedOfficialLogicalIndex = -1;
             this.disconnectCurrentAnswer();
@@ -5865,7 +5970,12 @@
                     if (!response.ok) throw new Error(`会话令牌请求失败：HTTP ${response.status}`);
                     const data = await response.json();
                     const token = String(data?.accessToken || '');
+                    const accountId = String(
+                        data?.account?.id || data?.active_account?.id || data?.activeAccount?.id ||
+                        data?.user?.account_id || data?.user?.accountId || '',
+                    );
                     if (token) this.sessionAccessToken = token;
+                    if (accountId) this.apiAccountId = accountId;
                     return token;
                 })().finally(() => {
                     this.sessionAccessTokenPromise = null;
@@ -5886,6 +5996,7 @@
                 'Oai-Language': navigator.language || 'zh-CN',
             };
             if (token) headers.Authorization = `Bearer ${token}`;
+            if (this.apiAccountId) headers['ChatGPT-Account-Id'] = this.apiAccountId;
             const response = await fetch(path, {
                 method: 'GET',
                 credentials: 'include',
@@ -5954,14 +6065,130 @@
             return messages;
         }
 
-        extractFileIdFromValue(value) {
+        extractFileIdFromValue(value, keyHint = '') {
             const raw = String(value || '').trim();
             if (!raw) return '';
-            const pointer = /^(?:file-service|sediment):\/\/(.+)$/i.exec(raw)?.[1];
-            if (pointer) return pointer.split(/[?#]/)[0];
-            const endpoint = /\/backend-api\/files\/(?:download\/)?([^/?#]+)(?:\/download)?(?:[?#]|$)/i.exec(raw)?.[1];
-            if (endpoint) return decodeURIComponent(endpoint);
-            return /\b(file-[a-z0-9_-]{8,})\b/i.exec(raw)?.[1] || '';
+            const decoded = (() => {
+                try { return decodeURIComponent(raw); } catch { return raw; }
+            })();
+            const pointer = /^(?:file-service|sediment):\/\/(.+)$/i.exec(decoded)?.[1];
+            if (pointer) {
+                const clean = pointer.split(/[?#]/)[0];
+                const explicit = /\b(file[-_][a-z0-9_-]{6,})\b/i.exec(clean)?.[1];
+                return explicit || clean;
+            }
+            const endpointPatterns = [
+                /\/backend-api\/files\/download\/([^/?#]+)/i,
+                /\/backend-api\/files\/([^/?#]+)\/download/i,
+                /\/backend-api\/file\/([^/?#]+)\/download/i,
+                /\/backend-api\/files\/([^/?#]+)/i,
+                /\/files\/([^/?#]+)\/download/i,
+            ];
+            for (const endpointPattern of endpointPatterns) {
+                const match = endpointPattern.exec(decoded)?.[1];
+                if (match) {
+                    try { return decodeURIComponent(match); } catch { return match; }
+                }
+            }
+            const explicit = /\b(file[-_][a-z0-9_-]{6,})\b/i.exec(decoded)?.[1];
+            if (explicit) return explicit;
+            const hinted = String(keyHint || '').toLowerCase();
+            if (/(?:file|attachment|upload|asset)[_-]?(?:id|key|pointer)/i.test(hinted)) {
+                const compact = /^([a-z0-9][a-z0-9_-]{7,})$/i.exec(decoded)?.[1];
+                if (compact) return compact;
+            }
+            return '';
+        }
+
+        extractArtifactIdFromValue(value, keyHint = '') {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            const pointer = /^(?:artifact|canvas|canmore|textdoc|document):\/\/(.+)$/i.exec(raw)?.[1];
+            if (pointer) {
+                const clean = pointer.split(/[?#]/)[0];
+                return /\b((?:artifact|canvas|canmore|textdoc|document)[-_][a-z0-9_-]{6,})\b/i.exec(clean)?.[1] || clean;
+            }
+            const endpoint = /\/(?:artifacts?|canvas|canmore|textdocs?|documents?)\/([^/?#]+)/i.exec(raw)?.[1];
+            if (endpoint && !/^(?:download|export|open|preview|content|source|render|metadata|signed-url)$/i.test(endpoint)) {
+                try { return decodeURIComponent(endpoint); } catch { return endpoint; }
+            }
+            const explicit = /\b((?:artifact|canvas|canmore|textdoc|document)[-_][a-z0-9_-]{6,})\b/i.exec(raw)?.[1];
+            if (explicit) return explicit;
+            if (/(?:artifact|canvas|canmore|textdoc|document)[_-]?(?:id|key)/i.test(String(keyHint || ''))) {
+                return /^([a-z0-9][a-z0-9_-]{7,})$/i.exec(raw)?.[1] || '';
+            }
+            return '';
+        }
+
+        extractUrlLikeValues(value) {
+            const raw = String(value || '');
+            if (!raw) return [];
+            const values = [];
+            const patterns = [
+                /https?:\/\/[^\s"'<>\])}]+/gi,
+                /sandbox:\/mnt\/data\/[^\s"'<>\])}]+/gi,
+                /(?:file-service|sediment):\/\/[^\s"'<>\])}]+/gi,
+                /(?:artifact|canvas|canmore|textdoc|document):\/\/[^\s"'<>\])}]+/gi,
+                /blob:https?:\/\/[^\s"'<>\])}]+/gi,
+                /data:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[^,\s]+)?,[^\s"'<>]+/gi,
+            ];
+            for (const pattern of patterns) {
+                for (const match of raw.matchAll(pattern)) {
+                    const cleaned = String(match[0] || '').replace(/[.,;:!?]+$/g, '');
+                    if (cleaned && !values.includes(cleaned)) values.push(cleaned);
+                }
+            }
+            return values;
+        }
+
+        inferArtifactPayload(value, signal = '', fallbackName = 'artifact') {
+            if (!value || typeof value !== 'object') return null;
+            const combined = `${signal} ${value.type || ''} ${value.kind || ''} ${value.content_type || ''} ${value.format || ''} ${value.language || ''} ${value.mime_type || ''}`.toLowerCase();
+            const strongSignal = /artifact|canvas|canmore|textdoc|writing[-_ ]?block|code[-_ ]?document|rendered[-_ ]?(?:html|react)|interactive[-_ ]?content/.test(combined);
+            const contentCandidates = [
+                ['html', value.html], ['source', value.source], ['code', value.code],
+                ['text', value.text], ['body', value.body], ['markdown', value.markdown],
+                ['content', typeof value.content === 'string' ? value.content : ''],
+                ['document', typeof value.document === 'string' ? value.document : ''],
+                ['result', typeof value.result === 'string' ? value.result : ''],
+            ].filter((entry) => typeof entry[1] === 'string' && entry[1].trim());
+            if (!contentCandidates.length) return null;
+            const [field, rawContent] = contentCandidates[0];
+            const content = String(rawContent || '');
+            const looksHtml = /^\s*<!doctype\s+html|^\s*<html\b|<body\b|<svg\b/i.test(content);
+            if (!strongSignal && !looksHtml) return null;
+            const mimeHint = String(value.mime_type || value.media_type || value.content_type || '').toLowerCase();
+            const language = String(value.language || value.lang || value.format || '').toLowerCase();
+            let extension = 'txt';
+            let mimeType = 'text/plain;charset=utf-8';
+            if (looksHtml || mimeHint.includes('html') || /\bhtml\b/.test(language) || field === 'html') {
+                extension = 'html'; mimeType = 'text/html;charset=utf-8';
+            } else if (mimeHint.includes('markdown') || /markdown|\bmd\b/.test(language) || field === 'markdown') {
+                extension = 'md'; mimeType = 'text/markdown;charset=utf-8';
+            } else if (/tsx|typescriptreact/.test(language)) {
+                extension = 'tsx'; mimeType = 'text/typescript;charset=utf-8';
+            } else if (/jsx|react/.test(language)) {
+                extension = 'jsx'; mimeType = 'text/jsx;charset=utf-8';
+            } else if (/typescript|\bts\b/.test(language)) {
+                extension = 'ts'; mimeType = 'text/typescript;charset=utf-8';
+            } else if (/javascript|\bjs\b/.test(language)) {
+                extension = 'js'; mimeType = 'text/javascript;charset=utf-8';
+            } else if (/python|\bpy\b/.test(language)) {
+                extension = 'py'; mimeType = 'text/x-python;charset=utf-8';
+            } else if (/json/.test(language) || mimeHint.includes('json')) {
+                extension = 'json'; mimeType = 'application/json;charset=utf-8';
+            } else if (/css/.test(language) || mimeHint.includes('css')) {
+                extension = 'css'; mimeType = 'text/css;charset=utf-8';
+            } else if (/svg/.test(language) || mimeHint.includes('svg')) {
+                extension = 'svg'; mimeType = 'image/svg+xml;charset=utf-8';
+            }
+            const rawName = value.file_name || value.filename || value.name || value.title || fallbackName;
+            const safeName = this.sanitizeAssetFilename(rawName, fallbackName);
+            const filename = /\.[a-z0-9]{1,10}$/i.test(safeName) ? safeName : `${safeName}.${extension}`;
+            const maxBytes = Math.max(1024, Number(this.config.conversationExportMaxArtifactSourceBytes) || 0);
+            const blob = new Blob([content], { type: mimeType });
+            if (blob.size > maxBytes) return null;
+            return { blob, filename, mimeType, kind: extension === 'html' ? 'artifact-html' : 'artifact-source', content };
         }
 
         getAssetKindFromHints({ mimeType = '', filename = '', signal = '', image = false } = {}) {
@@ -5974,110 +6201,345 @@
             return 'file';
         }
 
+        isLikelyDownloadableAssetReference({
+            url = '', keySignal = '', mimeType = '', filename = '', fileId = '', artifactId = '',
+            image = false, blob = null, kind = '',
+        } = {}) {
+            if (fileId || artifactId || blob instanceof Blob) return true;
+            const normalized = this.normalizeAssetCandidateUrl(url);
+            const signal = `${keySignal} ${kind} ${filename}`.toLowerCase();
+            const mime = String(mimeType || '').toLowerCase();
+            const name = String(filename || '').toLowerCase();
+            if (!normalized) return false;
+            if (/^(?:data|blob|sandbox|file-service|sediment|artifact|canvas|canmore|textdoc|document):/i.test(normalized)) return true;
+            const iconSignal = /(?:favicon|site[_ -]?icon|brand[_ -]?icon|logo|thumbnail)/i.test(signal);
+            const weakWebSignal = /(?:citation|content[_ -]?reference|search[_ -]?result|web[_ -]?(?:source|page))/i.test(signal) || iconSignal;
+            const explicitAssetSignal = /(?:attachment|generated[_ -]?file|output[_ -]?file|file[_ -]?(?:id|name|url|path)|download|asset[_ -]?pointer|image[_ -]?asset|sandbox|artifact|canvas|canmore|textdoc)/i.test(signal);
+            if (iconSignal && !/(?:attachment|generated[_ -]?image|image[_ -]?asset|asset[_ -]?pointer)/i.test(signal)) return false;
+            if (mime && !/^(?:text\/html|application\/xhtml\+xml)(?:;|$)/i.test(mime)) return true;
+            if (/artifact|canvas|html/.test(signal) && /html|xhtml/.test(mime)) return true;
+            const extensionPattern = /\.(?:png|jpe?g|gif|webp|avif|svg|bmp|tiff?|ico|pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|md|markdown|csv|tsv|json|ya?ml|xml|zip|7z|rar|tar|gz|bz2|xz|mp3|wav|m4a|aac|flac|ogg|mp4|m4v|mov|avi|mkv|webm|py|js|jsx|ts|tsx|css|html?|sql|ipynb)(?:$|[?#])/i;
+            if (extensionPattern.test(name) || extensionPattern.test(normalized)) return true;
+            if (/(?:\/download(?:[/?#]|$)|\/backend-api\/files?\/|\/attachments?\/|\/files\/download\/)/i.test(normalized)) return true;
+            if (image && !weakWebSignal) return true;
+            if (explicitAssetSignal && !weakWebSignal) return true;
+            return false;
+        }
+
         collectApiAssetsFromMessage(message, logicalIndex) {
             if (!message || logicalIndex < 0) return [];
             const role = String(message.author?.role || 'assistant');
+            const messageSignal = [
+                message.author?.name, message.recipient, message.content?.content_type,
+                message.metadata?.tool_name, message.metadata?.tool, message.metadata?.name,
+                message.metadata?.canvas_id, message.metadata?.artifact_id,
+            ].filter(Boolean).join(' ');
+            const artifactToolMessage = /(?:canmore|canvas|artifact|textdoc|writing[-_ ]?block|code[-_ ]?document|rendered[-_ ]?(?:html|react))/i.test(messageSignal);
+            const parsedStringPayloads = [];
             const assets = [];
-            const seen = new Set();
+            const seen = new Map();
             let sequence = 0;
-            const add = ({ fileId = '', url = '', filename = '', label = '', mimeType = '', kind = '', image = false } = {}) => {
-                const normalizedUrl = this.normalizeAssetCandidateUrl(url);
-                const resolvedFileId = fileId || this.extractFileIdFromValue(normalizedUrl);
-                if (!resolvedFileId && !normalizedUrl) return;
-                const dedupe = resolvedFileId ? `id:${resolvedFileId}` : `url:${normalizedUrl}`;
-                if (seen.has(dedupe)) return;
-                seen.add(dedupe);
+            const add = ({
+                fileId = '', artifactId = '', url = '', alternateUrls = [], filename = '', label = '',
+                mimeType = '', kind = '', image = false, blob = null, sourcePath = '', signal = '', captureMethod = 'conversation-api',
+            } = {}) => {
+                const normalizedUrl = this.normalizeAssetCandidateUrl(url || sourcePath);
+                const resolvedFileId = this.extractFileIdFromValue(fileId, 'file_id') || this.extractFileIdFromValue(normalizedUrl);
+                const resolvedArtifactId = this.extractArtifactIdFromValue(artifactId, 'artifact_id') || this.extractArtifactIdFromValue(normalizedUrl);
+                const inlineBlob = blob instanceof Blob ? blob : null;
+                if (!resolvedFileId && !resolvedArtifactId && !normalizedUrl && !inlineBlob) return;
+                if (!this.isLikelyDownloadableAssetReference({
+                    url: normalizedUrl,
+                    keySignal: signal || label,
+                    mimeType,
+                    filename: filename || label,
+                    fileId: resolvedFileId,
+                    artifactId: resolvedArtifactId,
+                    image,
+                    blob: inlineBlob,
+                    kind,
+                })) return;
+                const dedupe = resolvedFileId
+                    ? `id:${resolvedFileId}`
+                    : resolvedArtifactId
+                        ? `artifact:${resolvedArtifactId}`
+                        : normalizedUrl
+                            ? `url:${normalizedUrl}`
+                            : `blob:${filename}:${inlineBlob?.size || 0}:${kind}`;
+                let inferredName = filename || label || (image ? 'image' : resolvedArtifactId ? 'artifact' : 'attachment');
+                if (!filename && /^sandbox:/i.test(normalizedUrl)) {
+                    try { inferredName = decodeURIComponent(normalizedUrl.split('/').pop() || inferredName); } catch { }
+                }
+                const finalKind = kind || this.getAssetKindFromHints({ mimeType, filename: inferredName, signal: label, image });
+                if (seen.has(dedupe)) {
+                    const existing = seen.get(dedupe);
+                    if (!existing.sourceUrl && normalizedUrl) existing.sourceUrl = normalizedUrl;
+                    existing.alternateUrls = [...new Set([
+                        ...(existing.alternateUrls || []),
+                        ...(alternateUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean),
+                        normalizedUrl && normalizedUrl !== existing.sourceUrl ? normalizedUrl : '',
+                    ].filter(Boolean))];
+                    if (inlineBlob && (!existing.blob || inlineBlob.size > (existing.blob.size || 0))) {
+                        existing.blob = inlineBlob;
+                        existing.byteLength = inlineBlob.size;
+                    }
+                    if (mimeType || inlineBlob?.type) existing.mimeType = String(mimeType || inlineBlob.type);
+                    if (filename && (!existing.filenameHint || !/\.[a-z0-9]{1,10}$/i.test(existing.filenameHint) ||
+                        existing.filenameHint === 'Artifact' || existing.filenameHint === 'attachment')) {
+                        existing.filenameHint = this.sanitizeAssetFilename(filename, existing.filenameHint || 'asset');
+                    }
+                    if (label && (!existing.label || existing.label === '附件' || existing.label === 'Artifact')) existing.label = String(label).trim();
+                    if (kind && (existing.kind === 'file' || existing.kind === 'artifact' || !existing.kind)) existing.kind = finalKind;
+                    if (captureMethod && /inline|tool|interactive/i.test(captureMethod)) existing.captureMethod = captureMethod;
+                    return;
+                }
                 sequence += 1;
-                const safeIdPart = String(resolvedFileId || sequence).replace(/[^a-z0-9_.-]+/gi, '-').slice(0, 64);
-                const finalFilename = filename || label || (image ? 'image' : 'attachment');
-                assets.push({
+                const safeIdPart = String(resolvedFileId || resolvedArtifactId || sequence).replace(/[^a-z0-9_.-]+/gi, '-').slice(0, 64);
+                const asset = {
                     id: `q${String(logicalIndex + 1).padStart(3, '0')}-${role}-api-${safeIdPart || sequence}`,
                     logicalIndex,
                     role,
-                    kind: kind || this.getAssetKindFromHints({ mimeType, filename: finalFilename, signal: label, image }),
-                    label: String(label || finalFilename || '附件').trim() || '附件',
+                    kind: finalKind,
+                    label: String(label || inferredName || '附件').trim() || '附件',
                     sourceUrl: normalizedUrl,
-                    alternateUrls: [],
+                    alternateUrls: [...new Set((alternateUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))],
                     fileId: resolvedFileId,
-                    filenameHint: this.sanitizeAssetFilename(finalFilename || `asset-${sequence}`, `asset-${sequence}`),
-                    mimeType: String(mimeType || ''),
-                    byteLength: 0,
-                    blob: null,
+                    artifactId: resolvedArtifactId,
+                    filenameHint: this.sanitizeAssetFilename(inferredName || `asset-${sequence}`, `asset-${sequence}`),
+                    mimeType: String(mimeType || inlineBlob?.type || ''),
+                    byteLength: inlineBlob?.size || 0,
+                    blob: inlineBlob,
                     apiDerived: true,
+                    captureMethod,
                     capturedAt: new Date().toISOString(),
-                });
+                };
+                seen.set(dedupe, asset);
+                assets.push(asset);
+            };
+
+            const addStringReferences = (rawValue, keyHint = '', context = {}) => {
+                const raw = String(rawValue || '').trim();
+                if (!raw) return;
+                const fileId = this.extractFileIdFromValue(raw, keyHint);
+                const artifactId = this.extractArtifactIdFromValue(raw, keyHint);
+                const urls = this.extractUrlLikeValues(raw);
+                const keySignal = String(keyHint || '').toLowerCase();
+                if (fileId || artifactId) {
+                    add({
+                        fileId,
+                        artifactId,
+                        url: urls[0] || '',
+                        alternateUrls: urls.slice(1),
+                        filename: context.filename || '',
+                        label: context.label || context.filename || (artifactId ? 'Artifact' : '附件'),
+                        mimeType: context.mimeType || '',
+                        kind: artifactId ? 'artifact' : '',
+                    });
+                }
+                if (urls.length) {
+                    for (const foundUrl of urls) {
+                        if (!this.isLikelyDownloadableAssetReference({
+                            url: foundUrl,
+                            keySignal,
+                            mimeType: context.mimeType || '',
+                            filename: context.filename || '',
+                            image: /image/i.test(keySignal),
+                            kind: /artifact|canvas/i.test(keySignal) ? 'artifact' : '',
+                        })) continue;
+                        add({
+                            url: foundUrl,
+                            filename: context.filename || '',
+                            label: context.label || context.filename || (/artifact|canvas/i.test(keySignal) ? 'Artifact' : '附件'),
+                            mimeType: context.mimeType || '',
+                            kind: /artifact|canvas/i.test(keySignal) ? 'artifact' : '',
+                            image: /image/i.test(keySignal),
+                            signal: keySignal,
+                        });
+                    }
+                }
             };
 
             const parts = Array.isArray(message.content?.parts) ? message.content.parts : [];
             for (const part of parts) {
+                if (typeof part === 'string') {
+                    const trimmed = part.trim();
+                    let parsedStructuredPayload = false;
+                    if (trimmed && trimmed.length <= Math.max(1024, Number(this.config.conversationExportMaxArtifactSourceBytes) || 0)) {
+                        if (/^[{[]/.test(trimmed)) {
+                            try {
+                                const parsed = JSON.parse(trimmed);
+                                if (parsed && typeof parsed === 'object') {
+                                    parsedStringPayloads.push(parsed);
+                                    parsedStructuredPayload = true;
+                                }
+                            } catch { }
+                        }
+                        if (artifactToolMessage && !parsedStructuredPayload && !this.extractUrlLikeValues(trimmed).length) {
+                            const payload = this.inferArtifactPayload({
+                                content: part,
+                                type: messageSignal || 'artifact',
+                                language: message.metadata?.language || message.metadata?.format || '',
+                                title: message.metadata?.title || message.metadata?.name || `artifact-${sequence + 1}`,
+                            }, `artifact tool ${messageSignal}`, `artifact-${sequence + 1}`);
+                            if (payload) {
+                                add({
+                                    artifactId: message.metadata?.artifact_id || message.metadata?.canvas_id || message.metadata?.textdoc_id || '',
+                                    filename: payload.filename,
+                                    label: message.metadata?.title || message.metadata?.name || payload.filename,
+                                    mimeType: payload.mimeType,
+                                    kind: payload.kind,
+                                    blob: payload.blob,
+                                    captureMethod: 'conversation-api-tool-artifact',
+                                });
+                            }
+                        }
+                    }
+                    if (!parsedStructuredPayload) addStringReferences(part, `content.parts ${messageSignal}`);
+                    continue;
+                }
+
                 if (!part || typeof part !== 'object') continue;
+                const partSignal = `content.parts ${part.content_type || ''} ${part.type || ''} ${part.kind || ''}`;
                 if (part.content_type === 'image_asset_pointer' && part.asset_pointer) {
                     add({
-                        fileId: this.extractFileIdFromValue(part.asset_pointer),
-                        url: part.download_url || part.url || '',
+                        fileId: this.extractFileIdFromValue(part.asset_pointer, 'asset_pointer'),
+                        url: part.download_url || part.downloadUrl || part.url || part.asset_pointer || '',
                         filename: part.metadata?.file_name || part.metadata?.name || (part.metadata?.dalle ? 'generated-image.png' : 'image.png'),
                         label: part.metadata?.dalle?.prompt || part.metadata?.name || '图片',
                         mimeType: part.metadata?.mime_type || 'image/png',
                         image: true,
                     });
                 }
+                const directPayload = this.inferArtifactPayload(part, partSignal, `artifact-${sequence + 1}`);
+                if (directPayload) {
+                    add({
+                        artifactId: part.artifact_id || part.canvas_id || part.textdoc_id || '',
+                        filename: directPayload.filename,
+                        label: part.title || part.name || directPayload.filename,
+                        mimeType: directPayload.mimeType,
+                        kind: directPayload.kind,
+                        blob: directPayload.blob,
+                        captureMethod: 'conversation-api-inline-artifact',
+                    });
+                }
+                for (const [key, value] of Object.entries(part)) {
+                    if (typeof value === 'string') addStringReferences(value, `content.parts.${key}`, {
+                        filename: part.file_name || part.filename || part.name || '',
+                        label: part.title || part.name || '',
+                        mimeType: part.mime_type || part.media_type || '',
+                    });
+                }
             }
 
-            for (const attachment of message.metadata?.attachments || []) {
-                add({
-                    fileId: attachment?.id || attachment?.file_id || '',
-                    url: attachment?.download_url || attachment?.url || '',
-                    filename: attachment?.name || attachment?.file_name || 'attachment',
-                    label: attachment?.name || attachment?.title || '附件',
-                    mimeType: attachment?.mime_type || attachment?.content_type || '',
-                });
-            }
-
-            for (const citation of message.metadata?.citations || []) {
-                add({
-                    fileId: citation?.metadata?.file_id || citation?.file_id || '',
-                    url: citation?.metadata?.download_url || citation?.download_url || citation?.url || '',
-                    filename: citation?.metadata?.title || citation?.title || 'citation',
-                    label: citation?.metadata?.title || citation?.title || '引用附件',
-                    mimeType: citation?.metadata?.mime_type || citation?.mime_type || '',
-                });
+            const explicitCollections = [
+                ['attachments', message.metadata?.attachments],
+                ['files', message.metadata?.files],
+                ['generated_files', message.metadata?.generated_files],
+                ['citations', message.metadata?.citations],
+                ['content_references', message.metadata?.content_references],
+                ['assets', message.metadata?.assets],
+                ['artifacts', message.metadata?.artifacts],
+            ];
+            for (const [collectionName, collection] of explicitCollections) {
+                for (const item of Array.isArray(collection) ? collection : []) {
+                    if (!item || typeof item !== 'object') continue;
+                    const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata : {};
+                    const signal = `${collectionName} ${item.type || ''} ${item.kind || ''} ${item.content_type || ''}`;
+                    const payload = this.inferArtifactPayload(item, signal, `${collectionName}-${sequence + 1}`) ||
+                        this.inferArtifactPayload(metadata, signal, `${collectionName}-${sequence + 1}`);
+                    const genericFileId = /^(?:attachments|files|generated_files|assets)$/.test(collectionName) ? item.id : '';
+                    const genericArtifactId = collectionName === 'artifacts' ? item.id : '';
+                    add({
+                        fileId: item.file_id || item.fileId || metadata.file_id || metadata.fileId || genericFileId || '',
+                        artifactId: item.artifact_id || item.artifactId || item.canvas_id || item.canvasId || item.textdoc_id || metadata.artifact_id || metadata.canvas_id || genericArtifactId || '',
+                        url: item.download_url || item.downloadUrl || item.content_url || item.url || item.href || item.src || metadata.download_url || metadata.url || '',
+                        alternateUrls: [item.asset_pointer, item.sandbox_path, item.path, metadata.asset_pointer, metadata.sandbox_path].filter(Boolean),
+                        filename: item.name || item.file_name || item.filename || item.title || metadata.title || metadata.file_name || '',
+                        label: item.title || item.name || item.file_name || metadata.title || '附件',
+                        mimeType: item.mime_type || item.content_type || item.media_type || metadata.mime_type || metadata.content_type || payload?.mimeType || '',
+                        kind: payload?.kind || (/artifact|canvas/i.test(signal) ? 'artifact' : ''),
+                        blob: payload?.blob || null,
+                        image: /image/i.test(signal) || String(item.mime_type || '').startsWith('image/'),
+                        signal,
+                        captureMethod: payload ? 'conversation-api-inline-artifact' : 'conversation-api',
+                    });
+                }
             }
 
             let visitedCount = 0;
             const visited = new WeakSet();
-            const walk = (value, keyHint = '', depth = 0) => {
-                if (!value || depth > 9 || visitedCount > 2400 || typeof value !== 'object') return;
+            const walk = (value, keyPath = '', depth = 0) => {
+                if (value == null || depth > 11 || visitedCount > 5200) return;
+                if (typeof value === 'string') {
+                    addStringReferences(value, keyPath);
+                    return;
+                }
+                if (typeof value !== 'object') return;
                 if (visited.has(value)) return;
                 visited.add(value);
                 visitedCount += 1;
                 if (Array.isArray(value)) {
-                    for (const item of value) walk(item, keyHint, depth + 1);
+                    for (const item of value) walk(item, keyPath, depth + 1);
                     return;
                 }
-                const signal = `${keyHint} ${value.content_type || ''} ${value.type || ''} ${value.kind || ''}`;
-                const fileId = value.file_id || value.fileId || value.asset_id ||
-                    (/(?:attachment|file|asset|image|citation)/i.test(signal) ? value.id : '') ||
-                    this.extractFileIdFromValue(value.asset_pointer || '');
-                const url = value.download_url || value.downloadUrl || value.content_url || value.url || value.href || value.src || '';
-                if (fileId || (url && /(?:file|download|oaiusercontent|oaistatic|blob:|data:|sandbox:)/i.test(String(url)))) {
-                    const filename = value.file_name || value.filename || value.name || value.title || '';
-                    const mimeType = value.mime_type || value.content_type || value.media_type || '';
+                const signal = `${keyPath} ${value.content_type || ''} ${value.type || ''} ${value.kind || ''} ${value.format || ''}`;
+                const filename = value.file_name || value.filename || value.name || value.title || '';
+                const mimeType = value.mime_type || value.media_type || (typeof value.content_type === 'string' && value.content_type.includes('/') ? value.content_type : '') || '';
+                const fileId = value.file_id || value.fileId || value.upload_id || value.uploadId || value.asset_pointer ||
+                    (/(?:attachment|file|asset|image|generated[_ -]?file)/i.test(signal) && !/(?:citation|content[_ -]?reference|search[_ -]?result)/i.test(signal) ? value.id : '') || '';
+                const artifactId = value.artifact_id || value.artifactId || value.canvas_id || value.canvasId ||
+                    value.canmore_id || value.textdoc_id || value.document_id ||
+                    (/(?:artifact|canvas|canmore|textdoc|writing[_ -]?block)/i.test(signal) ? value.id : '') || '';
+                const url = value.download_url || value.downloadUrl || value.signed_url || value.signedUrl ||
+                    value.content_url || value.file_url || value.url || value.href || value.src || value.sandbox_path || value.path || '';
+                const payload = this.inferArtifactPayload(value, signal, filename || `artifact-${sequence + 1}`);
+                if (fileId || artifactId || url || payload) {
                     add({
                         fileId,
+                        artifactId,
                         url,
-                        filename: filename || (/image/i.test(signal) ? 'image.png' : 'attachment'),
-                        label: value.title || value.name || filename || (/image/i.test(signal) ? '图片' : '附件'),
-                        mimeType,
+                        alternateUrls: [value.asset_pointer, value.sandbox_path, value.path].filter(Boolean),
+                        filename: filename || payload?.filename || (/image/i.test(signal) ? 'image.png' : artifactId ? 'artifact' : 'attachment'),
+                        label: value.title || value.name || filename || (artifactId ? 'Artifact' : /image/i.test(signal) ? '图片' : '附件'),
+                        mimeType: mimeType || payload?.mimeType || '',
+                        kind: payload?.kind || (/artifact|canvas|canmore|textdoc/i.test(signal) ? 'artifact' : ''),
+                        blob: payload?.blob || null,
                         image: /image/i.test(signal) || String(mimeType).startsWith('image/'),
+                        signal,
+                        captureMethod: payload ? 'conversation-api-inline-artifact' : 'conversation-api-recursive',
                     });
                 }
                 for (const [key, child] of Object.entries(value)) {
-                    if (['text', 'content', 'parts'].includes(key) && typeof child === 'string') continue;
-                    walk(child, key, depth + 1);
+                    if (typeof child === 'string') {
+                        addStringReferences(child, `${keyPath}.${key}`, { filename, label: value.title || value.name || '', mimeType });
+                    } else {
+                        walk(child, `${keyPath}.${key}`, depth + 1);
+                    }
                 }
             };
-            walk(message.metadata || {}, 'metadata', 0);
-            return assets;
+            walk(message.content || {}, `content ${messageSignal}`, 0);
+            walk(message.metadata || {}, `metadata ${messageSignal}`, 0);
+            for (const parsed of parsedStringPayloads) walk(parsed, `parsed-tool-payload ${messageSignal}`, 0);
+
+            const mergedAssets = [];
+            for (const asset of assets) {
+                const same = mergedAssets.find((existing) =>
+                    (asset.fileId && existing.fileId === asset.fileId) ||
+                    (asset.artifactId && existing.artifactId === asset.artifactId) ||
+                    (asset.sourceUrl && existing.sourceUrl === asset.sourceUrl) ||
+                    (asset.filenameHint && existing.filenameHint === asset.filenameHint &&
+                        (/^sandbox:/i.test(asset.sourceUrl || '') || /^sandbox:/i.test(existing.sourceUrl || '')) &&
+                        (asset.fileId || existing.fileId))
+                );
+                if (!same) {
+                    mergedAssets.push(asset);
+                    continue;
+                }
+                this.mergeArchiveAsset(same, asset);
+                if (!same.kind || same.kind === 'file') same.kind = asset.kind || same.kind;
+                if (!same.blob && asset.blob) same.blob = asset.blob;
+            }
+            return mergedAssets;
         }
 
         buildConversationApiAssetMap(snapshot) {
@@ -6098,7 +6560,12 @@
         mergeArchiveAsset(existing, incoming) {
             if (!existing || !incoming) return existing || incoming;
             if (!existing.fileId && incoming.fileId) existing.fileId = incoming.fileId;
+            if (!existing.artifactId && incoming.artifactId) existing.artifactId = incoming.artifactId;
             if (!existing.sourceUrl && incoming.sourceUrl) existing.sourceUrl = incoming.sourceUrl;
+            if (!(existing.blob instanceof Blob) && incoming.blob instanceof Blob) {
+                existing.blob = incoming.blob;
+                existing.byteLength = incoming.blob.size;
+            }
             existing.alternateUrls = [...new Set([
                 ...(existing.alternateUrls || []),
                 ...(incoming.alternateUrls || []),
@@ -6108,6 +6575,7 @@
             if (!existing.mimeType && incoming.mimeType) existing.mimeType = incoming.mimeType;
             if ((!existing.label || existing.label === '附件') && incoming.label) existing.label = incoming.label;
             existing.apiDerived = existing.apiDerived || incoming.apiDerived;
+            existing.captureMethod = existing.captureMethod || incoming.captureMethod || '';
             return existing;
         }
 
@@ -6173,21 +6641,134 @@
             return { added, merged, available: true };
         }
 
+        getFileEndpointCandidates(fileId, sourceUrl = '') {
+            const id = String(fileId || '').trim();
+            if (!id) return [];
+            const encoded = encodeURIComponent(id);
+            const conversationId = this.getCurrentConversationId();
+            const paths = [
+                `/backend-api/files/download/${encoded}`,
+                `/backend-api/files/${encoded}/download`,
+                `/backend-api/files/${encoded}/content`,
+                `/backend-api/files/${encoded}/signed-url`,
+                `/backend-api/files/${encoded}/download-url`,
+                `/backend-api/files/${encoded}`,
+                `/backend-api/file/${encoded}/download`,
+                `/backend-api/files/${encoded}/metadata`,
+            ];
+            if (conversationId) {
+                const conversation = encodeURIComponent(conversationId);
+                paths.push(`/backend-api/conversation/${conversation}/files/${encoded}/download`);
+                paths.push(`/backend-api/conversation/${conversation}/files/${encoded}`);
+                paths.push(`/backend-api/conversation/${conversation}/attachments/${encoded}`);
+            }
+            if (/^sandbox:/i.test(String(sourceUrl || ''))) {
+                const path = String(sourceUrl).replace(/^sandbox:/i, '');
+                for (const endpoint of [
+                    `/backend-api/files/download/${encoded}`,
+                    `/backend-api/files/${encoded}/download`,
+                    `/backend-api/files/${encoded}`,
+                ]) {
+                    paths.push(`${endpoint}?path=${encodeURIComponent(path)}`);
+                    paths.push(`${endpoint}?sandbox_path=${encodeURIComponent(path)}`);
+                }
+            }
+            const urls = [...new Set(paths.map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))];
+            const limit = Math.max(1, Math.min(12, Number(this.config.conversationExportFileEndpointCandidateLimit) || 5));
+            const preferredSet = urls.slice(0, limit);
+            const active = preferredSet.filter((url) => !this.isAssetRouteSuppressed(url));
+            active.sort((a, b) => this.getAssetRoutePriority(a) - this.getAssetRoutePriority(b));
+            return active;
+        }
+
+        extractDownloadMetadataFromJson(data) {
+            if (!data || typeof data !== 'object') return null;
+            const visited = new WeakSet();
+            let result = null;
+            const walk = (value, depth = 0) => {
+                if (!value || typeof value !== 'object' || depth > 8 || result?.downloadUrl) return;
+                if (visited.has(value)) return;
+                visited.add(value);
+                if (Array.isArray(value)) {
+                    for (const item of value) walk(item, depth + 1);
+                    return;
+                }
+                const url = value.download_url || value.downloadUrl || value.signed_url || value.signedUrl ||
+                    value.file_url || value.content_url || value.url || value.href || value.location || '';
+                if (typeof url === 'string' && /^(?:https?:|blob:|data:|\/)/i.test(url)) {
+                    result = {
+                        downloadUrl: this.normalizeAssetCandidateUrl(url),
+                        filename: value.file_name || value.filename || value.name || value.title || '',
+                        mimeType: value.mime_type || value.content_type || value.media_type || '',
+                        size: Number(value.size || value.bytes || value.byte_size || value.content_length || 0) || 0,
+                    };
+                    return;
+                }
+                for (const child of Object.values(value)) walk(child, depth + 1);
+            };
+            walk(data, 0);
+            return result;
+        }
+
         async resolveFileDownloadMetadata(fileId, signal) {
             const id = String(fileId || '').trim();
             if (!id) return null;
-            const data = await this.fetchChatGptApiJson(
-                `/backend-api/files/download/${encodeURIComponent(id)}`,
-                signal,
-            );
-            const downloadUrl = data?.download_url || data?.downloadUrl || data?.url || '';
-            if (!downloadUrl) throw new Error(`文件 ${id} 没有返回 download_url`);
-            return {
-                downloadUrl: this.normalizeAssetCandidateUrl(downloadUrl),
-                filename: data?.file_name || data?.filename || data?.name || '',
-                mimeType: data?.mime_type || data?.content_type || '',
-                size: Number(data?.size || data?.bytes || 0) || 0,
-            };
+            if (this.fileDownloadMetadataCache.has(id)) return this.fileDownloadMetadataCache.get(id);
+            const task = (async () => {
+                const errors = [];
+                for (const endpoint of this.getFileEndpointCandidates(id)) {
+                    try {
+                        const token = await this.getSessionAccessToken(signal);
+                        const headers = {
+                            Accept: 'application/json, application/octet-stream;q=0.8, */*;q=0.5',
+                            'Oai-Device-Id': this.getApiDeviceId(),
+                            'Oai-Language': navigator.language || 'zh-CN',
+                        };
+                        if (token) headers.Authorization = `Bearer ${token}`;
+                        if (this.apiAccountId) headers['ChatGPT-Account-Id'] = this.apiAccountId;
+                        const response = await fetch(endpoint, {
+                            method: 'GET', credentials: 'include', redirect: 'follow', cache: 'no-store', signal, headers,
+                        });
+                        if (!response.ok) {
+                            errors.push(`${new URL(endpoint, location.href).pathname}: HTTP ${response.status}`);
+                            continue;
+                        }
+                        const contentType = response.headers.get('content-type') || '';
+                        const disposition = response.headers.get('content-disposition') || '';
+                        if (/json/i.test(contentType)) {
+                            const data = await response.json();
+                            const metadata = this.extractDownloadMetadataFromJson(data);
+                            if (metadata?.downloadUrl) return metadata;
+                            errors.push(`${new URL(endpoint, location.href).pathname}: JSON 中没有下载地址`);
+                            continue;
+                        }
+                        const blob = await response.blob();
+                        if (blob.size) {
+                            return {
+                                downloadUrl: response.url || endpoint,
+                                filename: this.parseContentDispositionFilename(disposition),
+                                mimeType: contentType || blob.type || '',
+                                size: blob.size,
+                                blob,
+                                contentDisposition: disposition,
+                            };
+                        }
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        errors.push(error?.message || String(error));
+                    }
+                }
+                throw new Error(errors.join('；') || `无法解析文件 ${id}`);
+            })();
+            this.fileDownloadMetadataCache.set(id, task);
+            try {
+                const value = await task;
+                this.fileDownloadMetadataCache.set(id, value);
+                return value;
+            } catch (error) {
+                this.fileDownloadMetadataCache.delete(id);
+                throw error;
+            }
         }
 
         normalizeAssetCandidateUrl(rawValue) {
@@ -6325,32 +6906,824 @@
             return '';
         }
 
-        async discoverMessageAssets(root, logicalIndex, role, sequenceStart = 0) {
+        getPageRealmWindow() {
+            try {
+                if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow;
+            } catch { }
+            return window;
+        }
+
+        isBlobLike(value) {
+            if (!value || typeof value !== 'object') return false;
+            try { if (value instanceof Blob) return true; } catch { }
+            const tag = Object.prototype.toString.call(value);
+            return tag === '[object Blob]' || (
+                typeof value.size === 'number' && value.size >= 0 &&
+                typeof value.type === 'string' && typeof value.arrayBuffer === 'function'
+            );
+        }
+
+        async normalizeBlobLike(value, fallbackType = '') {
+            if (!this.isBlobLike(value)) return null;
+            try { if (value instanceof Blob) return value; } catch { }
+            try {
+                const buffer = await value.arrayBuffer();
+                return new Blob([buffer], { type: value.type || fallbackType || 'application/octet-stream' });
+            } catch {
+                return null;
+            }
+        }
+
+        isElementActuallyVisible(element) {
+            if (!(element instanceof Element) || !element.isConnected) return false;
+            try {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 1 && rect.height > 1 && style.display !== 'none' &&
+                    style.visibility !== 'hidden' && Number.parseFloat(style.opacity || '1') > 0.01 &&
+                    !element.hasAttribute('hidden') && element.getAttribute('aria-hidden') !== 'true';
+            } catch {
+                return false;
+            }
+        }
+
+        getArtifactNodeState(element) {
+            if (!(element instanceof Element)) return '';
+            try {
+                const rect = element.getBoundingClientRect();
+                const visible = this.isElementActuallyVisible(element) ? 1 : 0;
+                const iframeState = element instanceof HTMLIFrameElement
+                    ? `${element.getAttribute('src') || ''}|${String(element.srcdoc || '').length}`
+                    : [...(element.querySelectorAll?.('iframe') || [])]
+                        .slice(0, 4)
+                        .map((iframe) => `${iframe.getAttribute('src') || ''}|${String(iframe.srcdoc || '').length}`)
+                        .join('||');
+                const signal = `${element.getAttribute('data-testid') || ''}|${element.getAttribute('role') || ''}|${element.textContent?.trim().slice(0, 300) || ''}`;
+                return `${visible}|${Math.round(rect.width)}x${Math.round(rect.height)}|${element.childElementCount}|${iframeState}|${signal}`;
+            } catch {
+                return '';
+            }
+        }
+
+        captureArtifactNodeBaseline() {
+            const selector = [
+                'iframe', '[role="dialog"]', '[data-testid*="artifact" i]', '[data-testid*="canvas" i]',
+                '[data-testid*="preview" i]', '[class*="artifact" i]', '[class*="canvas" i]',
+            ].join(',');
+            return new Map(this.queryAllDeep(selector).map((node) => [node, this.getArtifactNodeState(node)]));
+        }
+
+        getReactInternalPayloads(element) {
+            if (this.config.conversationExportProbeReactProperties === false || !(element instanceof Element)) return [];
+            const payloads = [];
+            const seen = new Set();
+            let node = element;
+            for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+                let keys = [];
+                try { keys = Reflect.ownKeys(node); } catch { }
+                for (const key of keys) {
+                    if (typeof key !== 'string') continue;
+                    let value;
+                    try { value = node[key]; } catch { continue; }
+                    if (key.startsWith('__reactProps$')) {
+                        if (value && typeof value === 'object' && !seen.has(value)) { seen.add(value); payloads.push(value); }
+                    } else if (key.startsWith('__reactFiber$')) {
+                        let fiber = value;
+                        for (let up = 0; fiber && up < 4; up += 1, fiber = fiber.return) {
+                            for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
+                                if (props && typeof props === 'object' && !seen.has(props)) { seen.add(props); payloads.push(props); }
+                            }
+                        }
+                    }
+                }
+            }
+            return payloads.slice(0, 16);
+        }
+
+        collectReactInternalAssetCandidates(element, logicalIndex, role) {
+            const payloads = this.getReactInternalPayloads(element);
+            if (!payloads.length) return [];
+            const syntheticMessage = {
+                author: { role, name: 'react-ui' },
+                content: { content_type: 'react_asset_hints', parts: [] },
+                metadata: { react_asset_hints: payloads },
+            };
+            return this.collectApiAssetsFromMessage(syntheticMessage, logicalIndex).map((asset) => ({
+                kind: asset.kind,
+                url: asset.sourceUrl || '',
+                alternateUrls: asset.alternateUrls || [],
+                fileId: asset.fileId || '',
+                artifactId: asset.artifactId || '',
+                label: asset.label || asset.filenameHint || '附件',
+                filenameHint: asset.filenameHint || '',
+                mimeType: asset.mimeType || '',
+                inlineBlob: asset.blob || null,
+                captureMethod: 'react-control-properties',
+                probeOnly: true,
+            }));
+        }
+
+        queryAllDeep(selector, root = document, results = []) {
+            try {
+                for (const element of root.querySelectorAll(selector)) {
+                    if (!results.includes(element)) results.push(element);
+                }
+                for (const element of root.querySelectorAll('*')) {
+                    if (element.shadowRoot) this.queryAllDeep(selector, element.shadowRoot, results);
+                }
+            } catch { }
+            return results;
+        }
+
+        getInteractiveControlSignal(element) {
+            if (!(element instanceof Element)) return '';
+            const localSelector = [
+                '[data-testid*="file" i]', '[data-testid*="attachment" i]', '[data-testid*="download" i]',
+                '[data-testid*="artifact" i]', '[data-testid*="canvas" i]',
+                '[class*="file-card" i]', '[class*="attachment" i]', '[class*="artifact" i]', '[class*="canvas" i]',
+                '[role="menuitem"]', '[role="group"]', 'li',
+            ].join(',');
+            let container = element.closest(localSelector) || element.parentElement;
+            if (container && container !== element) {
+                const interactiveCount = container.querySelectorAll?.('button,a[href],[role="button"],[role="menuitem"]').length || 0;
+                if (interactiveCount > 6 || String(container.textContent || '').length > 900) container = element.parentElement;
+            }
+            return [
+                element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid'),
+                element.getAttribute('download'), element.getAttribute('href'), element.className,
+                element.textContent, container?.getAttribute?.('data-testid'), container?.getAttribute?.('aria-label'),
+                container && container !== element ? container.textContent : '',
+            ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 1200);
+        }
+
+        isStrongInteractiveAssetControl(element, candidate = {}) {
+            if (!(element instanceof Element)) return false;
+            const signal = this.getInteractiveControlSignal(element);
+            if (/(?:下载|导出|附件|文件|打开.*(?:画布|预览|文件)|在.*中打开|download|export|attachment|generated[-_ ]?file|artifact|canvas|canmore|writing[-_ ]?block|open.*(?:preview|canvas|artifact))/i.test(signal)) return true;
+            if (/\.(?:csv|docx?|html?|json|md|odp|ods|odt|pdf|pptx?|py|rtf|svg|txt|xlsx?|xml|yaml|yml|zip)\b/i.test(signal)) return true;
+            return /^sandbox:/i.test(candidate.url || '') || Boolean(candidate.fileId || candidate.artifactId);
+        }
+
+        isLikelyCapturedAssetUrl(url, filename = '', contentType = '') {
+            const signal = `${url} ${filename} ${contentType}`.toLowerCase();
+            return /(?:sandbox:|\/backend-api\/(?:files?|artifacts?|canvas|canmore)|oaiusercontent|oaistatic|download|attachment|artifact|canvas|blob:|data:)|\.(?:csv|docx?|html?|json|md|odp|ods|odt|pdf|pptx?|py|rtf|svg|txt|xlsx?|xml|yaml|yml|zip)(?:$|[?#\s])/i.test(signal);
+        }
+
+        collectArtifactSnapshotCandidates(beforeNodes = new Map(), label = 'Artifact') {
+            if (this.config.conversationExportCaptureArtifactPanels === false) return [];
+            const candidates = [];
+            const nodes = this.queryAllDeep([
+                'iframe', '[role="dialog"]', '[data-testid*="artifact" i]', '[data-testid*="canvas" i]',
+                '[data-testid*="preview" i]', '[class*="artifact" i]', '[class*="canvas" i]',
+            ].join(','));
+            let sequence = 0;
+            const capturedIframes = new WeakSet();
+            const baselineIsMap = beforeNodes instanceof Map;
+            for (const node of nodes) {
+                if (!(node instanceof Element) || this.host?.contains(node)) continue;
+                const currentState = this.getArtifactNodeState(node);
+                const existed = baselineIsMap ? beforeNodes.has(node) : beforeNodes?.has?.(node);
+                const changed = !existed || (baselineIsMap && beforeNodes.get(node) !== currentState);
+                const visible = this.isElementActuallyVisible(node);
+                if (!changed && !visible) continue;
+                const rect = node.getBoundingClientRect?.();
+                if (rect && visible && rect.width < 80 && rect.height < 60) continue;
+                const nodeCandidateStart = candidates.length;
+
+                if (node instanceof HTMLIFrameElement) {
+                    const iframeSignal = `${node.getAttribute('title') || ''} ${node.getAttribute('data-testid') || ''} ${node.className || ''}`;
+                    if (!visible && !/(?:artifact|canvas|canmore|preview|画布|预览)/i.test(iframeSignal)) continue;
+                    if (capturedIframes.has(node)) continue;
+                    capturedIframes.add(node);
+                    const html = this.serializeIframeDocument(node);
+                    const url = this.normalizeAssetCandidateUrl(node.getAttribute('src') || '');
+                    if (html || url) {
+                        sequence += 1;
+                        candidates.push({
+                            kind: 'artifact-html', url, alternateUrls: this.getElementUrlAlternates(node, url),
+                            label: node.getAttribute('title') || label || 'Artifact',
+                            filenameHint: `artifact-${sequence}.html`, mimeType: 'text/html',
+                            inlineBlob: html ? new Blob([html], { type: 'text/html;charset=utf-8' }) : null,
+                            captureMethod: 'interactive-artifact-iframe', probeOnly: true,
+                        });
+                    }
+                    continue;
+                }
+
+                const panelSignal = this.getInteractiveControlSignal(node);
+                if (!/(?:artifact|canvas|canmore|preview|画布|预览|代码|document|textdoc)/i.test(panelSignal) && !changed) continue;
+                for (const iframe of this.queryAllDeep('iframe', node)) {
+                    if (capturedIframes.has(iframe)) continue;
+                    capturedIframes.add(iframe);
+                    const html = this.serializeIframeDocument(iframe);
+                    const url = this.normalizeAssetCandidateUrl(iframe.getAttribute('src') || '');
+                    if (!html && !url) continue;
+                    sequence += 1;
+                    candidates.push({
+                        kind: 'artifact-html', url, alternateUrls: this.getElementUrlAlternates(iframe, url),
+                        label: iframe.getAttribute('title') || label || 'Artifact',
+                        filenameHint: `artifact-${sequence}.html`, mimeType: 'text/html',
+                        inlineBlob: html ? new Blob([html], { type: 'text/html;charset=utf-8' }) : null,
+                        captureMethod: 'interactive-artifact-panel-iframe', probeOnly: true,
+                    });
+                }
+
+                const sourceElements = [
+                    ...node.querySelectorAll?.('textarea, [contenteditable="true"], [data-lexical-editor="true"], .cm-content, .monaco-editor .view-lines, pre code, pre, script[type="application/json"], template') || [],
+                ];
+                for (const codeElement of sourceElements.slice(0, 8)) {
+                    let sourceText = '';
+                    if (codeElement instanceof HTMLTextAreaElement) sourceText = codeElement.value;
+                    else if (codeElement instanceof HTMLTemplateElement) sourceText = codeElement.innerHTML;
+                    else sourceText = codeElement.textContent || '';
+                    sourceText = sourceText.trim();
+                    if (sourceText.length < 4) continue;
+                    const payload = this.inferArtifactPayload({
+                        content: sourceText,
+                        type: `artifact ${panelSignal}`,
+                        language: node.getAttribute('data-language') || codeElement.getAttribute?.('data-language') || codeElement.getAttribute?.('data-lang') || '',
+                        title: node.querySelector?.('h1,h2,[data-testid*="title" i]')?.textContent?.trim() || label,
+                    }, `artifact panel ${panelSignal}`, `artifact-source-${sequence + 1}`);
+                    if (!payload) continue;
+                    sequence += 1;
+                    candidates.push({
+                        kind: payload.kind, url: '', alternateUrls: [], label: payload.filename,
+                        filenameHint: payload.filename, mimeType: payload.mimeType, inlineBlob: payload.blob,
+                        captureMethod: 'interactive-artifact-source', probeOnly: true,
+                    });
+                    break;
+                }
+
+                for (const canvas of node.querySelectorAll?.('canvas') || []) {
+                    const rectCanvas = canvas.getBoundingClientRect();
+                    if (rectCanvas.width < 40 || rectCanvas.height < 40) continue;
+                    candidates.push({
+                        kind: 'canvas-image', url: '', alternateUrls: [], label: `${label} 预览`,
+                        filenameHint: `artifact-preview-${sequence + 1}.png`, mimeType: 'image/png',
+                        canvasElement: canvas, captureMethod: 'interactive-artifact-canvas', probeOnly: true,
+                    });
+                    sequence += 1;
+                }
+
+                for (const svg of node.querySelectorAll?.('svg') || []) {
+                    const svgRect = svg.getBoundingClientRect();
+                    if (svgRect.width < 80 || svgRect.height < 60) continue;
+                    const serialized = new XMLSerializer().serializeToString(svg);
+                    sequence += 1;
+                    candidates.push({
+                        kind: 'image', url: '', alternateUrls: [], label: `${label} SVG`,
+                        filenameHint: `artifact-${sequence}.svg`, mimeType: 'image/svg+xml',
+                        inlineBlob: new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' }),
+                        captureMethod: 'interactive-artifact-svg', probeOnly: true,
+                    });
+                }
+
+                // 对没有 iframe/源码的渲染型 Artifact，保存一份静态 HTML 快照作为后备。
+                const alreadyCapturedPanel = candidates.length > nodeCandidateStart;
+                if (visible && !alreadyCapturedPanel && rect && rect.width >= 180 && rect.height >= 100) {
+                    try {
+                        const clone = node.cloneNode(true);
+                        for (const removable of clone.querySelectorAll('button,script,noscript,[role="tooltip"],[aria-hidden="true"]')) removable.remove();
+                        const snapshot = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html{color-scheme:light dark}body{margin:0;padding:18px;font:15px/1.55 system-ui,sans-serif;overflow-wrap:anywhere}img,svg,canvas,video{max-width:100%;height:auto}pre{overflow:auto;white-space:pre-wrap}table{max-width:100%;display:block;overflow:auto}</style></head><body>${clone.outerHTML}</body></html>`;
+                        sequence += 1;
+                        candidates.push({
+                            kind: 'artifact-html', url: '', alternateUrls: [], label: label || 'Artifact 快照',
+                            filenameHint: `artifact-snapshot-${sequence}.html`, mimeType: 'text/html',
+                            inlineBlob: new Blob([snapshot], { type: 'text/html;charset=utf-8' }),
+                            captureMethod: 'interactive-artifact-static-snapshot', probeOnly: true,
+                        });
+                    } catch { }
+                }
+            }
+            return candidates;
+        }
+
+        isLikelyAutomatedDownloadUrl(value, filename = '', contentType = '') {
+            const url = this.normalizeAssetCandidateUrl(value);
+            const name = String(filename || '').trim();
+            const type = String(contentType || '').trim();
+            if (name) return true;
+            if (!url) return false;
+            if (/^(?:blob:|data:|sandbox:|file-service:|sediment:|artifact:|canvas:|canmore:|textdoc:|document:)/i.test(url)) return true;
+            if (/(?:\/backend-api\/(?:files?|artifacts?|canvas|canmore|textdocs?|documents?)\/|\/mnt\/data\/|oaiusercontent|oaistatic|download|attachment|signed[-_]?url)/i.test(url)) return true;
+            if (/\.(?:7z|aac|avi|bmp|csv|docx?|epub|gif|gz|html?|jpeg|jpg|json|m4a|md|mov|mp3|mp4|odp|ods|odt|ogg|pdf|png|pptx?|py|rar|rtf|svg|tar|tiff?|tsv|txt|wav|webm|webp|xlsx?|xml|yaml|yml|zip)(?:$|[?#])/i.test(url)) return true;
+            return this.isLikelyCapturedAssetUrl(url, name, type);
+        }
+
+        isLikelyAutomatedDownloadAnchor(anchor) {
+            if (!anchor || Number(anchor.nodeType) !== 1 || String(anchor.tagName || '').toLowerCase() !== 'a') return false;
+            const href = anchor.href || anchor.getAttribute?.('href') || '';
+            const filename = anchor.download || anchor.getAttribute?.('download') || '';
+            if (anchor.hasAttribute?.('download')) return true;
+            if (this.isLikelyAutomatedDownloadUrl(href, filename, '')) return true;
+            try { return this.isLikelyDownloadAssetLink(anchor, this.normalizeAssetCandidateUrl(href)); } catch { return false; }
+        }
+
+        installAutomatedDownloadQuarantine(context = 'archive-load') {
+            if (this.config.conversationArchiveDownloadQuarantine === false) return null;
+            const pageWindow = this.getPageRealmWindow();
+            const id = ++this.downloadQuarantineSequence;
+            const stats = {
+                id,
+                context,
+                blocked: 0,
+                anchorClicks: 0,
+                syntheticEvents: 0,
+                windowOpens: 0,
+                samples: [],
+            };
+            let active = true;
+            const record = (kind, value = '') => {
+                stats.blocked += 1;
+                if (kind === 'anchor-click') stats.anchorClicks += 1;
+                else if (kind === 'synthetic-event') stats.syntheticEvents += 1;
+                else if (kind === 'window-open') stats.windowOpens += 1;
+                if (stats.samples.length < 8) stats.samples.push({ kind, value: String(value || '').slice(0, 300) });
+            };
+            let trustedDownloadIntentUntil = 0;
+            const getClosestElement = (target, selector) => {
+                try {
+                    if (!target || Number(target.nodeType) !== 1) return null;
+                    return target.closest?.(selector) || null;
+                } catch { return null; }
+            };
+            const isExplicitUserDownloadControl = (element) => {
+                if (!element) return false;
+                if (String(element.tagName || '').toLowerCase() === 'a' && this.isLikelyAutomatedDownloadAnchor(element)) return true;
+                const signal = this.getInteractiveControlSignal(element);
+                return /(?:下载|另存为|保存文件|导出(?:为|文件)?|download|save(?: as)?|export(?: file)?|attachment|generated[-_ ]?file)/i.test(signal);
+            };
+            const hasRecentExplicitUserDownloadIntent = () => performance.now() < trustedDownloadIntentUntil;
+            const shouldBlockAnchor = (anchor) => active && !hasRecentExplicitUserDownloadIntent() && this.isLikelyAutomatedDownloadAnchor(anchor);
+            const shouldBlockUrl = (url) => active && !hasRecentExplicitUserDownloadIntent() && this.isLikelyAutomatedDownloadUrl(url, '', '');
+
+            const original = {};
+            const onTrustedDownloadIntent = (event) => {
+                if (!active || !event.isTrusted) return;
+                const target = getClosestElement(event.target, 'a[href],a[download],button,[role="button"],[role="menuitem"]');
+                if (target && isExplicitUserDownloadControl(target)) {
+                    // 只为明确点击文件/下载控件的真实用户操作开放短时间窗口；
+                    // 点击“加载全部”不会获得此豁免。
+                    trustedDownloadIntentUntil = performance.now() + 1600;
+                }
+            };
+            const onSyntheticClick = (event) => {
+                if (!active || event.isTrusted || hasRecentExplicitUserDownloadIntent()) return;
+                const target = getClosestElement(event.target, 'a[href],a[download]');
+                if (!target || !this.isLikelyAutomatedDownloadAnchor(target)) return;
+                record('synthetic-event', target.href || target.getAttribute('href') || target.getAttribute('download') || '');
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            };
+            document.addEventListener('pointerdown', onTrustedDownloadIntent, true);
+            document.addEventListener('click', onTrustedDownloadIntent, true);
+            document.addEventListener('click', onSyntheticClick, true);
+
+            try {
+                const Anchor = pageWindow.HTMLAnchorElement;
+                original.anchorClick = Anchor?.prototype?.click;
+                if (typeof original.anchorClick === 'function') {
+                    const controller = this;
+                    Anchor.prototype.click = function (...args) {
+                        if (shouldBlockAnchor(this)) {
+                            record('anchor-click', this.href || this.getAttribute?.('href') || this.download || '');
+                            return undefined;
+                        }
+                        return original.anchorClick.apply(this, args);
+                    };
+                }
+            } catch { }
+
+            try {
+                original.open = pageWindow.open;
+                if (typeof original.open === 'function') {
+                    pageWindow.open = function (url, ...rest) {
+                        if (shouldBlockUrl(url)) {
+                            record('window-open', url);
+                            return null;
+                        }
+                        return original.open.call(this, url, ...rest);
+                    };
+                }
+            } catch { }
+
+            const restore = () => {
+                if (!active) return stats;
+                active = false;
+                document.removeEventListener('pointerdown', onTrustedDownloadIntent, true);
+                document.removeEventListener('click', onTrustedDownloadIntent, true);
+                document.removeEventListener('click', onSyntheticClick, true);
+                try {
+                    const Anchor = pageWindow.HTMLAnchorElement;
+                    if (original.anchorClick && Anchor?.prototype) Anchor.prototype.click = original.anchorClick;
+                } catch { }
+                try { if (original.open) pageWindow.open = original.open; } catch { }
+                this.lastDownloadQuarantineStats = stats;
+                if (stats.blocked) {
+                    console.warn(`[ChatGPT 导航与导出] 安全加载期间拦截了 ${stats.blocked} 次非用户触发的下载尝试。`, stats);
+                }
+                return stats;
+            };
+            return { id, stats, restore };
+        }
+
+        async probeInteractiveAssetControl(element, baseCandidate = {}) {
+            if (
+                this.config.conversationArchivePassiveAssetDiscoveryOnly === true ||
+                this.config.conversationExportProbeInteractiveControls !== true ||
+                this.config.conversationExportEnableDangerousAutomaticControlActivation !== true ||
+                !(element instanceof Element) ||
+                !element.isConnected
+            ) {
+                return { primary: null, extras: [] };
+            }
+            const pageWindow = this.getPageRealmWindow();
+            const timeoutMs = Math.max(500, Number(this.config.conversationExportInteractiveProbeTimeoutMs) || 1800);
+            const settleMs = Math.max(120, Number(this.config.conversationExportInteractiveProbeSettleMs) || 300);
+            const runId = ++this.interactiveProbeRunId;
+            const capturedUrls = [];
+            const capturedBlobs = [];
+            const captureTasks = [];
+            const addedNodes = [];
+            const beforeArtifactNodes = this.captureArtifactNodeBaseline();
+            const performanceStart = performance.now();
+            const blobByUrl = new Map();
+            const recordUrl = (value, filename = '') => {
+                const url = this.normalizeAssetCandidateUrl(value);
+                if (!url || !this.isLikelyCapturedAssetUrl(url, filename, '')) return;
+                const existing = capturedUrls.find((item) => item.url === url);
+                if (existing) {
+                    if (!existing.filename && filename) existing.filename = filename;
+                    return;
+                }
+                capturedUrls.push({ url, filename });
+            };
+            const recordBlob = (blob, filename = '', url = '', contentType = '') => {
+                if (!this.isBlobLike(blob) || !(Number(blob.size) > 0)) return;
+                const sameObject = capturedBlobs.find((item) => item.blob === blob || (url && item.url === url));
+                if (sameObject) {
+                    if (!sameObject.filename && filename) sameObject.filename = filename;
+                    if (!sameObject.url && url) sameObject.url = url;
+                    if (!sameObject.contentType && contentType) sameObject.contentType = contentType;
+                    return;
+                }
+                capturedBlobs.push({ blob, filename, url, contentType });
+            };
+            const recordJson = (data) => {
+                const metadata = this.extractDownloadMetadataFromJson(data);
+                if (metadata?.downloadUrl) recordUrl(metadata.downloadUrl, metadata.filename);
+                if (data && typeof data === 'object') {
+                    const synthetic = {
+                        author: { role: baseCandidate.role || 'assistant', name: 'interactive-download' },
+                        content: { parts: [] },
+                        metadata: { interactive_response: data },
+                    };
+                    for (const asset of this.collectApiAssetsFromMessage(synthetic, Number(baseCandidate.logicalIndex) || 0)) {
+                        if (asset.sourceUrl) recordUrl(asset.sourceUrl, asset.filenameHint);
+                        if (asset.blob) recordBlob(asset.blob, asset.filenameHint, asset.sourceUrl, asset.mimeType);
+                    }
+                }
+            };
+
+            const observer = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) if (node instanceof Element) addedNodes.push(node);
+                }
+            });
+            try { observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'aria-hidden', 'class', 'style', 'src', 'srcdoc'] }); } catch { }
+
+            const original = {};
+            const xhrMeta = new WeakMap();
+            const thisController = this;
+            try {
+                original.open = pageWindow.open;
+                pageWindow.open = function (url) {
+                    recordUrl(url);
+                    return null;
+                };
+            } catch { }
+            try {
+                original.createObjectURL = pageWindow.URL?.createObjectURL;
+                if (original.createObjectURL) {
+                    pageWindow.URL.createObjectURL = function (blob) {
+                        const url = original.createObjectURL.call(this, blob);
+                        if (thisController.isBlobLike(blob)) {
+                            blobByUrl.set(url, blob);
+                            recordBlob(blob, '', url, blob.type || '');
+                        }
+                        return url;
+                    };
+                }
+            } catch { }
+            try {
+                original.anchorClick = pageWindow.HTMLAnchorElement?.prototype?.click;
+                if (original.anchorClick) {
+                    pageWindow.HTMLAnchorElement.prototype.click = function () {
+                        const href = this.href || this.getAttribute?.('href') || '';
+                        const filename = this.download || this.getAttribute?.('download') || '';
+                        recordUrl(href, filename);
+                        if (blobByUrl.has(href)) recordBlob(blobByUrl.get(href), filename, href);
+                        return undefined;
+                    };
+                }
+            } catch { }
+            try {
+                original.fetch = pageWindow.fetch;
+                if (typeof original.fetch === 'function') {
+                    pageWindow.fetch = async function (...args) {
+                        const response = await original.fetch.apply(this, args);
+                        try {
+                            const requestUrl = String(args[0]?.url || args[0] || response.url || '');
+                            const contentType = response.headers?.get?.('content-type') || '';
+                            const disposition = response.headers?.get?.('content-disposition') || '';
+                            const filename = thisController.parseContentDispositionFilename(disposition);
+                            const likely = thisController.isLikelyCapturedAssetUrl(requestUrl, filename, contentType) ||
+                                thisController.isLikelyCapturedAssetUrl(response.url || '', filename, contentType) || Boolean(disposition);
+                            if (likely) {
+                                const clone = response.clone();
+                                captureTasks.push((async () => {
+                                    if (/json/i.test(contentType)) {
+                                        try { recordJson(await clone.json()); } catch { }
+                                    } else {
+                                        try { recordBlob(await clone.blob(), filename, response.url || requestUrl, contentType); } catch { }
+                                    }
+                                    recordUrl(response.url || requestUrl, filename);
+                                })());
+                            }
+                        } catch { }
+                        return response;
+                    };
+                }
+            } catch { }
+            try {
+                const Xhr = pageWindow.XMLHttpRequest;
+                if (Xhr?.prototype) {
+                    original.xhrOpen = Xhr.prototype.open;
+                    original.xhrSend = Xhr.prototype.send;
+                    Xhr.prototype.open = function (method, url, ...rest) {
+                        xhrMeta.set(this, { method: String(method || 'GET'), url: String(url || '') });
+                        return original.xhrOpen.call(this, method, url, ...rest);
+                    };
+                    Xhr.prototype.send = function (...args) {
+                        const xhr = this;
+                        const meta = xhrMeta.get(xhr) || {};
+                        const onLoadEnd = () => {
+                            try {
+                                const url = xhr.responseURL || meta.url || '';
+                                const contentType = xhr.getResponseHeader?.('content-type') || '';
+                                const disposition = xhr.getResponseHeader?.('content-disposition') || '';
+                                const filename = thisController.parseContentDispositionFilename(disposition);
+                                if (!thisController.isLikelyCapturedAssetUrl(url, filename, contentType) && !disposition) return;
+                                recordUrl(url, filename);
+                                const responseType = String(xhr.responseType || '').toLowerCase();
+                                if (responseType === 'blob' || responseType === 'arraybuffer') {
+                                    recordBlob(xhr.response, filename, url, contentType);
+                                } else {
+                                    const text = String(xhr.responseText || xhr.response || '');
+                                    if (/json/i.test(contentType) || /^[{[]/.test(text.trim())) {
+                                        try { recordJson(JSON.parse(text)); } catch { }
+                                    }
+                                }
+                            } catch { }
+                        };
+                        try { xhr.addEventListener('loadend', onLoadEnd, { once: true }); } catch { }
+                        return original.xhrSend.apply(this, args);
+                    };
+                }
+            } catch { }
+
+            let sourceEventSeen = false;
+            const onDocumentClick = (event) => {
+                const target = event.target instanceof Element ? event.target.closest('a[href]') : null;
+                if (target) {
+                    const href = target.href || target.getAttribute('href') || '';
+                    const filename = target.getAttribute('download') || '';
+                    if (this.isLikelyCapturedAssetUrl(href, filename, '')) {
+                        recordUrl(href, filename);
+                        if (blobByUrl.has(href)) recordBlob(blobByUrl.get(href), filename, href);
+                        event.preventDefault();
+                    }
+                }
+                if (element.contains(event.target)) sourceEventSeen = true;
+            };
+            document.addEventListener('click', onDocumentClick, true);
+
+            const restore = () => {
+                observer.disconnect();
+                document.removeEventListener('click', onDocumentClick, true);
+                try { if (original.open) pageWindow.open = original.open; } catch { }
+                try { if (original.createObjectURL) pageWindow.URL.createObjectURL = original.createObjectURL; } catch { }
+                try { if (original.anchorClick) pageWindow.HTMLAnchorElement.prototype.click = original.anchorClick; } catch { }
+                try { if (original.fetch) pageWindow.fetch = original.fetch; } catch { }
+                try {
+                    const Xhr = pageWindow.XMLHttpRequest;
+                    if (original.xhrOpen && Xhr?.prototype) Xhr.prototype.open = original.xhrOpen;
+                    if (original.xhrSend && Xhr?.prototype) Xhr.prototype.send = original.xhrSend;
+                } catch { }
+            };
+
+            const dispatchProbeClick = (target) => {
+                if (!(target instanceof Element) || !target.isConnected) return false;
+                try {
+                    target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window }));
+                    return true;
+                } catch {
+                    try { target.click?.(); return true; } catch { return false; }
+                }
+            };
+
+            const collectNestedControls = () => {
+                const panels = this.queryAllDeep([
+                    '[role="dialog"]', '[role="menu"]', '[data-radix-menu-content]',
+                    '[data-testid*="artifact" i]', '[data-testid*="canvas" i]', '[class*="artifact" i]', '[class*="canvas" i]',
+                ].join(',')).filter((node) => this.isElementActuallyVisible(node));
+                const controls = [];
+                for (const panel of panels) {
+                    for (const control of this.queryAllDeep('button,a[href],[role="button"],[role="menuitem"]', panel)) {
+                        if (!this.isElementActuallyVisible(control)) continue;
+                        const signal = this.getInteractiveControlSignal(control);
+                        const directSignal = [control.getAttribute('aria-label'), control.getAttribute('title'), control.getAttribute('data-testid'), control.textContent]
+                            .filter(Boolean).join(' ');
+                        if (!/(?:下载|导出|保存|获取|download|export|save|html|markdown|md|zip|pdf|docx?|pptx?|xlsx?|csv|json|源码|source)/i.test(signal)) continue;
+                        if (/(?:关闭|close|取消|cancel)/i.test(directSignal)) continue;
+                        if (!controls.includes(control)) controls.push(control);
+                    }
+                }
+                // 菜单经 Portal 挂到 body 时，不一定属于 Artifact 面板。
+                for (const control of this.queryAllDeep('[role="menuitem"], [data-radix-menu-content] button, [data-radix-menu-content] a[href]')) {
+                    if (!this.isElementActuallyVisible(control)) continue;
+                    const signal = this.getInteractiveControlSignal(control);
+                    if (/(?:下载|导出|保存|download|export|save|html|markdown|md|zip|pdf|docx?|pptx?|xlsx?|csv|json|源码|source)/i.test(signal) && !controls.includes(control)) controls.push(control);
+                }
+                return controls;
+            };
+
+            try {
+                dispatchProbeClick(element);
+                await this.waitForDelay(Math.min(220, settleMs)).catch(() => { });
+
+                const maxNested = Math.max(0, Number(this.config.conversationExportMaxNestedProbeControls) || 8);
+                const nestedControls = collectNestedControls().slice(0, maxNested);
+                for (const control of nestedControls) {
+                    dispatchProbeClick(control);
+                    await this.waitForDelay(100).catch(() => { });
+                }
+
+                const startedAt = performance.now();
+                let lastChangeAt = startedAt;
+                let previousCount = 0;
+                while (performance.now() - startedAt < timeoutMs) {
+                    await this.waitForDelay(80).catch(() => { });
+                    const currentCount = capturedUrls.length + capturedBlobs.length + addedNodes.length;
+                    if (currentCount !== previousCount) {
+                        previousCount = currentCount;
+                        lastChangeAt = performance.now();
+                    }
+                    if (currentCount && performance.now() - lastChangeAt >= settleMs) break;
+                }
+                await Promise.allSettled(captureTasks);
+
+                try {
+                    for (const entry of performance.getEntriesByType?.('resource') || []) {
+                        if (Number(entry.startTime || 0) + 5 < performanceStart) continue;
+                        recordUrl(entry.name || '');
+                    }
+                } catch { }
+
+                const artifactCandidates = this.collectArtifactSnapshotCandidates(beforeArtifactNodes, baseCandidate.label || 'Artifact');
+                for (const artifactCandidate of artifactCandidates) {
+                    if (artifactCandidate.canvasElement instanceof HTMLCanvasElement) {
+                        artifactCandidate.inlineBlob = await this.canvasToBlob(artifactCandidate.canvasElement);
+                        delete artifactCandidate.canvasElement;
+                    }
+                }
+
+                const resolved = [];
+                const resolvedBlobKeys = new Set();
+                for (const item of capturedBlobs) {
+                    const normalizedBlob = await this.normalizeBlobLike(item.blob, item.contentType || baseCandidate.mimeType || '');
+                    if (!normalizedBlob?.size) continue;
+                    const inferredFilename = item.filename || baseCandidate.filenameHint || '';
+                    const blobKey = `${inferredFilename.toLowerCase()}|${normalizedBlob.size}|${normalizedBlob.type || item.contentType || ''}`;
+                    if (resolvedBlobKeys.has(blobKey)) continue;
+                    resolvedBlobKeys.add(blobKey);
+                    const baseKind = baseCandidate.kind === 'artifact' || /artifact|canvas/i.test(baseCandidate.kind || '')
+                        ? 'artifact'
+                        : /file-control/.test(baseCandidate.kind || '')
+                            ? 'file'
+                            : baseCandidate.kind || this.getAssetKindFromHints({ mimeType: normalizedBlob.type, filename: item.filename });
+                    resolved.push({
+                        kind: baseKind,
+                        url: item.url || '', alternateUrls: [], label: baseCandidate.label || item.filename || '生成文件',
+                        filenameHint: item.filename || baseCandidate.filenameHint || '', mimeType: normalizedBlob.type || item.contentType || baseCandidate.mimeType || '',
+                        inlineBlob: normalizedBlob, captureMethod: 'interactive-download-blob', probeOnly: true,
+                    });
+                }
+                for (const item of capturedUrls) {
+                    if (resolved.some((candidate) => candidate.url === item.url)) continue;
+                    if (blobByUrl.has(item.url)) continue;
+                    if (item.filename && resolved.some((candidate) =>
+                        String(candidate.filenameHint || '').toLowerCase() === String(item.filename).toLowerCase())) continue;
+                    resolved.push({
+                        kind: /file-control/.test(baseCandidate.kind || '')
+                            ? 'file'
+                            : baseCandidate.kind || this.getAssetKindFromHints({ filename: item.filename, signal: baseCandidate.label }),
+                        url: item.url, alternateUrls: [], label: baseCandidate.label || item.filename || '生成文件',
+                        filenameHint: item.filename || baseCandidate.filenameHint || '', mimeType: baseCandidate.mimeType || '',
+                        fileId: this.extractFileIdFromValue(item.url), artifactId: this.extractArtifactIdFromValue(item.url),
+                        captureMethod: 'interactive-download-url', probeOnly: true,
+                    });
+                }
+                resolved.push(...artifactCandidates.filter((candidate) => candidate.inlineBlob || candidate.url));
+
+                const openedPanel = [...addedNodes].reverse().find((node) => node instanceof Element &&
+                    node.matches?.('[role="dialog"],[data-testid*="artifact" i],[data-testid*="canvas" i],[class*="artifact" i],[class*="canvas" i]'));
+                if (openedPanel) {
+                    const close = openedPanel.querySelector?.('button[aria-label*="关闭"],button[aria-label*="Close" i],[data-testid*="close" i]');
+                    try { close?.click?.(); } catch { }
+                }
+                if (!resolved.length && sourceEventSeen && /^sandbox:/i.test(baseCandidate.url || '')) {
+                    resolved.push({ ...baseCandidate, captureMethod: 'interactive-unresolved-sandbox', probeOnly: true });
+                }
+                return { primary: resolved[0] || null, extras: resolved.slice(1) };
+            } finally {
+                restore();
+                if (runId === this.interactiveProbeRunId) this.requestFrame(true);
+            }
+        }
+
+        async discoverMessageAssets(root, logicalIndex, role, sequenceStart = 0, options = {}) {
             if (!(root instanceof HTMLElement)) return { assets: [], annotatedElements: [], nextSequence: sequenceStart };
             const candidates = [];
+            const allowInteractiveProbe = (
+                options.allowInteractiveProbe === true &&
+                this.config.conversationArchivePassiveAssetDiscoveryOnly !== true &&
+                this.config.conversationExportProbeInteractiveControls === true &&
+                this.config.conversationExportEnableDangerousAutomaticControlActivation === true
+            );
             const addCandidate = (element, data) => {
-                if (!(element instanceof Element)) return;
-                candidates.push({ element, role, ...data });
+                if (!(element instanceof Element) && !data?.probeOnly) return;
+                const normalizedElement = element instanceof Element ? element : null;
+                const incoming = { element: normalizedElement, role, ...data };
+                const incomingName = String(incoming.filenameHint || incoming.label || '').trim().toLowerCase();
+                const existing = candidates.find((candidate) => {
+                    if (incoming.fileId && candidate.fileId === incoming.fileId) return true;
+                    if (incoming.artifactId && candidate.artifactId === incoming.artifactId) return true;
+                    if (incoming.url && candidate.url === incoming.url) return true;
+                    if (normalizedElement && candidate.element === normalizedElement) {
+                        const existingName = String(candidate.filenameHint || candidate.label || '').trim().toLowerCase();
+                        return !incomingName || !existingName || incomingName === existingName ||
+                            incomingName.includes(existingName) || existingName.includes(incomingName);
+                    }
+                    return false;
+                });
+                if (!existing) {
+                    candidates.push(incoming);
+                    return;
+                }
+                existing.fileId = incoming.fileId || existing.fileId || '';
+                existing.artifactId = incoming.artifactId || existing.artifactId || '';
+                if (!existing.url || /^sandbox:/i.test(existing.url)) existing.url = incoming.url || existing.url || '';
+                existing.alternateUrls = [...new Set([
+                    ...(existing.alternateUrls || []), ...(incoming.alternateUrls || []),
+                    incoming.url && incoming.url !== existing.url ? incoming.url : '',
+                ].filter(Boolean))];
+                existing.filenameHint = incoming.filenameHint || existing.filenameHint || '';
+                existing.mimeType = incoming.mimeType || existing.mimeType || '';
+                existing.inlineBlob = incoming.inlineBlob || existing.inlineBlob || null;
+                existing.presentation = incoming.presentation || existing.presentation || '';
+                if (!existing.label || existing.label === '附件') existing.label = incoming.label || existing.label;
+                const genericKinds = new Set(['file-control', 'file', 'artifact']);
+                if (!existing.kind || (genericKinds.has(existing.kind) && incoming.kind && !genericKinds.has(incoming.kind))) existing.kind = incoming.kind;
+                if (/interactive|react/.test(incoming.captureMethod || '')) existing.captureMethod = incoming.captureMethod;
+                existing.probeOnly = existing.probeOnly || incoming.probeOnly;
             };
 
             for (const image of root.querySelectorAll('img')) {
                 if (image.closest('[role="tooltip"], [data-message-actions]')) continue;
                 const url = this.getLargestImageCandidate(image);
                 if (!url) continue;
+                let presentation = 'content';
+                try {
+                    const rect = image.getBoundingClientRect();
+                    const signal = `${image.className} ${image.getAttribute('alt') || ''} ${image.getAttribute('data-testid') || ''} ${url}`.toLowerCase();
+                    const small = rect.width > 0 && rect.height > 0 && rect.width <= 80 && rect.height <= 80;
+                    if (/favicon|site[-_ ]?icon|domain[-_ ]?icon|avatar|emoji|logo|icon\b/i.test(signal) ||
+                        (small && image.closest('a[href^="http"], p, li, span'))) presentation = 'inline-icon';
+                } catch { }
                 addCandidate(image, {
-                    kind: 'image',
-                    url,
+                    kind: presentation === 'inline-icon' ? 'inline-icon' : 'image', presentation, url,
                     alternateUrls: [
                         ...this.getElementUrlAlternates(image, url),
                         ...[...(image.closest('picture')?.querySelectorAll('source[srcset]') || [])]
                             .flatMap((source) => String(source.getAttribute('srcset') || '').split(',').map((part) => part.trim().split(/\s+/)[0]))
-                            .map((candidateUrl) => this.normalizeAssetCandidateUrl(candidateUrl))
-                            .filter(Boolean),
+                            .map((candidateUrl) => this.normalizeAssetCandidateUrl(candidateUrl)).filter(Boolean),
                     ],
-                    fileId: this.extractFileIdFromValue(url),
+                    fileId: this.extractFileIdFromValue(url), artifactId: '',
                     label: image.getAttribute('alt') || image.getAttribute('aria-label') || '图片',
                     filenameHint: image.getAttribute('download') || '',
                     mimeType: /^data:([^;,]+)/i.exec(url)?.[1] || '',
+                    captureMethod: 'dom-image',
                 });
             }
 
@@ -6358,37 +7731,41 @@
                 const url = this.normalizeAssetCandidateUrl(anchor.getAttribute('href') || anchor.href);
                 if (!url || !this.isLikelyDownloadAssetLink(anchor, url)) continue;
                 addCandidate(anchor, {
-                    kind: /\.html?(?:$|[?#])/i.test(url) || /artifact/i.test(anchor.getAttribute('data-testid') || '')
-                        ? 'artifact-html'
-                        : 'file',
-                    url,
-                    alternateUrls: this.getElementUrlAlternates(anchor, url),
-                    fileId: this.extractFileIdFromValue(url),
+                    kind: /\.html?(?:$|[?#])/i.test(url) || /artifact|canvas/i.test(this.getInteractiveControlSignal(anchor)) ? 'artifact-html' : 'file',
+                    url, alternateUrls: this.getElementUrlAlternates(anchor, url),
+                    fileId: this.extractFileIdFromValue(url), artifactId: this.extractArtifactIdFromValue(url),
                     label: anchor.textContent?.trim() || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || '附件',
-                    filenameHint: anchor.getAttribute('download') || '',
-                    mimeType: '',
+                    filenameHint: anchor.getAttribute('download') || '', mimeType: '', captureMethod: 'dom-link',
                 });
             }
 
-            for (const control of root.querySelectorAll('button, [role="button"]')) {
-                const signal = [
-                    control.getAttribute('aria-label'),
-                    control.getAttribute('title'),
-                    control.getAttribute('data-testid'),
-                    control.textContent,
-                ].filter(Boolean).join(' ');
-                if (!/(?:下载|附件|文件|artifact|download|attachment)/i.test(signal)) continue;
+            const controlSelector = 'button, [role="button"], [data-testid*="artifact" i], [data-testid*="canvas" i], [data-testid*="file" i]';
+            for (const control of root.querySelectorAll(controlSelector)) {
+                if (control.closest('[role="tooltip"], [data-message-actions]')) continue;
+                const signal = this.getInteractiveControlSignal(control);
+                if (!/(?:下载|导出|附件|文件|artifact|canvas|canmore|download|export|attachment|generated[-_ ]?file|open.*(?:preview|canvas|artifact)|\.(?:csv|docx?|html?|json|md|pdf|pptx?|py|svg|txt|xlsx?|zip)\b)/i.test(signal)) continue;
                 const alternates = this.getElementUrlAlternates(control, '');
                 const url = alternates[0] || '';
                 addCandidate(control, {
-                    kind: /artifact/i.test(signal) ? 'artifact' : 'file-control',
-                    url,
-                    alternateUrls: alternates.slice(1),
-                    fileId: this.extractFileIdFromValue(url),
-                    label: control.textContent?.trim() || control.getAttribute('aria-label') || '附件',
-                    filenameHint: '',
-                    mimeType: '',
+                    kind: /artifact|canvas|canmore/i.test(signal) ? 'artifact' : 'file-control',
+                    url, alternateUrls: alternates.slice(1),
+                    fileId: this.extractFileIdFromValue(url), artifactId: this.extractArtifactIdFromValue(url),
+                    label: control.textContent?.trim() || control.getAttribute('aria-label') || control.getAttribute('title') || '附件',
+                    filenameHint: '', mimeType: '', captureMethod: 'dom-control',
                 });
+            }
+
+            if (this.config.conversationExportProbeReactProperties !== false) {
+                const maxReactControls = Math.max(0, Number(this.config.conversationExportMaxReactHintControlsPerMessage) || 10);
+                let scanned = 0;
+                for (const candidate of [...candidates]) {
+                    if (scanned >= maxReactControls || !(candidate.element instanceof Element)) break;
+                    if (!this.isStrongInteractiveAssetControl(candidate.element, candidate)) continue;
+                    scanned += 1;
+                    for (const hint of this.collectReactInternalAssetCandidates(candidate.element, logicalIndex, role)) {
+                        addCandidate(candidate.element, hint);
+                    }
+                }
             }
 
             for (const iframe of root.querySelectorAll('iframe')) {
@@ -6396,13 +7773,12 @@
                 const url = this.normalizeAssetCandidateUrl(iframe.getAttribute('src') || '');
                 if (!html && !url) continue;
                 addCandidate(iframe, {
-                    kind: 'artifact-html',
-                    url,
-                    alternateUrls: this.getElementUrlAlternates(iframe, url),
+                    kind: 'artifact-html', url, alternateUrls: this.getElementUrlAlternates(iframe, url),
+                    artifactId: this.extractArtifactIdFromValue(url),
                     label: iframe.getAttribute('title') || iframe.getAttribute('aria-label') || '交互式 Artifact',
-                    filenameHint: 'artifact.html',
-                    mimeType: 'text/html',
+                    filenameHint: 'artifact.html', mimeType: 'text/html',
                     inlineBlob: html ? new Blob([html], { type: 'text/html;charset=utf-8' }) : null,
+                    captureMethod: 'dom-iframe',
                 });
             }
 
@@ -6410,13 +7786,9 @@
                 const rect = canvas.getBoundingClientRect();
                 if (rect.width < 24 && rect.height < 24) continue;
                 addCandidate(canvas, {
-                    kind: 'canvas-image',
-                    url: '',
-                    alternateUrls: [],
-                    label: canvas.getAttribute('aria-label') || 'Canvas 图像',
-                    filenameHint: 'canvas.png',
-                    mimeType: 'image/png',
-                    inlineBlob: await this.canvasToBlob(canvas),
+                    kind: 'canvas-image', url: '', alternateUrls: [], label: canvas.getAttribute('aria-label') || 'Canvas 图像',
+                    filenameHint: 'canvas.png', mimeType: 'image/png', inlineBlob: await this.canvasToBlob(canvas),
+                    captureMethod: 'dom-canvas',
                 });
             }
 
@@ -6426,13 +7798,10 @@
                 if (box.width < 48 && box.height < 48) continue;
                 const xml = new XMLSerializer().serializeToString(svg);
                 addCandidate(svg, {
-                    kind: 'svg-image',
-                    url: '',
-                    alternateUrls: [],
+                    kind: 'svg-image', url: '', alternateUrls: [],
                     label: svg.getAttribute('aria-label') || svg.querySelector('title')?.textContent || 'SVG 图像',
-                    filenameHint: 'graphic.svg',
-                    mimeType: 'image/svg+xml',
-                    inlineBlob: new Blob([xml], { type: 'image/svg+xml;charset=utf-8' }),
+                    filenameHint: 'graphic.svg', mimeType: 'image/svg+xml',
+                    inlineBlob: new Blob([xml], { type: 'image/svg+xml;charset=utf-8' }), captureMethod: 'dom-svg',
                 });
             }
 
@@ -6441,13 +7810,45 @@
                 const url = this.normalizeAssetCandidateUrl(raw);
                 if (!url) continue;
                 addCandidate(element, {
-                    kind: element.tagName.toLowerCase(),
-                    url,
-                    alternateUrls: this.getElementUrlAlternates(element, url),
+                    kind: element.tagName.toLowerCase(), url, alternateUrls: this.getElementUrlAlternates(element, url),
+                    fileId: this.extractFileIdFromValue(url), artifactId: this.extractArtifactIdFromValue(url),
                     label: element.getAttribute('aria-label') || element.getAttribute('title') || element.tagName.toLowerCase(),
-                    filenameHint: '',
-                    mimeType: element.getAttribute('type') || '',
+                    filenameHint: '', mimeType: element.getAttribute('type') || '', captureMethod: 'dom-media',
                 });
+            }
+
+            if (allowInteractiveProbe) {
+                const maxControls = Math.max(0, Number(this.config.conversationExportMaxProbeControlsPerMessage) || 12);
+                let probed = 0;
+                const originalCandidates = [...candidates];
+                for (const candidate of originalCandidates) {
+                    if (probed >= maxControls || !(candidate.element instanceof Element)) break;
+                    const needsProbe = this.isStrongInteractiveAssetControl(candidate.element, candidate) && (
+                        candidate.element.matches('button,[role="button"]') || /^sandbox:/i.test(candidate.url || '') ||
+                        (!candidate.fileId && !candidate.artifactId && !/^https?:|^data:|^blob:/i.test(candidate.url || '')) ||
+                        /artifact|canvas|canmore/i.test(candidate.kind || '')
+                    );
+                    if (!needsProbe) continue;
+                    probed += 1;
+                    try {
+                        const result = await this.probeInteractiveAssetControl(candidate.element, { ...candidate, logicalIndex, role });
+                        if (result.primary) {
+                            const primary = result.primary;
+                            candidate.kind = primary.kind || candidate.kind;
+                            candidate.url = primary.url || candidate.url;
+                            candidate.alternateUrls = [...new Set([...(candidate.alternateUrls || []), ...(primary.alternateUrls || [])])];
+                            candidate.fileId = primary.fileId || candidate.fileId;
+                            candidate.artifactId = primary.artifactId || candidate.artifactId;
+                            candidate.filenameHint = primary.filenameHint || candidate.filenameHint;
+                            candidate.mimeType = primary.mimeType || candidate.mimeType;
+                            candidate.inlineBlob = primary.inlineBlob || candidate.inlineBlob;
+                            candidate.captureMethod = primary.captureMethod || candidate.captureMethod;
+                        }
+                        for (const extra of result.extras || []) addCandidate(null, { ...extra, probeOnly: true });
+                    } catch (error) {
+                        console.debug('[ChatGPT 导航与导出] 资源控件探测未获取内容：', error);
+                    }
+                }
             }
 
             const assets = [];
@@ -6461,32 +7862,28 @@
                     try {
                         const response = await fetch(sourceUrl);
                         if (response.ok) inlineBlob = await response.blob();
-                    } catch {
-                        // blob: URL 可能已失效；仍保留原始 URL，导出时再尝试一次。
-                    }
+                    } catch { }
                 }
-                const key = sourceUrl
-                    ? `${candidate.kind}|${sourceUrl}`
-                    : `${candidate.kind}|inline|${sequence + 1}`;
+                const fileId = candidate.fileId || this.extractFileIdFromValue(sourceUrl);
+                const artifactId = candidate.artifactId || this.extractArtifactIdFromValue(sourceUrl);
+                const key = fileId ? `file|${fileId}`
+                    : artifactId ? `artifact|${artifactId}`
+                        : sourceUrl ? `${candidate.kind}|${sourceUrl}`
+                            : `${candidate.kind}|inline|${candidate.filenameHint || ''}|${inlineBlob?.size || sequence + 1}`;
                 let asset = byKey.get(key);
                 if (!asset) {
                     sequence += 1;
                     const id = `q${String(logicalIndex + 1).padStart(3, '0')}-${role}-a${String(sequence).padStart(3, '0')}`;
                     const mimeType = candidate.mimeType || inlineBlob?.type || '';
                     asset = {
-                        id,
-                        logicalIndex,
-                        role,
-                        kind: candidate.kind,
+                        id, logicalIndex, role, kind: candidate.kind,
+                        presentation: candidate.presentation || (candidate.kind === 'inline-icon' ? 'inline-icon' : ''),
                         label: String(candidate.label || '附件').trim() || '附件',
-                        sourceUrl,
-                        alternateUrls: [...new Set(candidate.alternateUrls || [])],
-                        fileId: candidate.fileId || this.extractFileIdFromValue(sourceUrl),
+                        sourceUrl, alternateUrls: [...new Set(candidate.alternateUrls || [])],
+                        fileId, artifactId,
                         filenameHint: this.getAssetFilenameHint({ ...candidate, mimeType }, sequence),
-                        mimeType,
-                        byteLength: inlineBlob?.size || 0,
-                        blob: inlineBlob,
-                        capturedAt: new Date().toISOString(),
+                        mimeType, byteLength: inlineBlob?.size || 0, blob: inlineBlob,
+                        captureMethod: candidate.captureMethod || 'dom', capturedAt: new Date().toISOString(),
                     };
                     byKey.set(key, asset);
                     assets.push(asset);
@@ -6494,21 +7891,29 @@
                     for (const alternate of candidate.alternateUrls || []) {
                         if (alternate && !asset.alternateUrls.includes(alternate)) asset.alternateUrls.push(alternate);
                     }
+                    if (!(asset.blob instanceof Blob) && inlineBlob instanceof Blob) {
+                        asset.blob = inlineBlob; asset.byteLength = inlineBlob.size;
+                    }
+                    if (!asset.fileId && fileId) asset.fileId = fileId;
+                    if (!asset.artifactId && artifactId) asset.artifactId = artifactId;
                 }
-                candidate.element.setAttribute('data-cgpt-export-asset-id', asset.id);
-                annotatedElements.push(candidate.element);
+                if (candidate.element instanceof Element) {
+                    candidate.element.setAttribute('data-cgpt-export-asset-id', asset.id);
+                    annotatedElements.push(candidate.element);
+                }
             }
 
             return { assets, annotatedElements, nextSequence: sequence };
         }
 
-        async discoverConversationAssets(logicalIndex, pair) {
-            const user = await this.discoverMessageAssets(pair.userElement, logicalIndex, 'user', 0);
+        async discoverConversationAssets(logicalIndex, pair, options = {}) {
+            const user = await this.discoverMessageAssets(pair.userElement, logicalIndex, 'user', 0, options);
             const assistant = await this.discoverMessageAssets(
                 pair.assistantElement,
                 logicalIndex,
                 'assistant',
                 user.nextSequence,
+                options,
             );
             return {
                 assets: [...user.assets, ...assistant.assets],
@@ -6516,8 +7921,69 @@
             };
         }
 
+        annotateExportCloneMetrics(source, clone) {
+            if (!(source instanceof Element) || !(clone instanceof Element)) return;
+            const sourceImages = [...source.querySelectorAll('img')];
+            const cloneImages = [...clone.querySelectorAll('img')];
+            for (let index = 0; index < Math.min(sourceImages.length, cloneImages.length); index += 1) {
+                const original = sourceImages[index];
+                const copy = cloneImages[index];
+                try {
+                    const rect = original.getBoundingClientRect();
+                    const style = getComputedStyle(original);
+                    copy.setAttribute('data-cgpt-render-width', String(Math.round(rect.width || 0)));
+                    copy.setAttribute('data-cgpt-render-height', String(Math.round(rect.height || 0)));
+                    copy.setAttribute('data-cgpt-render-display', style.display || '');
+                    const parentStyle = original.parentElement ? getComputedStyle(original.parentElement) : null;
+                    if (parentStyle) copy.setAttribute('data-cgpt-parent-display', parentStyle.display || '');
+                } catch { }
+            }
+        }
+
+        classifyExportImage(image) {
+            if (!(image instanceof HTMLImageElement)) return;
+            const src = String(image.getAttribute('src') || image.getAttribute('data-src') || '');
+            const signal = [
+                image.className, image.getAttribute('data-testid'), image.getAttribute('alt'), image.getAttribute('title'),
+                image.getAttribute('aria-label'), src,
+            ].filter(Boolean).join(' ').toLowerCase();
+            const width = Number.parseFloat(image.getAttribute('data-cgpt-render-width') || image.getAttribute('width') || '') || 0;
+            const height = Number.parseFloat(image.getAttribute('data-cgpt-render-height') || image.getAttribute('height') || '') || 0;
+            const renderedSmall = width > 0 && height > 0 && width <= 80 && height <= 80;
+            const tinyOrIconAspect = renderedSmall && Math.max(width, height) / Math.max(1, Math.min(width, height)) <= 2.2;
+            const iconSignal = /favicon|site[-_ ]?icon|domain[-_ ]?icon|source[-_ ]?icon|avatar|emoji|logo|icon\b|\/favicon(?:\.ico|\/|\?)/i.test(signal);
+            const nearText = Boolean(image.closest('a,span,p,li,div')?.textContent?.trim());
+            const linkedExternalSite = Boolean(image.closest('a[href^="http"]')) && renderedSmall;
+            const isInlineIcon = iconSignal || linkedExternalSite || (tinyOrIconAspect && nearText && !/generated|preview|photo|diagram|chart|screenshot/i.test(signal));
+            image.removeAttribute('data-cgpt-render-width');
+            image.removeAttribute('data-cgpt-render-height');
+            image.removeAttribute('data-cgpt-render-display');
+            image.removeAttribute('data-cgpt-parent-display');
+            if (isInlineIcon) {
+                image.className = /emoji/i.test(signal) ? 'inline-site-icon emoji-image' : 'inline-site-icon';
+                image.setAttribute('width', String(Math.min(24, width || 18)));
+                image.setAttribute('height', String(Math.min(24, height || 18)));
+                image.setAttribute('data-cgpt-export-presentation', 'inline-icon');
+                const holder = image.parentElement;
+                if (holder && /^(A|SPAN|DIV)$/.test(holder.tagName)) {
+                    holder.classList.add('inline-icon-holder');
+                    const row = holder.parentElement;
+                    if (row && /^(DIV|LI|P|A)$/.test(row.tagName) && row.children.length <= 6 && row.textContent?.trim()) {
+                        row.classList.add('icon-text-row');
+                    }
+                }
+            } else {
+                image.className = 'content-image';
+                image.removeAttribute('data-cgpt-export-presentation');
+                if (width && width < 120) image.removeAttribute('width');
+                if (height && height < 120) image.removeAttribute('height');
+            }
+        }
+
         sanitizeExportHtmlClone(clone) {
             if (!(clone instanceof Element)) return;
+
+            for (const image of clone.querySelectorAll('img')) this.classifyExportImage(image);
 
             // 将 KaTeX 的页面专用结构替换为可离线显示的 MathML/LaTeX 容器。
             const mathRoots = [...clone.querySelectorAll('.katex-display, .katex')]
@@ -6569,7 +8035,7 @@
             for (const element of clone.querySelectorAll('*')) {
                 for (const attribute of [...element.attributes]) {
                     const name = attribute.name.toLowerCase();
-                    const preserve = name === 'data-cgpt-export-asset-id' ||
+                    const preserve = name === 'data-cgpt-export-asset-id' || name === 'data-cgpt-export-presentation' ||
                         name === 'href' || name === 'src' || name === 'srcset' || name === 'sizes' ||
                         name === 'poster' || name === 'data' || name === 'srcdoc' || name === 'type' ||
                         name === 'alt' || name === 'title' || name === 'download' || name === 'target' ||
@@ -6589,6 +8055,14 @@
                         : 'math math-inline';
                 } else if (element.classList.contains('inline-attachment')) {
                     element.className = 'inline-attachment';
+                } else if (element.classList.contains('inline-site-icon')) {
+                    element.className = element.classList.contains('emoji-image') ? 'inline-site-icon emoji-image' : 'inline-site-icon';
+                } else if (element.classList.contains('content-image')) {
+                    element.className = 'content-image';
+                } else if (element.classList.contains('inline-icon-holder')) {
+                    element.className = 'inline-icon-holder';
+                } else if (element.classList.contains('icon-text-row')) {
+                    element.className = 'icon-text-row';
                 } else {
                     element.removeAttribute('class');
                 }
@@ -6608,6 +8082,7 @@
             const source = this.getMessageExportSource(element);
             if (!(source instanceof HTMLElement)) return '';
             const clone = source.cloneNode(true);
+            this.annotateExportCloneMetrics(source, clone);
             this.sanitizeExportHtmlClone(clone);
             for (const table of [...clone.querySelectorAll('table')]) {
                 if (table.parentElement?.classList.contains('table-wrap')) continue;
@@ -6796,9 +8271,9 @@
             return this.normalizeExportMarkdown(this.serializeBlockChildren(clone));
         }
 
-        async captureConversationPair(logicalIndex, pair) {
+        async captureConversationPair(logicalIndex, pair, options = {}) {
             if (!pair) return null;
-            const assetCapture = await this.discoverConversationAssets(logicalIndex, pair);
+            const assetCapture = await this.discoverConversationAssets(logicalIndex, pair, options);
             try {
                 const userText = this.extractUserPromptText(pair.userElement);
                 const userMarkdown = this.elementToMarkdown(pair.userElement) || userText;
@@ -6833,7 +8308,7 @@
             }
         }
 
-        async loadSingleConversation(logicalIndex, signal) {
+        async loadSingleConversation(logicalIndex, signal, options = {}) {
             if (this.conversationArchive.has(logicalIndex)) {
                 return this.conversationArchive.get(logicalIndex);
             }
@@ -6842,7 +8317,7 @@
                 if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
                 this.activateOfficialConversationButton(logicalIndex);
                 const pair = await this.waitForConversationPair(logicalIndex, signal);
-                const archive = await this.captureConversationPair(logicalIndex, pair);
+                const archive = await this.captureConversationPair(logicalIndex, pair, options);
                 if (archive) return archive;
                 if (attempt < retries) await this.waitForDelay(180 + attempt * 140, signal);
             }
@@ -6869,6 +8344,10 @@
             this.pinTransientHoverOpen(true);
             this.updateConversationArchiveUi();
 
+            // “加载全部”只允许官方问答导航切换和被动 DOM/API 读取。
+            // 防御性隔离任何非用户触发的 a[download]、文件 URL 和 window.open 下载。
+            const downloadQuarantine = this.installAutomatedDownloadQuarantine(this.conversationLoadMode);
+
             const task = (async () => {
                 const loaded = [];
                 const failed = [];
@@ -6878,7 +8357,10 @@
                         if (signal.aborted || runId !== this.conversationLoadRunId) {
                             throw new DOMException('Aborted', 'AbortError');
                         }
-                        const archive = await this.loadSingleConversation(logicalIndex, signal);
+                        const archive = await this.loadSingleConversation(logicalIndex, signal, {
+                            allowInteractiveProbe: false,
+                            sourceMode: this.conversationLoadMode,
+                        });
                         if (archive) loaded.push(logicalIndex);
                         else failed.push(logicalIndex);
                         this.conversationLoadProgress.completed += 1;
@@ -6896,11 +8378,15 @@
                     if (options.restore !== false && runId === this.conversationLoadRunId) {
                         await this.restoreConversationReturnPoint(returnPoint, null).catch(() => { });
                     }
+                    const quarantineStats = downloadQuarantine?.restore?.() || null;
                     if (runId === this.conversationLoadRunId) {
                         this.conversationLoadAbortController = null;
                         this.conversationLoadPromise = null;
                         this.conversationLoadMode = '';
                         this.scheduleConversationRebuild(0);
+                        if (quarantineStats?.blocked) {
+                            this.updateConversationArchiveUi(`安全拦截 ${quarantineStats.blocked} 次自动下载；加载内容已保留`);
+                        }
                     }
                 }
             })();
@@ -7167,7 +8653,8 @@
         }
 
         buildArchiveAssetHtml(archive, assetPathMap) {
-            const assets = Array.isArray(archive?.assets) ? archive.assets : [];
+            const assets = (Array.isArray(archive?.assets) ? archive.assets : [])
+                .filter((asset) => asset?.presentation !== 'inline-icon' && asset?.kind !== 'inline-icon');
             if (!assets.length) return '';
             const cards = assets.map((asset) => {
                 const local = assetPathMap.get(asset.id);
@@ -7176,14 +8663,19 @@
                 const label = this.escapeHtml(asset.label || filename || '附件');
                 const meta = [mime, sizeLabel].filter(Boolean).map((value) => this.escapeHtml(value)).join(' · ');
                 const status = local ? '已归档' : reference ? '外部链接' : '未能获取';
-                const icon = asset.kind === 'image' ? '图片' : asset.kind === 'artifact-html' ? 'HTML' : '文件';
-                const preview = local && asset.kind === 'image'
-                    ? `<a class="asset-preview" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer"><img src="${this.escapeHtml(reference)}" alt="${label}" loading="lazy" decoding="async"></a>`
-                    : '';
+                const isImage = /image|canvas|svg/i.test(asset.kind || '') || String(mime).startsWith('image/');
+                const isHtmlArtifact = /artifact-html/i.test(asset.kind || '') || /text\/html/i.test(mime) || /\.html?(?:$|[?#])/i.test(reference || filename);
+                const icon = isImage ? '图片' : isHtmlArtifact ? 'Artifact' : /artifact/i.test(asset.kind || '') ? '源码' : '文件';
+                let preview = '';
+                if (local && isImage) {
+                    preview = `<a class="asset-preview" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer"><img class="content-image" src="${this.escapeHtml(reference)}" alt="${label}" loading="lazy" decoding="async"></a>`;
+                } else if (local && isHtmlArtifact) {
+                    preview = `<iframe class="artifact-frame asset-artifact-preview" src="${this.escapeHtml(reference)}" title="${label}" sandbox="allow-scripts allow-forms allow-modals allow-popups" loading="lazy"></iframe>`;
+                }
                 const main = reference
                     ? `<a class="asset-link" href="${this.escapeHtml(reference)}" target="_blank" rel="noopener noreferrer"${local ? ' download' : ''}>${label}</a>`
                     : `<span class="asset-link asset-unavailable">${label}</span>`;
-                return `<li class="asset-card ${asset.kind === 'image' ? 'asset-image' : ''}">
+                return `<li class="asset-card ${isImage ? 'asset-image' : ''} ${isHtmlArtifact ? 'asset-artifact' : ''}">
           ${preview}
           <div class="asset-card-body"><span class="asset-badge">${icon}</span>${main}
           <div class="asset-meta">${meta ? `${meta} · ` : ''}${status}</div></div>
@@ -7280,14 +8772,18 @@
   .message-content pre code{padding:0;border:0;background:none;color:inherit;font-size:13px;white-space:pre}
   .table-wrap{max-width:100%;overflow:auto;margin:1em 0;border:1px solid var(--border);border-radius:10px}.table-wrap table{width:100%;min-width:480px;border-collapse:collapse;background:var(--surface)}
   .table-wrap th,.table-wrap td{padding:9px 12px;border-bottom:1px solid var(--border);border-inline-end:1px solid var(--border);text-align:start;vertical-align:top}.table-wrap th{background:var(--surface-soft);font-weight:700}.table-wrap tr:last-child>*{border-bottom:0}.table-wrap tr>*:last-child{border-inline-end:0}
-  .message-content img,.asset-preview img{display:block;max-width:100%;height:auto;margin:1em auto;border-radius:10px;object-fit:contain}.message-content video,.message-content audio{max-width:100%}
+  .message-content img.content-image,.message-content img:not(.inline-site-icon),.asset-preview img{display:block;max-width:100%;height:auto;margin:1em auto;border-radius:10px;object-fit:contain}
+  .message-content img.inline-site-icon,.message-content a img.inline-site-icon{display:inline-block!important;flex:0 0 auto;width:1.08em!important;height:1.08em!important;min-width:1.08em!important;min-height:1.08em!important;max-width:1.08em!important;max-height:1.08em!important;margin:0 .34em 0 0!important;padding:0!important;border:0;border-radius:3px;vertical-align:-.16em;object-fit:contain;box-shadow:none;background:transparent}
+  .message-content img.inline-site-icon.emoji-image{width:1.18em!important;height:1.18em!important;max-width:1.18em!important;max-height:1.18em!important;margin-inline-end:.15em!important;border-radius:0}
+  .message-content .inline-icon-holder{display:inline-flex!important;flex:0 0 auto;align-items:center;line-height:1;vertical-align:middle;width:auto!important;min-width:0!important}.message-content .icon-text-row{display:flex!important;align-items:flex-start;gap:.42em;min-width:0}.message-content .icon-text-row>*{min-width:0}.message-content p.icon-text-row,.message-content li.icon-text-row{margin-block:.55em}
+  .message-content video,.message-content audio{max-width:100%}
   .artifact-frame,.message-content iframe{display:block;width:100%;min-height:min(68vh,720px);margin:1em 0;border:1px solid var(--border);border-radius:11px;background:#fff}
   .message-content details{margin:.8em 0;padding:.65em .8em;border:1px solid var(--border);border-radius:9px;background:var(--surface-soft)}.message-content summary{cursor:pointer;font-weight:650}
   .math-display{display:block;max-width:100%;overflow:auto;padding:.55em 0;text-align:center}.math-inline{display:inline}.math math{font-size:1.05em}
   .inline-attachment{display:inline-flex;align-items:center;gap:6px;padding:.45em .65em;border:1px solid var(--border);border-radius:8px;background:var(--surface-soft);text-decoration:none}
   .assets{margin:16px 0 0;padding:16px 18px;border:1px solid var(--border);border-radius:14px;background:var(--surface)}.assets h4{margin:0 0 12px;font-size:14px}
   .asset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:10px;list-style:none;margin:0;padding:0}.asset-card{display:flex;min-width:0;gap:11px;padding:11px;border:1px solid var(--border);border-radius:10px;background:var(--surface-soft)}
-  .asset-card.asset-image{display:block}.asset-preview{display:block;margin-bottom:9px}.asset-preview img{width:100%;max-height:280px;margin:0;background:var(--surface);object-fit:contain}.asset-card-body{min-width:0}.asset-badge{display:inline-block;margin:0 7px 4px 0;padding:2px 6px;border-radius:5px;background:var(--accent-soft);color:var(--accent);font-size:10px;font-weight:750;letter-spacing:.04em}
+  .asset-card.asset-image,.asset-card.asset-artifact{display:block}.asset-preview{display:block;margin-bottom:9px}.asset-preview img{width:100%;max-height:280px;margin:0;background:var(--surface);object-fit:contain}.asset-artifact-preview{min-height:360px;max-height:72vh;margin:0 0 10px}.asset-card-body{min-width:0}.asset-badge{display:inline-block;margin:0 7px 4px 0;padding:2px 6px;border-radius:5px;background:var(--accent-soft);color:var(--accent);font-size:10px;font-weight:750;letter-spacing:.04em}
   .asset-link{font-weight:650;word-break:break-word}.asset-unavailable{color:var(--muted)}.asset-meta{margin-top:3px;color:var(--muted);font-size:11.5px}
   @media(max-width:820px){.layout{display:block;padding-inline:16px}.conversation-nav{position:static;max-height:none;margin:0 0 24px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}.conversation-nav ol{display:flex;gap:6px;overflow:auto}.conversation-nav li{flex:0 0 min(280px,78vw)}.page-header-inner{padding-inline:18px}.metadata a{margin-inline-start:0}.message-content{padding-inline:14px}.message-header{padding-inline:14px}}
   @media(max-width:520px){body{font-size:15px}.page-header-inner{padding-top:24px}.message{border-radius:12px}.asset-grid{grid-template-columns:1fr}.qa{margin-bottom:28px}.artifact-frame,.message-content iframe{min-height:420px}}
@@ -7359,34 +8855,285 @@
             return plain?.[1] || plain?.[2]?.trim() || '';
         }
 
-        async fetchAssetWithPageFetch(url, signal) {
+        getAssetRouteKey(rawUrl) {
+            let parsed;
+            try { parsed = new URL(this.normalizeAssetCandidateUrl(rawUrl), location.href); } catch { return ''; }
+            if (parsed.origin !== location.origin || !/\/backend-api\//i.test(parsed.pathname)) return '';
+            let path = parsed.pathname;
+            const replacements = [
+                [/\/backend-api\/files\/download\/[^/]+/i, '/backend-api/files/download/:fileId'],
+                [/\/backend-api\/files\/[^/]+\/download/i, '/backend-api/files/:fileId/download'],
+                [/\/backend-api\/files\/[^/]+\/content/i, '/backend-api/files/:fileId/content'],
+                [/\/backend-api\/files\/[^/]+\/(?:signed-url|download-url|metadata)/i, (match) => match.replace(/\/files\/[^/]+\//i, '/files/:fileId/')],
+                [/\/backend-api\/files\/[^/]+/i, '/backend-api/files/:fileId'],
+                [/\/backend-api\/file\/[^/]+\/download/i, '/backend-api/file/:fileId/download'],
+                [/\/backend-api\/conversation\/[^/]+\/(?:files|attachments)\/[^/]+(?:\/download)?/i,
+                    (match) => match.replace(/\/conversation\/[^/]+\//i, '/conversation/:conversationId/').replace(/\/(files|attachments)\/[^/]+/i, '/$1/:fileId')],
+                [/\/backend-api\/artifacts?\/[^/]+(?:\/download)?/i,
+                    (match) => match.replace(/\/artifacts?\/[^/]+/i, (part) => part.startsWith('/artifacts/') ? '/artifacts/:artifactId' : '/artifact/:artifactId')],
+                [/\/backend-api\/(?:canvas|canmore|textdocs|documents)\/[^/]+(?:\/content|\/download)?/i,
+                    (match) => match.replace(/\/(canvas|canmore|textdocs|documents)\/[^/]+/i, '/$1/:artifactId')],
+                [/\/backend-api\/conversation\/[^/]+\/(?:artifacts|canvas)\/[^/]+/i,
+                    (match) => match.replace(/\/conversation\/[^/]+\//i, '/conversation/:conversationId/').replace(/\/(artifacts|canvas)\/[^/]+/i, '/$1/:artifactId')],
+            ];
+            for (const [pattern, replacement] of replacements) {
+                if (pattern.test(path)) {
+                    path = path.replace(pattern, replacement);
+                    return `${parsed.origin}${path}`;
+                }
+            }
+            return '';
+        }
+
+        getAssetRoutePriority(url) {
+            const key = this.getAssetRouteKey(url);
+            if (!key) return 100;
+            const stats = this.assetRouteStats.get(key);
+            if (!stats) return 20;
+            if (stats.successes > 0) return Math.max(0, 4 - Math.min(4, stats.successes));
+            if (stats.blockedUntil > Date.now()) return 1000;
+            return 20 + Math.min(50, stats.consecutiveFailures * 8);
+        }
+
+        isAssetRouteSuppressed(url) {
+            const key = this.getAssetRouteKey(url);
+            if (!key) return false;
+            const stats = this.assetRouteStats.get(key);
+            return Boolean(stats?.blockedUntil && stats.blockedUntil > Date.now());
+        }
+
+        getAssetErrorStatus(error) {
+            const direct = Number(error?.status) || 0;
+            if (direct) return direct;
+            const match = /HTTP\s+(\d{3})/i.exec(String(error?.message || error || ''));
+            return Number(match?.[1]) || 0;
+        }
+
+        recordAssetRouteResult(url, success, error = null, elapsedMs = 0) {
+            const key = this.getAssetRouteKey(url);
+            if (!key) return;
+            const now = Date.now();
+            const stats = this.assetRouteStats.get(key) || {
+                successes: 0,
+                failures: 0,
+                consecutiveFailures: 0,
+                blockedUntil: 0,
+                averageMs: 0,
+            };
+            const elapsed = Math.max(0, Number(elapsedMs) || 0);
+            if (success) {
+                stats.successes += 1;
+                stats.consecutiveFailures = 0;
+                stats.blockedUntil = 0;
+                stats.averageMs = stats.averageMs ? stats.averageMs * 0.7 + elapsed * 0.3 : elapsed;
+            } else {
+                stats.failures += 1;
+                stats.consecutiveFailures += 1;
+                const status = this.getAssetErrorStatus(error);
+                const message = String(error?.message || error || '');
+                const routeUnsupported = [405, 501].includes(status);
+                const authStatus = status === 401;
+                const fileSpecificStatus = [400, 403, 404, 410, 422].includes(status);
+                const timeoutLike = /timeout|超时|network|failed to fetch|连接/i.test(message);
+                const threshold = Math.max(1, Number(this.config.conversationExportRouteTimeoutFailureThreshold) || 2);
+                const mayBlockAfterThreshold = stats.successes === 0 && (fileSpecificStatus || timeoutLike);
+                if (routeUnsupported || authStatus || (mayBlockAfterThreshold && stats.consecutiveFailures >= threshold)) {
+                    const cooldown = Math.max(5000, Number(this.config.conversationExportRouteFailureCooldownMs) || 600000);
+                    stats.blockedUntil = now + (authStatus ? Math.min(cooldown, 60000) : cooldown);
+                }
+            }
+            this.assetRouteStats.set(key, stats);
+        }
+
+        async enterAssetRouteProbe(url, signal) {
+            const key = this.getAssetRouteKey(url);
+            if (!key) return { key: '', owner: false, allowed: true, slot: null };
+            while (true) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                if (this.isAssetRouteSuppressed(url)) return { key, owner: false, allowed: false, slot: null };
+                const stats = this.assetRouteStats.get(key);
+                if (stats?.successes > 0) return { key, owner: false, allowed: true, slot: null };
+                const existing = this.assetRouteProbePromises.get(key);
+                if (!existing) {
+                    let resolve;
+                    const promise = new Promise((done) => { resolve = done; });
+                    const slot = { promise, resolve };
+                    this.assetRouteProbePromises.set(key, slot);
+                    return { key, owner: true, allowed: true, slot };
+                }
+                await new Promise((resolve, reject) => {
+                    const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+                    signal?.addEventListener('abort', onAbort, { once: true });
+                    existing.promise.then(resolve, resolve).finally(() => signal?.removeEventListener('abort', onAbort));
+                    if (signal?.aborted) onAbort();
+                });
+            }
+        }
+
+        finishAssetRouteProbe(probe, outcome = null) {
+            if (!probe?.owner || !probe.key || !probe.slot) return;
+            if (this.assetRouteProbePromises.get(probe.key) === probe.slot) {
+                this.assetRouteProbePromises.delete(probe.key);
+            }
+            try { probe.slot.resolve(outcome); } catch { }
+        }
+
+        getStableAssetUrlKey(rawUrl) {
+            const normalized = this.normalizeAssetCandidateUrl(rawUrl);
+            if (!normalized || this.config.conversationExportStableUrlDedupe === false) return normalized;
+            if (!/^https?:/i.test(normalized)) return normalized;
+            try {
+                const parsed = new URL(normalized, location.href);
+                const volatileNames = /^(?:token|sig|signature|expires?|expiry|policy|key-pair-id|x-amz-.+|x-goog-.+|response-content-disposition|download|auth|jwt)$/i;
+                const hadVolatile = [...parsed.searchParams.keys()].some((key) => volatileNames.test(key));
+                if (!hadVolatile) return parsed.href;
+                for (const key of [...parsed.searchParams.keys()]) {
+                    if (volatileNames.test(key)) parsed.searchParams.delete(key);
+                }
+                parsed.hash = '';
+                return parsed.href;
+            } catch {
+                return normalized;
+            }
+        }
+
+        isUsableDirectAssetUrl(rawUrl) {
+            const url = this.normalizeAssetCandidateUrl(rawUrl);
+            if (!url || /^(?:sandbox|artifact|canvas|canmore|textdoc|document|file-service|sediment):/i.test(url)) return false;
+            if (/^(?:data|blob):/i.test(url)) return true;
+            if (!/^https?:/i.test(url)) return false;
+            try {
+                const parsed = new URL(url, location.href);
+                if (parsed.origin !== location.origin) return true;
+                return /(?:\/download(?:[/?#]|$)|\/files?\/|\/attachments?\/|\/artifacts?\/|\.[a-z0-9]{2,10}(?:[?#]|$))/i.test(parsed.href);
+            } catch {
+                return false;
+            }
+        }
+
+        shouldTryAlternateAssetMethod(error, method, sameOrigin) {
+            if (sameOrigin) return false;
+            const status = this.getAssetErrorStatus(error);
+            if (status) return false;
+            const message = String(error?.message || error || '');
+            if (method === 'gm') {
+                if (this.config.conversationExportCrossOriginFallbackAfterGmFailure === true) return true;
+                return /GM_xmlhttpRequest 不可用|无法识别的二进制类型/i.test(message);
+            }
+            return /Failed to fetch|NetworkError|CORS|Load failed|TypeError/i.test(message);
+        }
+
+        async fetchAssetWithPageFetch(url, signal, options = null) {
+            const normalized = this.normalizeAssetCandidateUrl(url);
             const controller = new AbortController();
-            const timeoutMs = Math.max(2000, Number(this.config.conversationExportAssetTimeoutMs) || 30000);
-            const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+            const connectTimeoutMs = Math.max(1200, Number(this.config.conversationExportAssetHeaderTimeoutMs) || 3800);
+            const idleTimeoutMs = Math.max(connectTimeoutMs, Number(this.config.conversationExportAssetIdleTimeoutMs) || 30000);
+            const hardTimeoutMs = Math.max(idleTimeoutMs, Number(this.config.conversationExportAssetHardTimeoutMs) || 600000);
             const abort = () => controller.abort();
             signal?.addEventListener('abort', abort, { once: true });
+            let connectTimer = 0;
+            let idleTimer = 0;
+            let hardTimer = 0;
+            const clearTimers = () => {
+                window.clearTimeout(connectTimer);
+                window.clearTimeout(idleTimer);
+                window.clearTimeout(hardTimer);
+            };
+            const resetIdleTimer = () => {
+                window.clearTimeout(idleTimer);
+                idleTimer = window.setTimeout(() => controller.abort('idle-timeout'), idleTimeoutMs);
+            };
             try {
-                const response = await fetch(url, {
-                    method: 'GET',
-                    credentials: 'include',
-                    redirect: 'follow',
-                    cache: 'no-store',
-                    signal: controller.signal,
-                });
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const headers = { Accept: '*/*' };
+                let sameOrigin = false;
+                let backendApi = false;
+                try {
+                    const parsed = new URL(normalized, location.href);
+                    sameOrigin = parsed.origin === location.origin;
+                    backendApi = sameOrigin && /\/backend-api\//.test(parsed.pathname);
+                    if (backendApi) {
+                        const token = await this.getSessionAccessToken(signal);
+                        headers['Oai-Device-Id'] = this.getApiDeviceId();
+                        headers['Oai-Language'] = navigator.language || 'zh-CN';
+                        if (token) headers.Authorization = `Bearer ${token}`;
+                        if (this.apiAccountId) headers['ChatGPT-Account-Id'] = this.apiAccountId;
+                    }
+                } catch { }
+
+                connectTimer = window.setTimeout(() => controller.abort('connect-timeout'), connectTimeoutMs);
+                hardTimer = window.setTimeout(() => controller.abort('hard-timeout'), hardTimeoutMs);
+                let response;
+                try {
+                    response = await fetch(normalized, {
+                        method: 'GET',
+                        credentials: sameOrigin ? 'include' : 'omit',
+                        redirect: 'follow',
+                        cache: backendApi ? 'no-store' : 'default',
+                        signal: controller.signal,
+                        headers,
+                    });
+                } catch (error) {
+                    if (controller.signal.aborted && !signal?.aborted) {
+                        const reason = String(controller.signal.reason || '');
+                        throw new Error(reason.includes('connect') ? '附件连接超时' : reason.includes('hard') ? '附件下载超过绝对时间上限' : '附件请求被中断');
+                    }
+                    throw error;
+                }
+                window.clearTimeout(connectTimer);
+                if (!response.ok) {
+                    const error = new Error(`HTTP ${response.status}`);
+                    error.status = response.status;
+                    throw error;
+                }
+                try { options?.onHeaders?.(response); } catch { }
+
                 const declaredSize = Number(response.headers.get('content-length')) || 0;
                 const maxAsset = Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0);
                 if (declaredSize && declaredSize > maxAsset) {
                     throw new Error(`附件超过大小限制（${Math.round(declaredSize / 1024 / 1024)} MiB）`);
                 }
+
+                const contentType = response.headers.get('content-type') || '';
+                let blob;
+                if (response.body && typeof response.body.getReader === 'function') {
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    let loaded = 0;
+                    resetIdleTimer();
+                    try {
+                        while (true) {
+                            let packet;
+                            try { packet = await reader.read(); }
+                            catch (error) {
+                                if (controller.signal.aborted && !signal?.aborted) throw new Error('附件传输长时间没有进展');
+                                throw error;
+                            }
+                            if (packet.done) break;
+                            if (packet.value?.byteLength) {
+                                loaded += packet.value.byteLength;
+                                if (loaded > maxAsset) throw new Error(`附件超过大小限制（>${Math.round(maxAsset / 1024 / 1024)} MiB）`);
+                                chunks.push(packet.value);
+                                resetIdleTimer();
+                            }
+                        }
+                    } finally {
+                        window.clearTimeout(idleTimer);
+                        try { reader.releaseLock?.(); } catch { }
+                    }
+                    blob = new Blob(chunks, { type: contentType || 'application/octet-stream' });
+                } else {
+                    resetIdleTimer();
+                    try { blob = await response.blob(); }
+                    finally { window.clearTimeout(idleTimer); }
+                }
                 return {
-                    blob: await response.blob(),
-                    finalUrl: response.url || url,
-                    contentType: response.headers.get('content-type') || '',
+                    blob,
+                    finalUrl: response.url || normalized,
+                    contentType,
                     contentDisposition: response.headers.get('content-disposition') || '',
                 };
             } finally {
-                window.clearTimeout(timer);
+                clearTimers();
                 signal?.removeEventListener('abort', abort);
             }
         }
@@ -7419,23 +9166,67 @@
             }
             return new Promise((resolve, reject) => {
                 let settled = false;
+                let request = null;
+                let connected = false;
+                let connectTimer = 0;
+                let idleTimer = 0;
+                let hardTimer = 0;
+                const connectTimeoutMs = Math.max(1200, Number(this.config.conversationExportAssetHeaderTimeoutMs) || 3800);
+                const idleTimeoutMs = Math.max(connectTimeoutMs, Number(this.config.conversationExportAssetIdleTimeoutMs) || 30000);
+                const hardTimeoutMs = Math.max(idleTimeoutMs, Number(this.config.conversationExportAssetHardTimeoutMs) || 600000);
+                const clearTimers = () => {
+                    window.clearTimeout(connectTimer);
+                    window.clearTimeout(idleTimer);
+                    window.clearTimeout(hardTimer);
+                };
                 const finish = (callback, value) => {
                     if (settled) return;
                     settled = true;
+                    clearTimers();
                     signal?.removeEventListener('abort', onAbort);
                     callback(value);
                 };
-                const request = GM_xmlhttpRequest({
+                const abortWith = (message) => {
+                    if (settled) return;
+                    const currentRequest = request;
+                    finish(reject, new Error(message));
+                    try { currentRequest?.abort?.(); } catch { }
+                };
+                const markConnected = () => {
+                    if (!connected) {
+                        connected = true;
+                        window.clearTimeout(connectTimer);
+                    }
+                    window.clearTimeout(idleTimer);
+                    idleTimer = window.setTimeout(() => abortWith('附件传输长时间没有进展'), idleTimeoutMs);
+                };
+                const onAbort = () => {
+                    if (settled) return;
+                    const currentRequest = request;
+                    finish(reject, new DOMException('Aborted', 'AbortError'));
+                    try { currentRequest?.abort?.(); } catch { }
+                };
+
+                connectTimer = window.setTimeout(() => abortWith('附件连接超时'), connectTimeoutMs);
+                hardTimer = window.setTimeout(() => abortWith('附件下载超过绝对时间上限'), hardTimeoutMs);
+                request = GM_xmlhttpRequest({
                     method: 'GET',
                     url,
-                    responseType: 'arraybuffer',
-                    timeout: Math.max(2000, Number(this.config.conversationExportAssetTimeoutMs) || 30000),
+                    responseType: this.config.conversationExportGmPreferBlobResponse === false ? 'arraybuffer' : 'blob',
+                    timeout: hardTimeoutMs,
                     anonymous: false,
                     headers: { Accept: '*/*' },
+                    onreadystatechange: (response) => {
+                        if (Number(response?.readyState) >= 2) markConnected();
+                    },
+                    onprogress: () => markConnected(),
                     onload: (response) => {
+                        markConnected();
                         const status = Number(response.status) || 0;
                         if (status && (status < 200 || status >= 300)) {
-                            finish(reject, new Error(`HTTP ${status}`));
+                            const error = new Error(`HTTP ${status}`);
+                            error.status = status;
+                            finish(reject, error);
                             return;
                         }
                         const headers = String(response.responseHeaders || '');
@@ -7453,14 +9244,17 @@
                             finish(reject, error);
                         }
                     },
-                    onerror: (response) => finish(reject, new Error(`跨域附件请求失败${response?.status ? `：HTTP ${response.status}` : ''}`)),
-                    ontimeout: () => finish(reject, new Error('附件下载超时')),
-                    onabort: () => finish(reject, new DOMException('Aborted', 'AbortError')),
+                    onerror: (response) => {
+                        const status = Number(response?.status) || 0;
+                        const error = new Error(`跨域附件请求失败${status ? `：HTTP ${status}` : ''}`);
+                        if (status) error.status = status;
+                        finish(reject, error);
+                    },
+                    ontimeout: () => finish(reject, new Error('附件下载超过绝对时间上限')),
+                    onabort: () => {
+                        if (!settled) finish(reject, new DOMException('Aborted', 'AbortError'));
+                    },
                 });
-                const onAbort = () => {
-                    try { request?.abort?.(); } catch { }
-                    finish(reject, new DOMException('Aborted', 'AbortError'));
-                };
                 signal?.addEventListener('abort', onAbort, { once: true });
                 if (signal?.aborted) onAbort();
             });
@@ -7520,9 +9314,42 @@
             return { ...result, resolvedFilename: dispositionName || urlName || '' };
         }
 
+        sortAssetCandidateUrls(candidates, asset = null) {
+            const unique = [...new Set((candidates || [])
+                .map((value) => this.normalizeAssetCandidateUrl(value))
+                .filter(Boolean))];
+            const directSourceKeys = new Set([
+                asset?.sourceUrl,
+                ...(asset?.alternateUrls || []),
+            ].map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean));
+            const score = (url) => {
+                if (/^data:/i.test(url)) return 0;
+                if (/^blob:/i.test(url)) return 1;
+                const routePriority = this.getAssetRoutePriority(url);
+                const isBackendRoute = Boolean(this.getAssetRouteKey(url));
+                if (directSourceKeys.has(url) && this.isUsableDirectAssetUrl(url)) return 2;
+                if (/^https?:/i.test(url) && !isBackendRoute) {
+                    try {
+                        const parsed = new URL(url, location.href);
+                        const signed = /(?:token|sig|signature|expires?|x-amz-|x-goog-|policy|key-pair-id)/i.test(parsed.search);
+                        const fileLike = /(?:\/download(?:[/?#]|$)|\.[a-z0-9]{2,10}(?:[?#]|$))/i.test(parsed.href);
+                        if (signed || fileLike || parsed.origin !== location.origin) return 3;
+                    } catch { }
+                    return 5;
+                }
+                if (isBackendRoute) return 4 + routePriority;
+                return 100;
+            };
+            return unique.sort((a, b) => score(a) - score(b));
+        }
+
         async fetchBinaryAssetCandidates(candidates, asset, signal, visitedUrls = new Set()) {
             const errors = [];
-            const unique = [...new Set((candidates || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))];
+            const startedAt = performance.now();
+            let attemptCount = 0;
+            const sorted = this.sortAssetCandidateUrls(candidates, asset);
+            const unsuppressed = sorted.filter((url) => !this.isAssetRouteSuppressed(url));
+            const unique = unsuppressed.length ? unsuppressed : sorted.slice(0, 1);
             for (const url of unique) {
                 if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
                 if (visitedUrls.has(url)) continue;
@@ -7532,28 +9359,242 @@
                     continue;
                 }
 
-                try {
-                    const result = await this.fetchAssetWithPageFetch(url, signal);
-                    return await this.unwrapAssetDownloadResponse(result, asset, signal, visitedUrls);
-                } catch (error) {
-                    if (error?.name === 'AbortError') throw error;
-                    errors.push(`${url}: 页面请求 ${error?.message || error}`);
+                const routeProbe = await this.enterAssetRouteProbe(url, signal);
+                if (!routeProbe.allowed) {
+                    errors.push(`${url}: 该附件端点已在本次页面会话中熔断`);
+                    continue;
                 }
+                let routeProbeFinished = false;
+                let sameOrigin = false;
+                let crossOriginHttp = false;
+                let originKey = '';
+                try {
+                    const parsed = new URL(url, location.href);
+                    sameOrigin = parsed.origin === location.origin;
+                    crossOriginHttp = /^https?:$/.test(parsed.protocol) && !sameOrigin;
+                    originKey = parsed.origin;
+                } catch { }
 
-                if (/^https?:/i.test(url)) {
+                const preferGm = crossOriginHttp && this.config.conversationExportCrossOriginPreferGm !== false &&
+                    typeof GM_xmlhttpRequest === 'function';
+                const remembered = originKey ? this.assetFetchMethodPreference.get(originKey) : '';
+                let methods = remembered === 'gm'
+                    ? ['gm']
+                    : remembered === 'page'
+                        ? ['page', ...(sameOrigin ? [] : ['gm'])]
+                        : preferGm
+                            ? ['gm']
+                            : ['page', ...(sameOrigin ? [] : ['gm'])];
+                methods = [...new Set(methods)];
+
+                for (let methodIndex = 0; methodIndex < methods.length; methodIndex += 1) {
+                    const method = methods[methodIndex];
+                    if (method === 'gm' && typeof GM_xmlhttpRequest !== 'function') continue;
+                    const attemptStartedAt = performance.now();
+                    attemptCount += 1;
+                    this.assetFetchAttemptSequence += 1;
                     try {
-                        const result = await this.fetchAssetWithGmRequest(url, signal);
-                        return await this.unwrapAssetDownloadResponse(result, asset, signal, visitedUrls);
+                        const result = method === 'gm'
+                            ? await this.fetchAssetWithGmRequest(url, signal)
+                            : await this.fetchAssetWithPageFetch(url, signal, {
+                                onHeaders: () => {
+                                    if (routeProbe.owner && !routeProbeFinished) {
+                                        this.recordAssetRouteResult(url, true, null, performance.now() - attemptStartedAt);
+                                        this.finishAssetRouteProbe(routeProbe, { success: true, headersOnly: true });
+                                        routeProbeFinished = true;
+                                    }
+                                },
+                            });
+                        const unwrapped = await this.unwrapAssetDownloadResponse(result, asset, signal, visitedUrls);
+                        if (originKey) this.assetFetchMethodPreference.set(originKey, method);
+                        this.recordAssetRouteResult(url, true, null, performance.now() - attemptStartedAt);
+                        this.finishAssetRouteProbe(routeProbe, { success: true });
+                        routeProbeFinished = true;
+                        return {
+                            ...unwrapped,
+                            attemptCount: attemptCount + (Number(unwrapped.attemptCount) || 0),
+                            fetchDurationMs: Math.round(performance.now() - startedAt),
+                            resolvedVia: unwrapped.resolvedVia || method,
+                        };
                     } catch (error) {
-                        if (error?.name === 'AbortError') throw error;
-                        errors.push(`${url}: 跨域请求 ${error?.message || error}`);
+                        if (error?.name === 'AbortError') {
+                            this.finishAssetRouteProbe(routeProbe, { success: false, aborted: true });
+                            routeProbeFinished = true;
+                            throw error;
+                        }
+                        this.recordAssetRouteResult(url, false, error, performance.now() - attemptStartedAt);
+                        errors.push(`${url}: ${method === 'gm' ? '跨域请求' : '页面请求'} ${error?.message || error}`);
+                        if (!this.shouldTryAlternateAssetMethod(error, method, sameOrigin)) break;
                     }
                 }
+                if (!routeProbeFinished) {
+                    this.finishAssetRouteProbe(routeProbe, { success: false });
+                    routeProbeFinished = true;
+                }
             }
-            throw new Error(errors.join('；') || '没有可读取的附件地址');
+            const error = new Error(errors.join('；') || '没有可读取的附件地址');
+            error.attemptCount = attemptCount;
+            error.fetchDurationMs = Math.round(performance.now() - startedAt);
+            throw error;
         }
 
-        async fetchArchiveAsset(asset, signal) {
+        getArtifactEndpointCandidates(artifactId, asset = null) {
+            const id = String(artifactId || '').trim();
+            if (!id) return [];
+            const encoded = encodeURIComponent(id);
+            const conversationId = this.getCurrentConversationId();
+            const signal = `${asset?.kind || ''} ${asset?.captureMethod || ''} ${asset?.mimeType || ''}`.toLowerCase();
+            const artifactPaths = [
+                `/backend-api/artifacts/${encoded}/download`,
+                `/backend-api/artifacts/${encoded}`,
+                `/backend-api/artifact/${encoded}/download`,
+                `/backend-api/artifact/${encoded}`,
+            ];
+            const canvasPaths = [
+                `/backend-api/canvas/${encoded}/download`,
+                `/backend-api/canvas/${encoded}`,
+                `/backend-api/canmore/${encoded}`,
+            ];
+            const documentPaths = [
+                `/backend-api/textdocs/${encoded}/content`,
+                `/backend-api/textdocs/${encoded}`,
+                `/backend-api/documents/${encoded}/content`,
+                `/backend-api/documents/${encoded}`,
+            ];
+            let paths = /canvas|canmore/.test(signal)
+                ? [...canvasPaths, ...artifactPaths, ...documentPaths]
+                : /textdoc|document|markdown|code/.test(signal)
+                    ? [...documentPaths, ...artifactPaths, ...canvasPaths]
+                    : [...artifactPaths, ...canvasPaths, ...documentPaths];
+            if (conversationId) {
+                const conversation = encodeURIComponent(conversationId);
+                paths.push(`/backend-api/conversation/${conversation}/artifacts/${encoded}`);
+                paths.push(`/backend-api/conversation/${conversation}/canvas/${encoded}`);
+            }
+            const urls = [...new Set(paths.map((value) => this.normalizeAssetCandidateUrl(value)))];
+            const limit = Math.max(1, Math.min(12, Number(this.config.conversationExportArtifactEndpointCandidateLimit) || 6));
+            const preferredSet = urls.slice(0, limit);
+            const active = preferredSet.filter((url) => !this.isAssetRouteSuppressed(url));
+            active.sort((a, b) => this.getAssetRoutePriority(a) - this.getAssetRoutePriority(b));
+            return active;
+        }
+
+        async fetchArtifactEndpoint(endpoint, asset, signal) {
+            const startedAt = performance.now();
+            const routeProbe = await this.enterAssetRouteProbe(endpoint, signal);
+            if (!routeProbe.allowed) throw new Error('该 Artifact 端点已在本次页面会话中熔断');
+            let routeProbeFinished = false;
+            try {
+                const result = await this.fetchAssetWithPageFetch(endpoint, signal, {
+                    onHeaders: () => {
+                        if (routeProbe.owner && !routeProbeFinished) {
+                            this.recordAssetRouteResult(endpoint, true, null, performance.now() - startedAt);
+                            this.finishAssetRouteProbe(routeProbe, { success: true, headersOnly: true });
+                            routeProbeFinished = true;
+                        }
+                    },
+                });
+                const contentType = String(result.contentType || result.blob?.type || '').toLowerCase();
+                if (/json/i.test(contentType) && result.blob?.size <= 16 * 1024 * 1024) {
+                    const text = await result.blob.text();
+                    let data;
+                    try { data = JSON.parse(text); } catch { throw new Error('Artifact 端点返回了无效 JSON'); }
+                    const download = this.extractDownloadMetadataFromJson(data);
+                    if (download?.downloadUrl) {
+                        this.recordAssetRouteResult(endpoint, true, null, performance.now() - startedAt);
+                        this.finishAssetRouteProbe(routeProbe, { success: true });
+                        routeProbeFinished = true;
+                        return { ...download, candidates: [download.downloadUrl] };
+                    }
+                    const payload = this.inferArtifactPayload(data, 'artifact endpoint', asset.filenameHint || 'artifact');
+                    if (payload) {
+                        this.recordAssetRouteResult(endpoint, true, null, performance.now() - startedAt);
+                        this.finishAssetRouteProbe(routeProbe, { success: true });
+                        routeProbeFinished = true;
+                        return { blob: payload.blob, filename: payload.filename, mimeType: payload.mimeType, candidates: [] };
+                    }
+                    throw new Error('Artifact JSON 中没有可导出的内容');
+                }
+                if (result.blob?.size) {
+                    this.recordAssetRouteResult(endpoint, true, null, performance.now() - startedAt);
+                    this.finishAssetRouteProbe(routeProbe, { success: true });
+                    routeProbeFinished = true;
+                    return {
+                        blob: result.blob,
+                        filename: this.parseContentDispositionFilename(result.contentDisposition) || asset.filenameHint || '',
+                        mimeType: result.contentType || result.blob.type || '',
+                        candidates: [],
+                    };
+                }
+                throw new Error('Artifact 端点返回空内容');
+            } catch (error) {
+                this.recordAssetRouteResult(endpoint, false, error, performance.now() - startedAt);
+                if (!routeProbeFinished) {
+                    this.finishAssetRouteProbe(routeProbe, { success: false });
+                    routeProbeFinished = true;
+                }
+                throw error;
+            }
+        }
+
+        async resolveArtifactAsset(asset, signal) {
+            const artifactId = String(asset?.artifactId || '').trim();
+            if (!artifactId) return null;
+            if (this.artifactResolutionCache.has(artifactId)) return this.artifactResolutionCache.get(artifactId);
+            const task = (async () => {
+                const endpoints = this.getArtifactEndpointCandidates(artifactId, asset);
+                const batchSize = Math.max(1, Math.min(6, Number(this.config.conversationExportArtifactResolveConcurrency) || 4));
+                const budgetMs = Math.max(2500, Number(this.config.conversationExportArtifactResolveBudgetMs) || 9000);
+                const deadline = performance.now() + budgetMs;
+                const errors = [];
+                for (let offset = 0; offset < endpoints.length && performance.now() < deadline; offset += batchSize) {
+                    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                    const batch = endpoints.slice(offset, offset + batchSize);
+                    const controllers = batch.map(() => new AbortController());
+                    const remaining = Math.max(500, deadline - performance.now());
+                    const budgetTimer = window.setTimeout(() => controllers.forEach((controller) => controller.abort()), remaining);
+                    const abortAll = () => controllers.forEach((controller) => controller.abort());
+                    const parentAbort = () => abortAll();
+                    signal?.addEventListener('abort', parentAbort, { once: true });
+                    try {
+                        const promises = batch.map((endpoint, index) => {
+                            const controller = controllers[index];
+                            return this.fetchArtifactEndpoint(endpoint, asset, controller.signal)
+                                .catch((error) => {
+                                    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                                    const path = (() => { try { return new URL(endpoint, location.href).pathname; } catch { return endpoint; } })();
+                                    throw new Error(`${path}: ${error?.message || error}`);
+                                });
+                        });
+                        try {
+                            const value = await Promise.any(promises);
+                            abortAll();
+                            return value;
+                        } catch (aggregate) {
+                            if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                            for (const error of aggregate?.errors || []) errors.push(error?.message || String(error));
+                        }
+                    } finally {
+                        window.clearTimeout(budgetTimer);
+                        signal?.removeEventListener('abort', parentAbort);
+                        abortAll();
+                    }
+                }
+                if (performance.now() >= deadline) errors.push(`Artifact 路由探测超过 ${Math.round(budgetMs / 1000)} 秒预算`);
+                throw new Error(errors.join('；') || `无法解析 Artifact ${artifactId}`);
+            })();
+            this.artifactResolutionCache.set(artifactId, task);
+            try {
+                const value = await task;
+                this.artifactResolutionCache.set(artifactId, value);
+                return value;
+            } catch (error) {
+                this.artifactResolutionCache.delete(artifactId);
+                throw error;
+            }
+        }
+
+        async fetchArchiveAssetUncached(asset, signal) {
             if (asset?.blob instanceof Blob) {
                 return {
                     blob: asset.blob,
@@ -7561,39 +9602,137 @@
                     contentType: asset.blob.type || asset.mimeType || '',
                     contentDisposition: '',
                     resolvedFilename: asset.filenameHint || '',
+                    attemptCount: 0,
+                    fetchDurationMs: 0,
+                    resolvedVia: 'memory',
                 };
             }
 
-            const candidates = [];
-            let metadata = null;
             const fileId = asset?.fileId || this.extractFileIdFromValue(asset?.sourceUrl);
+            const artifactId = asset?.artifactId || this.extractArtifactIdFromValue(asset?.sourceUrl);
             const errors = [];
+            let metadata = null;
+
+            const directCandidates = [asset?.sourceUrl, ...(asset?.alternateUrls || [])]
+                .filter((value) => this.isUsableDirectAssetUrl(value));
             if (fileId) {
-                try {
-                    metadata = await this.resolveFileDownloadMetadata(fileId, signal);
-                    if (metadata.size > Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0)) {
-                        throw new Error(`附件超过大小限制（${Math.round(metadata.size / 1024 / 1024)} MiB）`);
+                const cachedMetadata = this.fileDownloadMetadataCache.get(String(fileId));
+                if (cachedMetadata && !(cachedMetadata instanceof Promise)) {
+                    metadata = cachedMetadata;
+                    if (metadata?.blob instanceof Blob) {
+                        return {
+                            blob: metadata.blob,
+                            finalUrl: metadata.downloadUrl || asset.sourceUrl || '',
+                            contentType: metadata.mimeType || metadata.blob.type || asset.mimeType || '',
+                            contentDisposition: metadata.contentDisposition || '',
+                            resolvedFilename: metadata.filename || asset.filenameHint || '',
+                            attemptCount: 0,
+                            fetchDurationMs: 0,
+                            resolvedVia: 'metadata-cache',
+                        };
                     }
-                    if (metadata.downloadUrl) candidates.push(metadata.downloadUrl);
-                } catch (error) {
-                    if (error?.name === 'AbortError') throw error;
-                    errors.push(`file_id ${fileId}: ${error?.message || error}`);
+                    if (metadata?.downloadUrl) directCandidates.unshift(metadata.downloadUrl);
                 }
             }
-            candidates.push(asset?.sourceUrl, ...(asset?.alternateUrls || []));
 
-            try {
-                const result = await this.fetchBinaryAssetCandidates(candidates, asset, signal);
-                return {
-                    ...result,
-                    contentType: result.contentType || metadata?.mimeType || asset?.mimeType || result.blob.type || '',
-                    resolvedFilename: result.resolvedFilename || metadata?.filename || asset?.filenameHint || '',
-                };
-            } catch (error) {
-                if (error?.name === 'AbortError') throw error;
-                errors.push(error?.message || String(error));
+            const primaryCandidates = [...directCandidates];
+            if (fileId) primaryCandidates.push(...this.getFileEndpointCandidates(fileId, asset?.sourceUrl));
+            if (primaryCandidates.length) {
+                try {
+                    const result = await this.fetchBinaryAssetCandidates(primaryCandidates, asset, signal);
+                    if (fileId) {
+                        this.fileDownloadMetadataCache.set(String(fileId), {
+                            downloadUrl: result.finalUrl || '',
+                            filename: result.resolvedFilename || asset?.filenameHint || '',
+                            mimeType: result.contentType || result.blob.type || asset?.mimeType || '',
+                            size: result.blob.size,
+                            contentDisposition: result.contentDisposition || '',
+                        });
+                    }
+                    return {
+                        ...result,
+                        contentType: result.contentType || metadata?.mimeType || asset?.mimeType || result.blob.type || '',
+                        resolvedFilename: result.resolvedFilename || metadata?.filename || asset?.filenameHint || '',
+                    };
+                } catch (error) {
+                    if (error?.name === 'AbortError') throw error;
+                    errors.push(error?.message || String(error));
+                }
             }
+
+            // Artifact 端点属于昂贵的猜测性后备。只有直接 URL/file_id 均失败或不存在时才探测，
+            // 避免一个本来可直接下载的资源先等待多批无效 Artifact 路由。
+            if (artifactId) {
+                try {
+                    const resolvedArtifact = await this.resolveArtifactAsset(asset, signal);
+                    if (resolvedArtifact?.blob instanceof Blob) {
+                        return {
+                            blob: resolvedArtifact.blob,
+                            finalUrl: asset.sourceUrl || '',
+                            contentType: resolvedArtifact.mimeType || resolvedArtifact.blob.type || asset.mimeType || '',
+                            contentDisposition: '',
+                            resolvedFilename: resolvedArtifact.filename || asset.filenameHint || '',
+                            attemptCount: 1,
+                            fetchDurationMs: 0,
+                            resolvedVia: 'artifact-endpoint',
+                        };
+                    }
+                    if (resolvedArtifact?.candidates?.length) {
+                        const result = await this.fetchBinaryAssetCandidates(resolvedArtifact.candidates, asset, signal);
+                        return {
+                            ...result,
+                            contentType: result.contentType || resolvedArtifact.mimeType || asset.mimeType || result.blob.type || '',
+                            resolvedFilename: result.resolvedFilename || resolvedArtifact.filename || asset.filenameHint || '',
+                        };
+                    }
+                } catch (error) {
+                    if (error?.name === 'AbortError') throw error;
+                    errors.push(`artifact_id ${artifactId}: ${error?.message || error}`);
+                }
+            }
+
             throw new Error(errors.filter(Boolean).join('；') || '没有可读取的附件地址');
+        }
+
+        async fetchArchiveAsset(asset, signal) {
+            const key = this.getAssetFetchCacheKey(asset);
+            if (!key) return this.fetchArchiveAssetUncached(asset, signal);
+
+            const cached = this.assetBinaryCache.get(key);
+            if (cached) {
+                const value = await cached;
+                return { ...value, cacheHit: true };
+            }
+
+            const failure = this.assetFailureCache.get(key);
+            const failureTtl = Math.max(0, Number(this.config.conversationExportAssetFailureCacheTtlMs) || 0);
+            if (failure && Date.now() - failure.at < failureTtl) {
+                throw new Error(`${failure.message}（近期失败缓存）`);
+            }
+            if (failure) this.assetFailureCache.delete(key);
+
+            const task = this.fetchArchiveAssetUncached(asset, signal);
+            this.assetBinaryCache.set(key, task);
+            try {
+                const value = await task;
+                const itemLimit = Math.max(0, Number(this.config.conversationExportBinaryCacheMaxItemBytes) || 0);
+                const totalLimit = Math.max(0, Number(this.config.conversationExportBinaryCacheMaxBytes) || 0);
+                const size = Number(value?.blob?.size) || 0;
+                if (size && size <= itemLimit && this.assetBinaryCacheBytes + size <= totalLimit) {
+                    this.assetBinaryCache.set(key, value);
+                    this.assetBinaryCacheBytes += size;
+                } else {
+                    this.assetBinaryCache.delete(key);
+                }
+                this.assetFailureCache.delete(key);
+                return value;
+            } catch (error) {
+                this.assetBinaryCache.delete(key);
+                if (error?.name !== 'AbortError') {
+                    this.assetFailureCache.set(key, { at: Date.now(), message: error?.message || String(error) });
+                }
+                throw error;
+            }
         }
 
         ensureAssetFilenameExtension(filename, mimeType) {
@@ -7622,6 +9761,85 @@
             return candidate;
         }
 
+        getAssetFetchCacheKey(asset) {
+            if (!asset) return '';
+            const fileId = String(asset.fileId || this.extractFileIdFromValue(asset.sourceUrl) || '').trim();
+            if (fileId) return `file-id|${fileId}`;
+            const artifactId = String(asset.artifactId || this.extractArtifactIdFromValue(asset.sourceUrl) || '').trim();
+            if (artifactId) return `artifact-id|${artifactId}`;
+            const source = this.getStableAssetUrlKey(asset.sourceUrl || '');
+            if (source) return `${asset.kind || 'asset'}|${source}`;
+            if (asset.blob instanceof Blob) return `blob|${asset.id || asset.filenameHint || asset.label || asset.blob.size}`;
+            return String(asset.id || asset.filenameHint || asset.label || 'asset');
+        }
+
+        getAdaptiveAssetConcurrency() {
+            let value = Math.max(1, Math.min(16, Number(this.config.conversationExportAssetConcurrency) || 10));
+            const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+            if (connection?.saveData) value = Math.min(value, 2);
+            if (/^(?:slow-2g|2g)$/i.test(String(connection?.effectiveType || ''))) value = Math.min(value, 2);
+            else if (/^3g$/i.test(String(connection?.effectiveType || ''))) value = Math.min(value, 5);
+            const memory = Number(navigator.deviceMemory) || 0;
+            if (memory && memory <= 2) value = Math.min(value, 3);
+            else if (memory && memory <= 4) value = Math.min(value, 6);
+            const cores = Number(navigator.hardwareConcurrency) || 0;
+            if (cores && cores <= 4) value = Math.min(value, 6);
+            else if (cores >= 12 && !connection?.saveData && !/^(?:slow-2g|2g|3g)$/i.test(String(connection?.effectiveType || ''))) {
+                value = Math.min(16, Math.max(value, 12));
+            }
+            return Math.max(1, value);
+        }
+
+        async runBoundedAssetWorkers(items, concurrency, worker, signal) {
+            const queue = Array.from(items || []);
+            if (!queue.length) return;
+            let cursor = 0;
+            const workerCount = Math.max(1, Math.min(queue.length, Number(concurrency) || 1));
+            const runners = Array.from({ length: workerCount }, async () => {
+                while (true) {
+                    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                    const index = cursor;
+                    cursor += 1;
+                    if (index >= queue.length) return;
+                    await worker(queue[index], index);
+                }
+            });
+            await Promise.all(runners);
+        }
+
+        updateAssetFetchProgress(label = '', force = false) {
+            const now = performance.now();
+            const interval = Math.max(30, Number(this.config.conversationExportProgressUpdateIntervalMs) || 90);
+            if (!force && now - this.assetProgressLastUiAt < interval) return;
+            this.assetProgressLastUiAt = now;
+            const progress = this.conversationAssetProgress;
+            const elapsedSeconds = this.assetProgressStartedAt
+                ? Math.max(0, (performance.now() - this.assetProgressStartedAt) / 1000)
+                : 0;
+            const sizeMiB = this.assetProgressBytes / 1024 / 1024;
+            const parts = [
+                `正在获取附件 ${progress.completed}/${progress.total}`,
+                this.assetProgressActive ? `并发 ${this.assetProgressActive}` : '',
+                sizeMiB >= 0.05 ? `${sizeMiB.toFixed(sizeMiB >= 10 ? 1 : 2)} MiB` : '',
+                elapsedSeconds >= 1 ? `${elapsedSeconds.toFixed(1)} 秒` : '',
+                progress.failed ? `失败 ${progress.failed}` : '',
+            ].filter(Boolean);
+            if (label) parts.push(label);
+            this.updateConversationArchiveUi(parts.join(' · '));
+        }
+
+        scoreAssetJob(job) {
+            const asset = job?.asset || {};
+            if (asset.blob instanceof Blob) return 0;
+            const source = String(asset.sourceUrl || '');
+            if (/^data:/i.test(source)) return 1;
+            if (/^blob:/i.test(source)) return 2;
+            if (asset.fileId) return 3;
+            if (/^https?:/i.test(source)) return 4;
+            if (asset.artifactId) return 5;
+            return 6;
+        }
+
         getArchiveAssetsForIndices(indices) {
             const entries = [];
             for (const logicalIndex of indices) {
@@ -7645,7 +9863,10 @@
                         kind: asset.kind,
                         sourceUrl: asset.sourceUrl || '',
                         fileId: asset.fileId || '',
+                        artifactId: asset.artifactId || '',
+                        captureMethod: asset.captureMethod || '',
                         included: false,
+                        skipped: true,
                         reason: '用户未勾选“图片和附件”',
                     });
                 }
@@ -7653,27 +9874,53 @@
             }
 
             const entries = this.getArchiveAssetsForIndices(indices);
-            const uniqueJobs = new Map();
+            const fetchEntries = [];
             for (const entry of entries) {
-                const key = entry.asset.fileId
-                    ? `file-id|${entry.asset.fileId}`
-                    : entry.asset.sourceUrl || entry.asset.blob
-                        ? `${entry.asset.kind}|${entry.asset.sourceUrl || entry.asset.id}`
-                        : entry.asset.id;
-                if (!uniqueJobs.has(key)) uniqueJobs.set(key, { ...entry, refs: [] });
+                const decorative = entry.asset?.presentation === 'inline-icon' || entry.asset?.kind === 'inline-icon';
+                if (decorative && this.config.conversationExportIncludeDecorativeIcons !== true) {
+                    manifest.push({
+                        logicalIndex: entry.logicalIndex,
+                        id: entry.asset.id,
+                        label: entry.asset.label,
+                        kind: entry.asset.kind,
+                        presentation: entry.asset.presentation || '',
+                        sourceUrl: entry.asset.sourceUrl || '',
+                        fileId: entry.asset.fileId || '',
+                        artifactId: entry.asset.artifactId || '',
+                        captureMethod: entry.asset.captureMethod || '',
+                        included: false,
+                        skipped: true,
+                        reason: '已跳过装饰性网页图标（可在脚本配置中开启）',
+                    });
+                    continue;
+                }
+                fetchEntries.push(entry);
+            }
+            const uniqueJobs = new Map();
+            for (const entry of fetchEntries) {
+                const key = this.getAssetFetchCacheKey(entry.asset) || entry.asset.id;
+                if (!uniqueJobs.has(key)) uniqueJobs.set(key, { ...entry, key, refs: [] });
                 uniqueJobs.get(key).refs.push(entry);
             }
 
-            this.conversationAssetProgress = { completed: 0, total: uniqueJobs.size, failed: 0 };
+            const jobs = [...uniqueJobs.values()].sort((a, b) => this.scoreAssetJob(a) - this.scoreAssetJob(b));
+            this.conversationAssetProgress = { completed: 0, total: jobs.length, failed: 0 };
+            this.assetProgressActive = 0;
+            this.assetProgressBytes = 0;
+            this.assetProgressStartedAt = performance.now();
+            this.assetProgressLastUiAt = 0;
             const usedPaths = new Set();
             let plannedZipBytes = 0;
             const maxZip = Math.max(1, Number(this.config.conversationExportMaxZipBytes) || 0);
-            for (const job of uniqueJobs.values()) {
+            const concurrency = this.getAdaptiveAssetConcurrency();
+            this.updateAssetFetchProgress(`并发上限 ${concurrency}`, true);
+
+            const processJob = async (job) => {
                 if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
                 const { asset, logicalIndex } = job;
-                this.updateConversationArchiveUi(
-                    `正在获取附件 ${this.conversationAssetProgress.completed + 1}/${this.conversationAssetProgress.total}：${asset.label || asset.filenameHint || '附件'}`,
-                );
+                const label = asset.label || asset.filenameHint || '附件';
+                this.assetProgressActive += 1;
+                this.updateAssetFetchProgress(label);
                 try {
                     const result = await this.fetchArchiveAsset(asset, signal);
                     if (plannedZipBytes + result.blob.size > maxZip) {
@@ -7686,6 +9933,7 @@
                     );
                     const path = this.createUniqueAssetPath(logicalIndex, filename, usedPaths);
                     plannedZipBytes += result.blob.size;
+                    this.assetProgressBytes += result.blob.size;
                     files.push({ path, blob: result.blob, asset, logicalIndex });
                     for (const ref of job.refs) {
                         ref.asset.byteLength = result.blob.size;
@@ -7702,12 +9950,19 @@
                             id: ref.asset.id,
                             label: ref.asset.label,
                             kind: ref.asset.kind,
+                            presentation: ref.asset.presentation || '',
                             sourceUrl: ref.asset.sourceUrl || '',
                             fileId: ref.asset.fileId || '',
+                            artifactId: ref.asset.artifactId || '',
+                            captureMethod: ref.asset.captureMethod || '',
                             included: true,
                             path,
                             size: result.blob.size,
                             mimeType: result.contentType || ref.asset.mimeType || result.blob.type || '',
+                            cacheHit: Boolean(result.cacheHit),
+                            fetchDurationMs: Number(result.fetchDurationMs) || 0,
+                            attemptCount: Number(result.attemptCount) || 0,
+                            resolvedVia: result.resolvedVia || '',
                         });
                     }
                 } catch (error) {
@@ -7719,35 +9974,51 @@
                             id: ref.asset.id,
                             label: ref.asset.label,
                             kind: ref.asset.kind,
+                            presentation: ref.asset.presentation || '',
                             sourceUrl: ref.asset.sourceUrl || '',
                             fileId: ref.asset.fileId || '',
+                            artifactId: ref.asset.artifactId || '',
+                            captureMethod: ref.asset.captureMethod || '',
                             included: false,
                             reason: error?.message || String(error),
+                            fetchDurationMs: Number(error?.fetchDurationMs) || 0,
+                            attemptCount: Number(error?.attemptCount) || 0,
                         });
                     }
                 } finally {
+                    this.assetProgressActive = Math.max(0, this.assetProgressActive - 1);
                     this.conversationAssetProgress.completed += 1;
+                    this.updateAssetFetchProgress('', this.conversationAssetProgress.completed === this.conversationAssetProgress.total);
                 }
-            }
+            };
+
+            await this.runBoundedAssetWorkers(jobs, concurrency, processJob, signal);
+            files.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
+            manifest.sort((a, b) => (a.logicalIndex - b.logicalIndex) || String(a.id).localeCompare(String(b.id)));
             return { tokenPathMap, urlPathMap, files, manifest };
         }
 
         buildZipReadme(assetManifest) {
-            const failures = assetManifest.filter((item) => !item.included);
+            const failures = assetManifest.filter((item) => !item.included && !item.skipped);
+            const skipped = assetManifest.filter((item) => !item.included && item.skipped);
             const lines = [
                 'ChatGPT 对话归档',
                 '',
                 'conversation.md：适合 Markdown 阅读器。',
                 'conversation.html：可直接在浏览器中离线打开。',
                 'assets/：成功获取的图片、文件和 HTML Artifacts。',
-                'manifest.json：每个资源的来源、导出路径和失败原因。',
+                'manifest.json：每个资源的来源、导出路径、缓存命中状态和失败原因。',
                 '',
-                '资源解析会优先使用对话数据中的 file_id 换取临时下载地址，再以页面 DOM 地址作为后备。',
-                'manifest.json 会记录 file_id、来源 URL、归档路径和失败原因。',
+                '资源解析默认只使用结构化对话数据、React 控件属性、DOM、多个文件端点以及已经打开的 Artifact 面板快照。',
+                '全量加载和导出准备不会自动点击文件卡、下载按钮或导出菜单；这是为了避免页面原生下载处理器连续触发浏览器下载。',
+                'manifest.json 会记录 file_id / artifact_id、捕获方式、来源 URL、归档路径和失败原因。',
                 '如果签名链接已过期、账号无权限、文件超过限制，或页面未提供 file_id，附件仍可能无法打包。',
             ];
+            if (skipped.length) {
+                lines.push('', `按配置跳过的资源：${skipped.length} 个（主要为网页图标或用户未选择附件）`);
+            }
             if (failures.length) {
-                lines.push('', `未打包资源：${failures.length} 个`, '');
+                lines.push('', `未能打包资源：${failures.length} 个`, '');
                 for (const item of failures) {
                     lines.push(`- 第 ${item.logicalIndex + 1} 轮 / ${item.label || item.id}: ${item.reason || '未知原因'}`);
                 }
@@ -7818,7 +10089,7 @@
                 }
 
                 const manifest = {
-                    version: 2,
+                    version: 7,
                     generatedAt: new Date().toISOString(),
                     source: location.href,
                     title: this.getConversationExportTitle(),
@@ -7837,7 +10108,7 @@
                 const blob = zip.build();
                 const suffix = selectedOnly ? '-selected' : '-all';
                 this.downloadBlob(blob, `${title}${suffix}-${this.getExportTimestamp()}.zip`);
-                const failedAssets = assetPlan.manifest.filter((item) => !item.included).length;
+                const failedAssets = assetPlan.manifest.filter((item) => !item.included && !item.skipped).length;
                 completionMessage = failedAssets
                     ? `ZIP 已导出；${failedAssets} 个资源未能打包，详见 manifest`
                     : `ZIP 已导出：${uniqueIndices.length} 轮，附件 ${assetPlan.files.length} 个`;
