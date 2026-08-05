@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      3.7.0
-// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持严格校验原始生成文件、图片、附件与 Artifacts 的离线归档，并保证导出 HTML/Markdown 使用可移植的本地附件链接，且不同文本附件不会错误复用同一二进制内容
+// @version      3.8.0
+// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持严格校验原始生成文件、图片、附件与 Artifacts 的离线归档，并保证导出 HTML/Markdown 使用可移植的本地附件链接，且采用可信资源清单消除虚假附件、重复计数与无效获取任务
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -110,6 +110,12 @@
         // 网页来源 favicon、站点图标、头像等装饰性小图默认不打包。
         // 它们往往占附件候选的大多数，但对离线阅读价值很低；关闭可显著缩短获取阶段。
         conversationExportIncludeDecorativeIcons: false,
+
+        // 资源清单只统计可确认的真实文件、内容图片和 Artifact。
+        // 没有 URL / file_id / artifact_id / Blob 的纯按钮占位符，以及普通网页来源、搜索引用、
+        // favicon 和无法与真实资源对账的 sandbox 占位符，不再计入附件数量，也不进入下载队列。
+        conversationExportUseCanonicalAssetInventory: true,
+        conversationExportSkipUnconfirmedAssetCandidates: true,
 
         // 优先读取当前对话的结构化数据，解析 image_asset_pointer、attachments、citations
         // 与 file_id，再通过 /backend-api/files/download/{file_id} 获取临时下载地址。
@@ -5293,7 +5299,7 @@
                     const checkbox = document.createElement('input');
                     const exportButton = buildPromptButton(conversation, index);
                     const archive = this.conversationArchive.get(conversation.logicalIndex);
-                    const assetCount = Array.isArray(archive?.assets) ? archive.assets.length : 0;
+                    const assetCount = this.countArchiveExportableAssets(archive);
 
                     exportRow.className = 'conversation-row';
                     exportRow.dataset.selectable = 'true';
@@ -5311,7 +5317,7 @@
                         const badge = document.createElement('span');
                         badge.className = 'export-asset-count';
                         badge.textContent = `附件 ${assetCount}`;
-                        badge.title = `已发现 ${assetCount} 个图片、附件或 Artifact 资源`;
+                        badge.title = `已确认 ${assetCount} 个可导出的实际资源；已排除网页来源、图标、纯按钮占位和重复引用`;
                         exportButton.appendChild(badge);
                     }
 
@@ -6359,10 +6365,16 @@
             const addStringReferences = (rawValue, keyHint = '', context = {}) => {
                 const raw = String(rawValue || '').trim();
                 if (!raw) return;
-                const fileId = this.extractFileIdFromValue(raw, keyHint);
-                const artifactId = this.extractArtifactIdFromValue(raw, keyHint);
-                const urls = this.extractUrlLikeValues(raw);
                 const keySignal = String(keyHint || '').toLowerCase();
+                const preciseFileField = /(?:^|[.\s_-])(?:original|source|upload)?[_-]?(?:file|attachment|asset)[_-]?(?:id|key|pointer)(?:$|[.\s_-])/i.test(keySignal);
+                const preciseArtifactField = /(?:^|[.\s_-])(?:artifact|canvas|canmore|textdoc|document)[_-]?(?:id|key|pointer)(?:$|[.\s_-])/i.test(keySignal);
+                const internalFilePointer = /^(?:file-service|sediment):\/\//i.test(raw) || /\/backend-api\/(?:files?|file)\//i.test(raw);
+                const internalArtifactPointer = /^(?:artifact|canvas|canmore|textdoc|document):\/\//i.test(raw) || /\/backend-api\/(?:artifacts?|canvas|canmore|textdocs?|documents?)\//i.test(raw);
+                // 不再从普通回答文本或普通元数据字符串中抓取任意 file-xxxx / artifact-xxxx。
+                // 只有明确的 ID 字段或内部资源指针才允许产生裸 ID 资源。
+                const fileId = (preciseFileField || internalFilePointer) ? this.extractFileIdFromValue(raw, keyHint) : '';
+                const artifactId = (preciseArtifactField || internalArtifactPointer) ? this.extractArtifactIdFromValue(raw, keyHint) : '';
+                const urls = this.extractUrlLikeValues(raw);
                 if (fileId || artifactId) {
                     add({
                         fileId,
@@ -6379,6 +6391,10 @@
                 }
                 if (urls.length) {
                     for (const foundUrl of urls) {
+                        const freeFormContent = /\bcontent\b.*(?:^|[.\s])parts(?:$|[.\s])/i.test(keySignal) || /(?:^|[.\s])content\.parts(?:$|[.\s])/i.test(keySignal) || /^content parts/i.test(keySignal);
+                        const ordinaryPublicUrl = /^https?:/i.test(foundUrl) &&
+                            !/(?:\/backend-api\/(?:files?|file|artifacts?|canvas|canmore|textdocs?|documents?)\/|oaiusercontent|oaistatic|\/download(?:[/?#]|$)|[?&](?:download|response-content-disposition)=)/i.test(foundUrl);
+                        if (freeFormContent && ordinaryPublicUrl) continue;
                         if (!this.isLikelyDownloadableAssetReference({
                             url: foundUrl,
                             keySignal,
@@ -6496,8 +6512,33 @@
                     const signal = `${collectionName} ${item.type || ''} ${item.kind || ''} ${item.content_type || ''}`;
                     const payload = this.inferArtifactPayload(item, signal, `${collectionName}-${sequence + 1}`) ||
                         this.inferArtifactPayload(metadata, signal, `${collectionName}-${sequence + 1}`);
-                    const genericFileId = /^(?:attachments|files|generated_files|assets)$/.test(collectionName) ? item.id : '';
-                    const genericArtifactId = collectionName === 'artifacts' ? item.id : '';
+                    const explicitFileEvidence = Boolean(
+                        item.file_id || item.fileId || item.original_file_id || item.originalFileId || item.source_file_id ||
+                        item.sourceFileId || item.upload_id || item.uploadId || item.asset_pointer || item.download_url ||
+                        item.downloadUrl || item.signed_url || item.signedUrl || item.original_url || item.originalUrl ||
+                        item.file_url || item.fileUrl || item.sandbox_path || metadata.file_id || metadata.fileId ||
+                        metadata.original_file_id || metadata.source_file_id || metadata.upload_id || metadata.asset_pointer ||
+                        metadata.download_url || metadata.downloadUrl || metadata.signed_url || metadata.original_url ||
+                        metadata.file_url || metadata.sandbox_path
+                    );
+                    const concreteFileMetadata = Boolean(
+                        item.file_name || item.filename || item.mime_type || item.media_type || item.size || item.byte_size ||
+                        metadata.file_name || metadata.filename || metadata.mime_type || metadata.media_type || metadata.size || metadata.byte_size
+                    );
+                    const publicReferenceCollection = /^(?:citations|content_references)$/.test(collectionName);
+                    // 普通网页 citation / 搜索来源即使 URL 以 .pdf/.png 结尾，也不是 ChatGPT 对话附件。
+                    // 只有它明确携带 file_id、sandbox/download 字段或内联 Artifact 内容时才纳入。
+                    if (publicReferenceCollection && !explicitFileEvidence && !payload) continue;
+                    const rawGenericFileId = /^(?:attachments|files|generated_files|assets)$/.test(collectionName) ? String(item.id || '') : '';
+                    const genericFileId = rawGenericFileId && (
+                        /^file[-_][a-z0-9_-]{6,}$/i.test(rawGenericFileId) || explicitFileEvidence || concreteFileMetadata
+                    ) ? rawGenericFileId : '';
+                    const rawGenericArtifactId = collectionName === 'artifacts' ? String(item.id || '') : '';
+                    const genericArtifactId = rawGenericArtifactId && (
+                        /^(?:artifact|canvas|canmore|textdoc|document)[-_][a-z0-9_-]{6,}$/i.test(rawGenericArtifactId) ||
+                        payload || item.artifact_id || item.canvas_id || item.textdoc_id || item.content_url || item.download_url
+                    ) ? rawGenericArtifactId : '';
+                    if (!explicitFileEvidence && !genericFileId && !genericArtifactId && !payload && publicReferenceCollection) continue;
                     add({
                         fileId: item.original_file_id || item.originalFileId || item.source_file_id || item.sourceFileId || item.upload_id ||
                             item.file_id || item.fileId || metadata.original_file_id || metadata.source_file_id || metadata.upload_id || metadata.file_id || metadata.fileId || genericFileId || '',
@@ -6550,18 +6591,30 @@
                 const filename = value.file_name || value.filename || value.name || value.title || '';
                 const mimeType = value.mime_type || value.media_type || (typeof value.content_type === 'string' && value.content_type.includes('/') ? value.content_type : '') || '';
                 const originalFileId = value.original_file_id || value.originalFileId || value.source_file_id || value.sourceFileId || value.upload_id || value.uploadId || '';
-                const fileIds = [originalFileId, value.file_id, value.fileId, value.asset_pointer,
-                    (/(?:attachment|file|asset|image|generated[_ -]?file)/i.test(signal) && !/(?:citation|content[_ -]?reference|search[_ -]?result)/i.test(signal) ? value.id : '')].filter(Boolean);
+                const referenceOnlySubtree = /(?:citations?|content[_ -]?references?|search[_ -]?results?|web[_ -]?(?:sources?|pages?)|source[_ -]?attributions?)/i.test(keyPath);
+                const concreteFileMetadata = Boolean(
+                    filename || mimeType || value.size || value.byte_size || value.bytes || value.content_length ||
+                    value.download_url || value.downloadUrl || value.signed_url || value.signedUrl || value.original_url ||
+                    value.originalUrl || value.file_url || value.fileUrl || value.sandbox_path || value.asset_pointer
+                );
+                const genericValueFileId = (!referenceOnlySubtree && /(?:^|[.\s_-])(?:attachments?|files?|generated[_ -]?files?|assets?)(?:$|[.\s_-])/i.test(signal) &&
+                    concreteFileMetadata) ? value.id : '';
+                const fileIds = [originalFileId, value.file_id, value.fileId, value.asset_pointer, genericValueFileId].filter(Boolean);
                 const fileId = fileIds[0] || '';
-                const artifactId = value.artifact_id || value.artifactId || value.canvas_id || value.canvasId ||
-                    value.canmore_id || value.textdoc_id || value.document_id ||
-                    (/(?:artifact|canvas|canmore|textdoc|writing[_ -]?block)/i.test(signal) ? value.id : '') || '';
+                const explicitArtifactId = value.artifact_id || value.artifactId || value.canvas_id || value.canvasId ||
+                    value.canmore_id || value.textdoc_id || value.document_id || '';
+                const genericValueArtifactId = (!referenceOnlySubtree && /(?:artifact|canvas|canmore|textdoc|writing[_ -]?block)/i.test(signal) &&
+                    (concreteFileMetadata || this.inferArtifactPayload(value, signal, filename || `artifact-${sequence + 1}`))) ? value.id : '';
+                const artifactId = explicitArtifactId || genericValueArtifactId || '';
                 const originalUrls = [value.download_url, value.downloadUrl, value.signed_url, value.signedUrl,
                 value.original_url, value.originalUrl, value.file_url, value.fileUrl].filter(Boolean);
                 const previewUrls = [value.preview_url, value.previewUrl, value.thumbnail_url, value.thumbnailUrl,
                 value.preview, value.thumbnail, value.src, value.url, value.href].filter((item) => typeof item === 'string');
                 const url = originalUrls[0] || value.content_url || value.contentUrl || value.url || value.href || value.src || value.sandbox_path || value.path || '';
                 const payload = this.inferArtifactPayload(value, signal, filename || `artifact-${sequence + 1}`);
+                const internalOrDownloadUrl = /^(?:sandbox|file-service|sediment|artifact|canvas|canmore|textdoc|document):/i.test(String(url || '')) ||
+                    /(?:\/backend-api\/(?:files?|file|artifacts?|canvas|canmore|textdocs?|documents?)\/|\/download(?:[/?#]|$))/i.test(String(url || ''));
+                if (referenceOnlySubtree && !fileId && !artifactId && !payload && !internalOrDownloadUrl) return;
                 if (fileId || artifactId || url || payload) {
                     add({
                         fileId,
@@ -7934,6 +7987,21 @@
             for (const anchor of root.querySelectorAll('a[href]')) {
                 const url = this.normalizeAssetCandidateUrl(anchor.getAttribute('href') || anchor.href);
                 if (!url || !this.isLikelyDownloadAssetLink(anchor, url)) continue;
+                const anchorSignal = [
+                    anchor.getAttribute('download'), anchor.getAttribute('aria-label'), anchor.getAttribute('title'),
+                    anchor.getAttribute('data-testid'), anchor.className, anchor.textContent, anchor.getAttribute('href'),
+                ].filter(Boolean).join(' ');
+                const explicitAttachmentLink = anchor.hasAttribute('download') ||
+                    /^(?:sandbox|blob|data|file-service|sediment|artifact|canvas|canmore|textdoc|document):/i.test(url) ||
+                    /(?:下载|附件|生成的?文件|download|attachment|generated[-_ ]?file)/i.test(anchorSignal) ||
+                    /(?:\/backend-api\/(?:files?|file|artifacts?|canvas|canmore|textdocs?|documents?)\/|oaiusercontent|oaistatic|\/download(?:[/?#]|$)|[?&](?:download|response-content-disposition)=)/i.test(url);
+                let ordinaryExternalReference = false;
+                try {
+                    const parsed = new URL(url, location.href);
+                    ordinaryExternalReference = /^https?:$/.test(parsed.protocol) && parsed.origin !== location.origin && !explicitAttachmentLink;
+                } catch { }
+                const citationContainer = anchor.closest('[data-testid*="citation" i],[data-testid*="source" i],[class*="citation" i],[class*="source" i],[aria-label*="来源" i],[aria-label*="citation" i]');
+                if (ordinaryExternalReference || citationContainer) continue;
                 addCandidate(anchor, {
                     kind: /\.html?(?:$|[?#])/i.test(url) || /artifact|canvas/i.test(this.getInteractiveControlSignal(anchor)) ? 'artifact-html' : 'file',
                     url, alternateUrls: this.getElementUrlAlternates(anchor, url),
@@ -8070,6 +8138,14 @@
                 }
                 const fileId = candidate.fileId || this.extractFileIdFromValue(sourceUrl);
                 const artifactId = candidate.artifactId || this.extractArtifactIdFromValue(sourceUrl);
+                const hasConcreteResource = Boolean(
+                    inlineBlob instanceof Blob || fileId || artifactId ||
+                    (sourceUrl && (this.isUsableDirectAssetUrl(sourceUrl) || /^sandbox:/i.test(sourceUrl)))
+                );
+                // 被动模式中，纯“下载/文件/Artifact”按钮没有任何资源身份。旧版把每个这样的
+                // 控件都当成一个附件，既抬高数量，又产生必然失败的获取任务。React 属性扫描如果
+                // 能补出 file_id / URL，会在到达这里之前把它变成真实资源；否则直接忽略。
+                if (!hasConcreteResource) continue;
                 const key = fileId ? `file|${fileId}`
                     : artifactId ? `artifact|${artifactId}`
                         : sourceUrl ? `${candidate.kind}|${sourceUrl}`
@@ -8627,7 +8703,8 @@
                 await this.enrichConversationArchivesWithApiAssets(indices, null).catch((error) => {
                     console.warn('[ChatGPT 导航与导出] 刷新附件元数据失败：', error);
                 });
-                this.updateConversationArchiveUi(`已加载 ${this.conversationArchive.size} 轮；附件信息已刷新`);
+                const confirmedAssetCount = indices.reduce((total, index) => total + this.countArchiveExportableAssets(this.conversationArchive.get(index)), 0);
+                this.updateConversationArchiveUi(`已加载 ${this.conversationArchive.size} 轮；确认附件 ${confirmedAssetCount} 个`);
             }
         }
 
@@ -8951,14 +9028,16 @@
         }
 
         buildArchiveAssetMarkdown(archive, assetPathMap = new Map(), referencePathMap = new Map()) {
-            const assets = Array.isArray(archive?.assets) ? archive.assets : [];
-            if (!assets.length) return '';
+            const groups = this.getCanonicalArchiveAssetGroupsForArchive(archive);
+            if (!groups.length) return '';
             const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
             const lines = ['#### 图片、附件与 Artifacts', ''];
             const seen = new Set();
-            for (const asset of assets) {
-                const localPath = assetPathMap.get(asset.id) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap);
-                const reference = localPath ? this.toArchiveLocalReference(localPath) : this.getPortableAssetFallbackReference(asset);
+            for (const group of groups) {
+                const asset = group.asset;
+                const localPath = group.refs.map((ref) => assetPathMap.get(ref.asset.id) || this.resolveArchiveAssetPath(ref.asset, logicalIndex, referencePathMap)).find(Boolean) || '';
+                const fallbackAsset = group.refs.map((ref) => ref.asset).find((candidate) => this.getPortableAssetFallbackReference(candidate)) || asset;
+                const reference = localPath ? this.toArchiveLocalReference(localPath) : this.getPortableAssetFallbackReference(fallbackAsset);
                 const dedupeKey = localPath ? `local:${localPath}` : reference ? `reference:${reference}` : `asset:${asset.id}`;
                 if (seen.has(dedupeKey)) continue;
                 seen.add(dedupeKey);
@@ -9157,14 +9236,15 @@
         }
 
         buildArchiveAssetHtml(archive, assetPathMap, referencePathMap = new Map()) {
-            const assets = (Array.isArray(archive?.assets) ? archive.assets : [])
-                .filter((asset) => asset?.presentation !== 'inline-icon' && asset?.kind !== 'inline-icon');
-            if (!assets.length) return '';
+            const groups = this.getCanonicalArchiveAssetGroupsForArchive(archive);
+            if (!groups.length) return '';
             const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
             const seen = new Set();
-            const cards = assets.map((asset) => {
-                const localPath = assetPathMap.get(asset.id) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap);
-                const reference = localPath ? this.toArchiveLocalReference(localPath) : this.getPortableAssetFallbackReference(asset);
+            const cards = groups.map((group) => {
+                const asset = group.asset;
+                const localPath = group.refs.map((ref) => assetPathMap.get(ref.asset.id) || this.resolveArchiveAssetPath(ref.asset, logicalIndex, referencePathMap)).find(Boolean) || '';
+                const fallbackAsset = group.refs.map((ref) => ref.asset).find((candidate) => this.getPortableAssetFallbackReference(candidate)) || asset;
+                const reference = localPath ? this.toArchiveLocalReference(localPath) : this.getPortableAssetFallbackReference(fallbackAsset);
                 const dedupeKey = localPath ? `local:${localPath}` : reference ? `reference:${reference}` : `asset:${asset.id}`;
                 if (seen.has(dedupeKey)) return '';
                 seen.add(dedupeKey);
@@ -10649,6 +10729,231 @@
             return 6;
         }
 
+        getArchiveAssetCategory(asset) {
+            const kind = String(asset?.kind || '').toLowerCase();
+            const mime = String(asset?.originalMimeType || asset?.mimeType || asset?.blob?.type || '').toLowerCase();
+            if (/artifact|canvas|canmore|textdoc|html/.test(kind) || /text\/html/.test(mime)) return 'artifact';
+            if (/image|svg/.test(kind) || /^image\//.test(mime)) return 'image';
+            return 'file';
+        }
+
+        getAssetAliasNames(asset) {
+            const values = [asset?.originalFilename, asset?.resolvedFilename, asset?.filenameHint];
+            for (const url of [asset?.sourceUrl, ...(asset?.alternateUrls || []), ...(asset?.originalUrls || []), ...(asset?.previewUrls || [])]) {
+                const basename = this.getArchiveReferenceBasename(url || '');
+                if (basename) values.push(basename);
+            }
+            const label = String(asset?.label || '').trim();
+            if (/\.[a-z0-9]{1,12}$/i.test(label)) values.push(label);
+            return [...new Set(values
+                .map((value) => this.normalizeAssetMatchFilename(value || ''))
+                // 带明确扩展名的精确文件名即使叫 file-1.txt / attachment.pdf 也可作为别名。
+                // 只有该名称在当前轮次只对应一个真实资源时才会合并，因此不会把同名不同文件折叠。
+                .filter((value) => value && (!this.isGenericAssetMatchFilename(value) || /\.[a-z0-9]{1,12}$/i.test(value))))];
+        }
+
+        hasConcreteAssetMetadata(asset) {
+            if (!asset) return false;
+            const filename = this.normalizeAssetMatchFilename(asset.originalFilename || asset.filenameHint || '');
+            const mime = String(asset.originalMimeType || asset.mimeType || '').split(';')[0].trim().toLowerCase();
+            return Boolean(
+                (filename && !this.isGenericAssetMatchFilename(filename)) ||
+                (mime && mime !== 'application/octet-stream' && mime !== 'text/html') ||
+                Number(asset.expectedSize) > 0
+            );
+        }
+
+        isArchiveAssetReferenceCandidate(asset) {
+            if (!asset) return false;
+            const decorative = asset.presentation === 'inline-icon' || asset.kind === 'inline-icon';
+            if (decorative && this.config.conversationExportIncludeDecorativeIcons !== true) return false;
+            const source = this.normalizeAssetCandidateUrl(asset.sourceUrl || '');
+            const hasBlob = asset.blob instanceof Blob && asset.blob.size > 0;
+            const hasIdentity = Boolean(asset.originalFileId || asset.fileId || (asset.fileIdCandidates || []).length || asset.artifactId);
+            const hasReference = Boolean(source || (asset.alternateUrls || []).some(Boolean) || (asset.originalUrls || []).some(Boolean));
+            if (!hasBlob && !hasIdentity && !hasReference) return false;
+            if ((asset.kind === 'file-control' || asset.captureMethod === 'dom-control') && !hasBlob && !hasIdentity && !source) return false;
+            // 普通网页 citation / 搜索来源不属于附件；API collector 已经尽量过滤，这里再做防御。
+            const signal = `${asset.captureMethod || ''} ${asset.kind || ''} ${asset.label || ''} ${source}`;
+            if (/citation|content[_ -]?reference|search[_ -]?result|web[_ -]?(?:source|page)/i.test(signal) &&
+                !hasIdentity && !hasBlob && !this.isExplicitOriginalAssetUrl(source, asset)) return false;
+            return true;
+        }
+
+        isArchiveAssetFetchableCandidate(asset) {
+            if (!this.isArchiveAssetReferenceCandidate(asset)) return false;
+            if (asset.blob instanceof Blob && asset.blob.size > 0) return true;
+            const ids = this.getAssetStrongFileIds(asset);
+            const explicitFileId = [...ids].some((value) => /^file[-_][a-z0-9_-]{6,}$/i.test(String(value || '')));
+            if (ids.size) {
+                if (explicitFileId || asset.originalFileId || this.hasConcreteAssetMetadata(asset)) return true;
+                // 递归扫描得到的无文件名、无 MIME、无大小的紧凑 ID 极易是内部 UI/引用 ID。
+                if (!/conversation-api-recursive/i.test(asset.captureMethod || '')) return true;
+                return false;
+            }
+            if (asset.artifactId) {
+                const explicitArtifactId = /^(?:artifact|canvas|canmore|textdoc|document)[-_][a-z0-9_-]{6,}$/i.test(String(asset.artifactId));
+                return explicitArtifactId || this.hasConcreteAssetMetadata(asset) ||
+                    /inline|tool|iframe|canvas|svg|artifact-panel/i.test(asset.captureMethod || '') ||
+                    (asset.apiDerived && !/recursive/i.test(asset.captureMethod || '') && /artifact|canvas|canmore|textdoc/i.test(asset.kind || ''));
+            }
+            const candidates = [asset.sourceUrl, ...(asset.originalUrls || []), ...(asset.alternateUrls || [])]
+                .map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean);
+            return candidates.some((url) => {
+                if (/^(?:data|blob):/i.test(url)) return true;
+                if (/^sandbox:/i.test(url)) return false; // 单独的 sandbox 占位符不可下载，只能作为 API 原件的别名。
+                return this.isUsableDirectAssetUrl(url) && (
+                    this.isExplicitOriginalAssetUrl(url, asset) ||
+                    /(?:\/download(?:[/?#]|$)|\/backend-api\/(?:files?|file|artifacts?|canvas|canmore|textdocs?|documents?)\/)/i.test(url) ||
+                    /\.(?:7z|aac|avi|bmp|csv|docx?|epub|gif|gz|html?|jpe?g|json|m4a|md|mov|mp3|mp4|odp|ods|odt|ogg|pdf|png|pptx?|py|rar|rtf|svg|tar|tiff?|tsv|txt|wav|webm|webp|xlsx?|xml|ya?ml|zip)(?:$|[?#])/i.test(url) ||
+                    /image|audio|video|artifact|canvas|svg/i.test(asset.kind || '')
+                );
+            });
+        }
+
+        scoreCanonicalAssetRepresentative(asset) {
+            if (!asset) return -1;
+            let score = 0;
+            if (asset.blob instanceof Blob && asset.blob.size > 0) score += 120;
+            if (asset.originalFileId) score += 110;
+            if (asset.fileId) score += 95;
+            if ((asset.fileIdCandidates || []).length) score += 85;
+            if (asset.artifactId) score += 80;
+            if ((asset.originalUrls || []).length) score += 55;
+            if (this.isExplicitOriginalAssetUrl(asset.sourceUrl || '', asset)) score += 45;
+            if (asset.apiDerived) score += 30;
+            if (this.hasConcreteAssetMetadata(asset)) score += 25;
+            if (/inline|tool|iframe|canvas|svg/i.test(asset.captureMethod || '')) score += 20;
+            if (/recursive/i.test(asset.captureMethod || '')) score -= 20;
+            if (asset.kind === 'file-control' || asset.captureMethod === 'dom-control') score -= 35;
+            return score;
+        }
+
+        aggregateCanonicalAssetGroup(refs) {
+            const sorted = [...refs].sort((a, b) => this.scoreCanonicalAssetRepresentative(b.asset) - this.scoreCanonicalAssetRepresentative(a.asset));
+            const primaryEntry = sorted[0];
+            const aggregate = { ...primaryEntry.asset };
+            aggregate.fileIdCandidates = [...new Set(sorted.flatMap((entry) => [
+                entry.asset.originalFileId || '', entry.asset.fileId || '', ...(entry.asset.fileIdCandidates || []),
+            ]).filter(Boolean))];
+            aggregate.originalUrls = [...new Set(sorted.flatMap((entry) => entry.asset.originalUrls || []).filter(Boolean))];
+            aggregate.alternateUrls = [...new Set(sorted.flatMap((entry) => [entry.asset.sourceUrl || '', ...(entry.asset.alternateUrls || [])]).filter(Boolean))];
+            aggregate.previewUrls = [...new Set(sorted.flatMap((entry) => entry.asset.previewUrls || []).filter(Boolean))];
+            if (!aggregate.originalFileId) aggregate.originalFileId = sorted.find((entry) => entry.asset.originalFileId)?.asset.originalFileId || '';
+            if (!aggregate.fileId) aggregate.fileId = sorted.find((entry) => entry.asset.fileId)?.asset.fileId || aggregate.fileIdCandidates[0] || '';
+            if (!aggregate.artifactId) aggregate.artifactId = sorted.find((entry) => entry.asset.artifactId)?.asset.artifactId || '';
+            if (!(aggregate.blob instanceof Blob)) aggregate.blob = sorted.find((entry) => entry.asset.blob instanceof Blob)?.asset.blob || null;
+            if (!aggregate.sourceUrl || /^sandbox:/i.test(aggregate.sourceUrl)) {
+                aggregate.sourceUrl = sorted.flatMap((entry) => [entry.asset.sourceUrl, ...(entry.asset.originalUrls || []), ...(entry.asset.alternateUrls || [])])
+                    .find((url) => url && !/^sandbox:/i.test(url)) || aggregate.sourceUrl || '';
+            }
+            for (const field of ['originalFilename', 'filenameHint', 'originalMimeType', 'mimeType', 'label']) {
+                if (!aggregate[field] || this.isGenericAssetMatchFilename(aggregate[field])) {
+                    const found = sorted.map((entry) => entry.asset[field]).find((value) => value && !this.isGenericAssetMatchFilename(value));
+                    if (found) aggregate[field] = found;
+                }
+            }
+            if (!Number(aggregate.expectedSize)) aggregate.expectedSize = Number(sorted.find((entry) => Number(entry.asset.expectedSize) > 0)?.asset.expectedSize) || 0;
+            aggregate.referenceIds = [...new Set(sorted.map((entry) => entry.asset.id).filter(Boolean))];
+            aggregate.canonicalReferenceCount = sorted.length;
+            return { asset: aggregate, refs: sorted, logicalIndex: primaryEntry.logicalIndex, archive: primaryEntry.archive };
+        }
+
+        buildCanonicalArchiveAssetGroups(entries) {
+            const list = (entries || []).filter((entry) => this.isArchiveAssetReferenceCandidate(entry?.asset));
+            if (!list.length) return [];
+            const parent = list.map((_, index) => index);
+            const find = (index) => {
+                let root = index;
+                while (parent[root] !== root) root = parent[root];
+                while (parent[index] !== index) { const next = parent[index]; parent[index] = root; index = next; }
+                return root;
+            };
+            const union = (a, b) => {
+                const ra = find(a), rb = find(b);
+                if (ra !== rb) parent[rb] = ra;
+            };
+
+            // 强身份：相同 file_id / artifact_id / 原始 URL / Blob。
+            // 使用索引表而不是两两比较，避免长对话中候选很多时产生 O(n²) 清单整理开销。
+            const strongKeyOwner = new Map();
+            const blobOwner = new WeakMap();
+            const registerStrongKey = (key, index) => {
+                if (!key) return;
+                if (strongKeyOwner.has(key)) union(strongKeyOwner.get(key), index);
+                else strongKeyOwner.set(key, index);
+            };
+            for (let index = 0; index < list.length; index += 1) {
+                const asset = list[index].asset;
+                for (const id of this.getAssetStrongFileIds(asset)) registerStrongKey(`file:${id}`, index);
+                if (asset.artifactId) registerStrongKey(`artifact:${String(asset.artifactId).trim()}`, index);
+                for (const url of this.getAssetStrongUrls(asset)) registerStrongKey(`url:${url}`, index);
+                if (asset.blob instanceof Blob) {
+                    if (blobOwner.has(asset.blob)) union(blobOwner.get(asset.blob), index);
+                    else blobOwner.set(asset.blob, index);
+                }
+            }
+
+            // 弱别名只用于把不可下载的 DOM/sandbox 占位符挂到唯一的真实 API 资源上。
+            // 两个都可独立获取的资源绝不靠文件名合并，避免重现 v3.6 的文本内容碰撞。
+            const aliasMap = new Map();
+            for (let index = 0; index < list.length; index += 1) {
+                const entry = list[index];
+                const category = this.getArchiveAssetCategory(entry.asset);
+                for (const name of this.getAssetAliasNames(entry.asset)) {
+                    const key = `${entry.logicalIndex}|${entry.asset.role || ''}|${category}|${name}`;
+                    if (!aliasMap.has(key)) aliasMap.set(key, []);
+                    aliasMap.get(key).push(index);
+                }
+            }
+            for (const indices of aliasMap.values()) {
+                const roots = [...new Set(indices.map(find))];
+                if (roots.length < 2) continue;
+                const fetchableRoots = roots.filter((root) => list.some((entry, index) => find(index) === root && this.isArchiveAssetFetchableCandidate(entry.asset)));
+                if (fetchableRoots.length !== 1) continue;
+                const target = fetchableRoots[0];
+                const targetAsset = list.find((entry, index) => find(index) === target && this.isArchiveAssetFetchableCandidate(entry.asset))?.asset;
+                for (const root of roots) {
+                    if (root === target) continue;
+                    const members = list.filter((entry, index) => find(index) === root);
+                    if (members.some((entry) => this.isArchiveAssetFetchableCandidate(entry.asset))) continue;
+                    if (members.every((entry) => !this.assetsHaveConflictingStrongIdentity(targetAsset, entry.asset) && this.assetMetadataCompatibleForMerge(targetAsset, entry.asset))) {
+                        union(target, root);
+                    }
+                }
+            }
+
+            const grouped = new Map();
+            for (let index = 0; index < list.length; index += 1) {
+                const root = find(index);
+                if (!grouped.has(root)) grouped.set(root, []);
+                grouped.get(root).push(list[index]);
+            }
+            return [...grouped.values()]
+                .filter((refs) => refs.some((entry) => this.isArchiveAssetFetchableCandidate(entry.asset)))
+                .map((refs) => this.aggregateCanonicalAssetGroup(refs));
+        }
+
+        getCanonicalArchiveAssetGroupsForIndices(indices) {
+            const entries = [];
+            for (const logicalIndex of indices || []) {
+                const archive = this.conversationArchive.get(logicalIndex);
+                for (const asset of archive?.assets || []) entries.push({ logicalIndex, archive, asset });
+            }
+            return this.buildCanonicalArchiveAssetGroups(entries);
+        }
+
+        getCanonicalArchiveAssetGroupsForArchive(archive) {
+            if (!archive) return [];
+            const logicalIndex = Number.isInteger(archive.logicalIndex) ? archive.logicalIndex : -1;
+            return this.buildCanonicalArchiveAssetGroups((archive.assets || []).map((asset) => ({ logicalIndex, archive, asset })));
+        }
+
+        countArchiveExportableAssets(archive) {
+            if (!archive) return 0;
+            return this.getCanonicalArchiveAssetGroupsForArchive(archive).length;
+        }
+
         getArchiveAssetsForIndices(indices) {
             const entries = [];
             for (const logicalIndex of indices) {
@@ -10664,7 +10969,8 @@
             const files = [];
             const manifest = [];
             if (!includeAssets) {
-                for (const { logicalIndex, asset } of this.getArchiveAssetsForIndices(indices)) {
+                for (const group of this.getCanonicalArchiveAssetGroupsForIndices(indices)) {
+                    const { logicalIndex, asset } = group;
                     manifest.push({
                         logicalIndex,
                         id: asset.id,
@@ -10674,6 +10980,7 @@
                         fileId: asset.fileId || '',
                         artifactId: asset.artifactId || '',
                         captureMethod: asset.captureMethod || '',
+                        referenceIds: group.refs.map((ref) => ref.asset.id),
                         included: false,
                         skipped: true,
                         reason: '用户未勾选“图片和附件”',
@@ -10682,41 +10989,22 @@
                 return { tokenPathMap, urlPathMap, files, manifest };
             }
 
-            const entries = this.getArchiveAssetsForIndices(indices);
-            const fetchEntries = [];
-            for (const entry of entries) {
-                const decorative = entry.asset?.presentation === 'inline-icon' || entry.asset?.kind === 'inline-icon';
-                if (decorative && this.config.conversationExportIncludeDecorativeIcons !== true) {
-                    manifest.push({
-                        logicalIndex: entry.logicalIndex,
-                        id: entry.asset.id,
-                        label: entry.asset.label,
-                        kind: entry.asset.kind,
-                        presentation: entry.asset.presentation || '',
-                        sourceUrl: entry.asset.sourceUrl || '',
-                        fileId: entry.asset.fileId || '',
-                        artifactId: entry.asset.artifactId || '',
-                        captureMethod: entry.asset.captureMethod || '',
-                        included: false,
-                        skipped: true,
-                        reason: '已跳过装饰性网页图标（可在脚本配置中开启）',
-                    });
-                    continue;
-                }
-                fetchEntries.push(entry);
-            }
+            // 使用规范化资源清单：一个真实文件只形成一个任务；DOM 按钮、sandbox 占位符、
+            // API 元数据和正文链接只是同一资源的引用，不再分别计数和分别失败。
+            const canonicalGroups = this.getCanonicalArchiveAssetGroupsForIndices(indices);
             const uniqueJobs = new Map();
-            for (const entry of fetchEntries) {
-                const baseKey = this.getAssetFetchCacheKey(entry.asset) || entry.asset.id;
+            for (const group of canonicalGroups) {
+                const entry = group.refs.find((ref) => this.isArchiveAssetFetchableCandidate(ref.asset)) || group.refs[0];
+                const aggregateAsset = group.asset;
+                const baseKey = this.getAssetFetchCacheKey(aggregateAsset) || aggregateAsset.id;
                 let key = baseKey;
                 let suffix = 2;
-                while (uniqueJobs.has(key) && !this.canAssetsShareFetchedBinary(uniqueJobs.get(key).asset, entry.asset)) {
-                    // 即使上游错误地给不同文件复用了同一个 file_id，也必须拆成独立任务。
-                    key = `${baseKey}|isolated:${entry.asset.id || suffix}`;
+                while (uniqueJobs.has(key) && !this.canAssetsShareFetchedBinary(uniqueJobs.get(key).asset, aggregateAsset)) {
+                    key = `${baseKey}|isolated:${aggregateAsset.id || suffix}`;
                     suffix += 1;
                 }
-                if (!uniqueJobs.has(key)) uniqueJobs.set(key, { ...entry, key, refs: [] });
-                uniqueJobs.get(key).refs.push(entry);
+                if (!uniqueJobs.has(key)) uniqueJobs.set(key, { ...entry, asset: aggregateAsset, key, refs: [] });
+                uniqueJobs.get(key).refs.push(...group.refs);
             }
 
             const jobs = [...uniqueJobs.values()].sort((a, b) => this.scoreAssetJob(a) - this.scoreAssetJob(b));
@@ -10757,53 +11045,57 @@
                         if (result.resolvedFilename) ref.asset.resolvedFilename = result.resolvedFilename;
                         tokenPathMap.set(ref.asset.id, path);
                         this.registerArchiveAssetPathAliases(urlPathMap, path, ref.asset, ref.logicalIndex, result);
-                        manifest.push({
-                            logicalIndex: ref.logicalIndex,
-                            id: ref.asset.id,
-                            label: ref.asset.label,
-                            kind: ref.asset.kind,
-                            presentation: ref.asset.presentation || '',
-                            sourceUrl: ref.asset.sourceUrl || '',
-                            fileId: ref.asset.fileId || '',
-                            artifactId: ref.asset.artifactId || '',
-                            captureMethod: ref.asset.captureMethod || '',
-                            included: true,
-                            path,
-                            size: result.blob.size,
-                            mimeType: result.contentType || ref.asset.mimeType || result.blob.type || '',
-                            cacheHit: Boolean(result.cacheHit),
-                            fetchIdentityKey: job.key,
-                            fetchDurationMs: Number(result.fetchDurationMs) || 0,
-                            attemptCount: Number(result.attemptCount) || 0,
-                            resolvedVia: result.resolvedVia || '',
-                            resolvedFileId: result.resolvedFileId || ref.asset.fileId || '',
-                            previewFallback: Boolean(result.previewFallback),
-                            validation: result.validation || null,
-                            expectedSize: Number(ref.asset.expectedSize) || 0,
-                            originalFilename: ref.asset.originalFilename || '',
-                            originalMimeType: ref.asset.originalMimeType || '',
-                        });
                     }
+                    manifest.push({
+                        logicalIndex,
+                        logicalIndices: [...new Set(job.refs.map((ref) => ref.logicalIndex))],
+                        id: asset.id,
+                        referenceIds: [...new Set(job.refs.map((ref) => ref.asset.id))],
+                        referenceCount: job.refs.length,
+                        label: asset.label,
+                        kind: asset.kind,
+                        presentation: asset.presentation || '',
+                        sourceUrl: asset.sourceUrl || '',
+                        fileId: asset.fileId || '',
+                        artifactId: asset.artifactId || '',
+                        captureMethod: asset.captureMethod || '',
+                        included: true,
+                        path,
+                        size: result.blob.size,
+                        mimeType: result.contentType || asset.mimeType || result.blob.type || '',
+                        cacheHit: Boolean(result.cacheHit),
+                        fetchIdentityKey: job.key,
+                        fetchDurationMs: Number(result.fetchDurationMs) || 0,
+                        attemptCount: Number(result.attemptCount) || 0,
+                        resolvedVia: result.resolvedVia || '',
+                        resolvedFileId: result.resolvedFileId || asset.fileId || '',
+                        previewFallback: Boolean(result.previewFallback),
+                        validation: result.validation || null,
+                        expectedSize: Number(asset.expectedSize) || 0,
+                        originalFilename: asset.originalFilename || '',
+                        originalMimeType: asset.originalMimeType || '',
+                    });
                 } catch (error) {
                     if (error?.name === 'AbortError') throw error;
                     this.conversationAssetProgress.failed += 1;
-                    for (const ref of job.refs) {
-                        manifest.push({
-                            logicalIndex: ref.logicalIndex,
-                            id: ref.asset.id,
-                            label: ref.asset.label,
-                            kind: ref.asset.kind,
-                            presentation: ref.asset.presentation || '',
-                            sourceUrl: ref.asset.sourceUrl || '',
-                            fileId: ref.asset.fileId || '',
-                            artifactId: ref.asset.artifactId || '',
-                            captureMethod: ref.asset.captureMethod || '',
-                            included: false,
-                            reason: error?.message || String(error),
-                            fetchDurationMs: Number(error?.fetchDurationMs) || 0,
-                            attemptCount: Number(error?.attemptCount) || 0,
-                        });
-                    }
+                    manifest.push({
+                        logicalIndex,
+                        logicalIndices: [...new Set(job.refs.map((ref) => ref.logicalIndex))],
+                        id: asset.id,
+                        referenceIds: [...new Set(job.refs.map((ref) => ref.asset.id))],
+                        referenceCount: job.refs.length,
+                        label: asset.label,
+                        kind: asset.kind,
+                        presentation: asset.presentation || '',
+                        sourceUrl: asset.sourceUrl || '',
+                        fileId: asset.fileId || '',
+                        artifactId: asset.artifactId || '',
+                        captureMethod: asset.captureMethod || '',
+                        included: false,
+                        reason: error?.message || String(error),
+                        fetchDurationMs: Number(error?.fetchDurationMs) || 0,
+                        attemptCount: Number(error?.attemptCount) || 0,
+                    });
                 } finally {
                     this.assetProgressActive = Math.max(0, this.assetProgressActive - 1);
                     this.conversationAssetProgress.completed += 1;
@@ -10814,7 +11106,7 @@
             await this.runBoundedAssetWorkers(jobs, concurrency, processJob, signal);
             this.reconcileArchiveAssetPathMappings(indices, tokenPathMap, urlPathMap);
             this.reconcileAssetManifestAliases(manifest, tokenPathMap, files);
-            this.conversationAssetProgress.failed = manifest.filter((item) => !item.included && !item.skipped).length;
+            this.conversationAssetProgress.failed = manifest.filter((item) => !item.included && !item.skipped).length; // 每条 manifest 现在对应一个真实资源任务
             files.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
             manifest.sort((a, b) => (a.logicalIndex - b.logicalIndex) || String(a.id).localeCompare(String(b.id)));
             return { tokenPathMap, urlPathMap, files, manifest };
@@ -10829,12 +11121,12 @@
                 'conversation.md：适合 Markdown 阅读器。',
                 'conversation.html：可直接在浏览器中离线打开。',
                 'assets/：成功获取的图片、文件和 HTML Artifacts。',
-                'manifest.json：每个资源的来源、导出路径、缓存命中状态和失败原因。',
+                'manifest.json：每个真实资源的来源、引用别名、导出路径、缓存命中状态和失败原因。',
                 '',
                 '资源解析默认只使用结构化对话数据、React 控件属性、DOM、多个文件端点以及已经打开的 Artifact 面板快照。',
                 '全量加载和导出准备不会自动点击文件卡、下载按钮或导出菜单；这是为了避免页面原生下载处理器连续触发浏览器下载。',
                 'manifest.json 会记录 file_id / artifact_id、最终采用的原文件 ID、文件头校验、大小校验、来源 URL、归档路径和失败原因。',
-                '原文件模式不会用缩略图、预览页或渲染产物冒充附件；无法验证原文件时会记录失败并跳过。',
+                '原文件模式不会用缩略图、预览页或渲染产物冒充附件；规范化清单会先剔除普通网页来源、纯按钮占位符和重复引用，再对真实资源执行获取。',
                 '如果签名链接已过期、账号无权限、文件超过限制，或页面未提供 file_id，附件仍可能无法打包。',
             ];
             if (skipped.length) {
@@ -10913,7 +11205,7 @@
                 }
 
                 const manifest = {
-                    version: 9,
+                    version: 10,
                     generatedAt: new Date().toISOString(),
                     source: location.href,
                     title: this.getConversationExportTitle(),
