@@ -1,12 +1,14 @@
 // ==UserScript==
-// @name         ChatGPT 长对话性能优化、导航与快速搜索
+// @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      2.7.0
-// @description  优化长对话渲染，提供问答/章节导航与章节、段落快速搜索
+// @version      2.9.0
+// @description  优化长对话渲染，提供导航、全文搜索、全量加载，以及 Markdown/HTML/附件 ZIP 导出
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      *
 // ==/UserScript==
 
 (() => {
@@ -62,7 +64,7 @@
         // 一级目录：整段对话中的用户提问；二级目录：当前回答里的 H1/H2。
         enableConversationToc: true,
         hideOfficialConversationToc: true,
-        answerTocInitialView: 'headings', // 可选：'conversation'、'headings' 或 'search'
+        answerTocInitialView: 'headings', // 可选：'conversation'、'headings'、'search' 或 'export'
         answerTocRememberView: true,
 
         // 快速搜索：检索当前页面已经挂载的 Assistant 章节与段落。
@@ -88,6 +90,26 @@
         // 搜索跳转后的顶部留白及目标短暂定位提示。
         quickSearchScrollOffsetPx: 96,
         quickSearchHighlightTarget: true,
+
+        // 全量加载与 Markdown、离线 HTML、附件 ZIP 导出。内容仅保存在当前页面内存中。
+        enableConversationArchive: true,
+        conversationLoadTimeoutMs: 7000,
+        conversationLoadSettleMs: 260,
+        conversationLoadRetryCount: 2,
+        conversationLoadStepDelayMs: 55,
+        conversationExportIncludeMetadata: true,
+        conversationExportShiftAnswerHeadingsBy: 3,
+        conversationExportFilenameMaxLength: 90,
+
+        // ZIP 导出默认同时包含 Markdown、离线 HTML 和可获取的图片/附件。
+        conversationZipIncludeMarkdownByDefault: true,
+        conversationZipIncludeHtmlByDefault: true,
+        conversationZipIncludeAssetsByDefault: true,
+
+        // 单个附件和整个 ZIP 的软限制；超限文件会写入 manifest，但不会拖垮页面。
+        conversationExportAssetTimeoutMs: 30000,
+        conversationExportMaxAssetBytes: 512 * 1024 * 1024,
+        conversationExportMaxZipBytes: 2 * 1024 * 1024 * 1024,
 
         // 问答预览最多显示 3 行；完整提问仍保留在鼠标悬停提示中。
         // 设为 0 可取消按行限制。
@@ -259,6 +281,156 @@
 
     if (!CONFIG.enableAnswerToc) return;
 
+
+    const CRC32_TABLE = (() => {
+        const table = new Uint32Array(256);
+        for (let index = 0; index < 256; index += 1) {
+            let value = index;
+            for (let bit = 0; bit < 8; bit += 1) {
+                value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+            }
+            table[index] = value >>> 0;
+        }
+        return table;
+    })();
+
+    const updateCrc32 = (crc, bytes) => {
+        let value = crc >>> 0;
+        for (let index = 0; index < bytes.length; index += 1) {
+            value = CRC32_TABLE[(value ^ bytes[index]) & 0xff] ^ (value >>> 8);
+        }
+        return value >>> 0;
+    };
+
+    const getBlobCrc32 = async (blob) => {
+        let crc = 0xffffffff;
+        if (blob.stream && typeof blob.stream === 'function') {
+            const reader = blob.stream().getReader();
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    crc = updateCrc32(crc, value);
+                }
+            } finally {
+                reader.releaseLock?.();
+            }
+        } else {
+            crc = updateCrc32(crc, new Uint8Array(await blob.arrayBuffer()));
+        }
+        return (crc ^ 0xffffffff) >>> 0;
+    };
+
+    const writeUint16 = (view, offset, value) => view.setUint16(offset, value, true);
+    const writeUint32 = (view, offset, value) => view.setUint32(offset, value >>> 0, true);
+
+    const getDosDateTime = (date = new Date()) => {
+        const year = Math.max(1980, date.getFullYear());
+        return {
+            time: ((date.getHours() & 0x1f) << 11) |
+                ((date.getMinutes() & 0x3f) << 5) |
+                ((Math.floor(date.getSeconds() / 2)) & 0x1f),
+            date: (((year - 1980) & 0x7f) << 9) |
+                (((date.getMonth() + 1) & 0x0f) << 5) |
+                (date.getDate() & 0x1f),
+        };
+    };
+
+    class StoredZipBuilder {
+        constructor() {
+            this.parts = [];
+            this.entries = [];
+            this.offset = 0;
+            this.encoder = new TextEncoder();
+        }
+
+        async add(path, value, modifiedAt = new Date()) {
+            const normalizedPath = String(path || '')
+                .replace(/\\/g, '/')
+                .replace(/^\/+/, '')
+                .replace(/\/{2,}/g, '/');
+            if (!normalizedPath || normalizedPath.endsWith('/')) {
+                throw new Error(`无效 ZIP 文件名：${path}`);
+            }
+
+            const blob = value instanceof Blob ? value : new Blob([value]);
+            if (blob.size > 0xffffffff) {
+                throw new Error(`ZIP32 不支持超过 4 GiB 的单个文件：${normalizedPath}`);
+            }
+            if (this.offset + blob.size > 0xffffffff) {
+                throw new Error('ZIP32 总大小超过 4 GiB，无法继续打包');
+            }
+
+            const nameBytes = this.encoder.encode(normalizedPath);
+            const crc32 = await getBlobCrc32(blob);
+            const { time, date } = getDosDateTime(modifiedAt);
+            const localOffset = this.offset;
+            const header = new Uint8Array(30 + nameBytes.length);
+            const view = new DataView(header.buffer);
+            writeUint32(view, 0, 0x04034b50);
+            writeUint16(view, 4, 20);
+            writeUint16(view, 6, 0x0800);
+            writeUint16(view, 8, 0);
+            writeUint16(view, 10, time);
+            writeUint16(view, 12, date);
+            writeUint32(view, 14, crc32);
+            writeUint32(view, 18, blob.size);
+            writeUint32(view, 22, blob.size);
+            writeUint16(view, 26, nameBytes.length);
+            writeUint16(view, 28, 0);
+            header.set(nameBytes, 30);
+
+            this.parts.push(header, blob);
+            this.entries.push({ normalizedPath, nameBytes, crc32, size: blob.size, time, date, localOffset });
+            this.offset += header.length + blob.size;
+        }
+
+        build() {
+            const centralParts = [];
+            let centralSize = 0;
+            for (const entry of this.entries) {
+                const header = new Uint8Array(46 + entry.nameBytes.length);
+                const view = new DataView(header.buffer);
+                writeUint32(view, 0, 0x02014b50);
+                writeUint16(view, 4, 20);
+                writeUint16(view, 6, 20);
+                writeUint16(view, 8, 0x0800);
+                writeUint16(view, 10, 0);
+                writeUint16(view, 12, entry.time);
+                writeUint16(view, 14, entry.date);
+                writeUint32(view, 16, entry.crc32);
+                writeUint32(view, 20, entry.size);
+                writeUint32(view, 24, entry.size);
+                writeUint16(view, 28, entry.nameBytes.length);
+                writeUint16(view, 30, 0);
+                writeUint16(view, 32, 0);
+                writeUint16(view, 34, 0);
+                writeUint16(view, 36, 0);
+                writeUint32(view, 38, 0);
+                writeUint32(view, 42, entry.localOffset);
+                header.set(entry.nameBytes, 46);
+                centralParts.push(header);
+                centralSize += header.length;
+            }
+
+            if (this.entries.length > 0xffff) {
+                throw new Error('ZIP32 不支持超过 65535 个文件');
+            }
+            const centralOffset = this.offset;
+            const footer = new Uint8Array(22);
+            const footerView = new DataView(footer.buffer);
+            writeUint32(footerView, 0, 0x06054b50);
+            writeUint16(footerView, 4, 0);
+            writeUint16(footerView, 6, 0);
+            writeUint16(footerView, 8, this.entries.length);
+            writeUint16(footerView, 10, this.entries.length);
+            writeUint32(footerView, 12, centralSize);
+            writeUint32(footerView, 16, centralOffset);
+            writeUint16(footerView, 20, 0);
+            return new Blob([...this.parts, ...centralParts, footer], { type: 'application/zip' });
+        }
+    }
+
     class AnswerTocController {
         constructor(config) {
             this.config = config;
@@ -271,8 +443,26 @@
             this.tocNav = null;
             this.conversationList = null;
             this.conversationNav = null;
+            this.exportList = null;
+            this.exportNav = null;
+            this.exportView = null;
+            this.exportEmptyState = null;
             this.headingEmptyState = null;
             this.conversationEmptyState = null;
+            this.conversationTools = null;
+            this.conversationLoadAllButton = null;
+            this.conversationCancelLoadButton = null;
+            this.conversationSelectAllButton = null;
+            this.conversationClearSelectionButton = null;
+            this.conversationExportSelectedButton = null;
+            this.conversationExportAllButton = null;
+            this.conversationExportSelectedZipButton = null;
+            this.conversationExportAllZipButton = null;
+            this.exportIncludeMarkdownInput = null;
+            this.exportIncludeHtmlInput = null;
+            this.exportIncludeAssetsInput = null;
+            this.conversationArchiveStatus = null;
+            this.conversationSelectionStatus = null;
             this.countLabel = null;
             this.launcherCount = null;
             this.launcherMode = null;
@@ -281,9 +471,11 @@
             this.viewConversationButton = null;
             this.viewHeadingsButton = null;
             this.viewSearchButton = null;
+            this.viewExportButton = null;
             this.viewConversationCount = null;
             this.viewHeadingsCount = null;
             this.viewSearchCount = null;
+            this.viewExportCount = null;
             this.searchView = null;
             this.searchNav = null;
             this.searchList = null;
@@ -323,6 +515,7 @@
 
             this.conversationItems = [];
             this.conversationItemButtons = [];
+            this.exportItemButtons = [];
             this.activeConversationIndex = -1;
             this.lastConversationSignature = '';
             this.officialNavContainer = null;
@@ -336,6 +529,21 @@
             this.conversationJumpTimers = new Set();
             this.conversationJumpRevealElement = null;
             this.conversationJumpRevealTimer = 0;
+
+            this.conversationArchive = new Map();
+            this.conversationArchiveFailures = new Map();
+            this.selectedConversationIndices = new Set();
+            this.conversationLoadRunId = 0;
+            this.conversationLoadAbortController = null;
+            this.conversationLoadPromise = null;
+            this.conversationLoadMode = '';
+            this.conversationLoadProgress = { completed: 0, total: 0, failed: 0 };
+            this.conversationExportInProgress = false;
+            this.conversationAssetProgress = { completed: 0, total: 0, failed: 0 };
+            this.exportIncludeMarkdown = this.config.conversationZipIncludeMarkdownByDefault !== false;
+            this.exportIncludeHtml = this.config.conversationZipIncludeHtmlByDefault !== false;
+            if (!this.exportIncludeMarkdown && !this.exportIncludeHtml) this.exportIncludeMarkdown = true;
+            this.exportIncludeAssets = this.config.conversationZipIncludeAssetsByDefault !== false;
 
             this.mainElement = null;
             this.mainObserver = null;
@@ -482,10 +690,16 @@
             backdrop-filter: blur(${backdropBlur}px) saturate(118%);`
                 : '';
             const searchEnabled = Boolean(this.config.enableQuickSearch);
-            const viewColumnCount = searchEnabled ? 3 : 2;
+            const exportEnabled = Boolean(this.config.enableConversationArchive);
+            const viewColumnCount = 2 + Number(searchEnabled) + Number(exportEnabled);
             const searchTabHtml = searchEnabled
                 ? `<button id="view-search" class="view-tab" type="button" role="tab" data-view="search" aria-selected="false">
               <span>搜索</span><span id="view-search-count" class="view-count">0</span>
+            </button>`
+                : '';
+            const exportTabHtml = exportEnabled
+                ? `<button id="view-export" class="view-tab" type="button" role="tab" data-view="export" aria-selected="false">
+              <span>导出</span><span id="view-export-count" class="view-count">0</span>
             </button>`
                 : '';
             const searchViewHtml = searchEnabled
@@ -519,6 +733,38 @@
               <nav id="search-nav" class="toc-nav search-results-nav" aria-label="搜索结果">
                 <div id="search-empty" class="empty-state">输入关键词开始搜索</div>
                 <ol id="search-list" class="toc-list"></ol>
+              </nav>
+            </section>`
+                : '';
+            const exportViewHtml = exportEnabled
+                ? `<section id="export-view" class="export-view" aria-label="加载与导出" hidden>
+              <div id="conversation-tools" class="conversation-tools" aria-label="问答加载、选择与导出工具">
+                <div class="conversation-tool-row">
+                  <button id="conversation-load-all" class="tool-button" data-primary="true" type="button" title="依次访问所有问答并将正文和资源描述缓存到当前页面内存">加载全部</button>
+                  <button id="conversation-cancel-load" class="tool-button" type="button" title="停止当前加载或导出准备" hidden>停止</button>
+                  <span id="conversation-archive-status" class="conversation-tool-status" aria-live="polite">已缓存 0/0</span>
+                </div>
+                <div class="conversation-tool-row">
+                  <button id="conversation-select-all" class="tool-button" type="button">全选</button>
+                  <button id="conversation-clear-selection" class="tool-button" type="button">清空</button>
+                  <span id="conversation-selection-status" class="conversation-tool-status">已选 0</span>
+                </div>
+                <fieldset class="export-options">
+                  <legend>ZIP 内容</legend>
+                  <label class="export-option"><input id="export-include-markdown" type="checkbox" ${this.exportIncludeMarkdown ? 'checked' : ''}/>Markdown</label>
+                  <label class="export-option"><input id="export-include-html" type="checkbox" ${this.exportIncludeHtml ? 'checked' : ''}/>离线 HTML</label>
+                  <label class="export-option"><input id="export-include-assets" type="checkbox" ${this.exportIncludeAssets ? 'checked' : ''}/>图片和附件</label>
+                </fieldset>
+                <div class="conversation-tool-row export-button-grid">
+                  <button id="conversation-export-selected" class="tool-button" type="button" title="导出单个 Markdown 文件">选中 MD</button>
+                  <button id="conversation-export-all" class="tool-button" type="button" title="导出单个 Markdown 文件">全部 MD</button>
+                  <button id="conversation-export-selected-zip" class="tool-button" data-primary="true" type="button" title="导出 Markdown/HTML 及可获取附件的 ZIP">选中 ZIP</button>
+                  <button id="conversation-export-all-zip" class="tool-button" data-primary="true" type="button" title="导出 Markdown/HTML 及可获取附件的 ZIP">全部 ZIP</button>
+                </div>
+              </div>
+              <nav id="export-nav" class="toc-nav export-nav" aria-label="选择需要导出的问答">
+                <div id="export-empty" class="empty-state" hidden>暂未找到可导出的问答</div>
+                <ol id="export-list" class="toc-list"></ol>
               </nav>
             </section>`
                 : '';
@@ -674,6 +920,7 @@
           .launcher[hidden],
           .toc-nav[hidden],
           .search-view[hidden],
+          .export-view[hidden],
           .empty-state[hidden],
           .search-clear[hidden] {
             display: none !important;
@@ -820,6 +1067,150 @@
             font-weight: 500;
           }
 
+          .export-view {
+            min-height: 0;
+            display: flex;
+            flex: 1;
+            flex-direction: column;
+          }
+
+          .conversation-tools {
+            flex: none;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            padding: 6px 7px;
+            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+          }
+
+          .conversation-tool-row {
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex-wrap: wrap;
+          }
+
+          .tool-button {
+            min-height: 27px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            padding: 4px 8px;
+            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.13));
+            border-radius: 7px;
+            background: color-mix(in srgb, var(--main-surface-secondary, #f3f3f3) 66%, transparent);
+            color: var(--text-secondary, #4a4a4a);
+            font-size: 10.5px;
+            line-height: 1.2;
+            cursor: pointer;
+          }
+
+          .tool-button:hover:not(:disabled) {
+            background: var(--main-surface-secondary, var(--bg-secondary, #ededed));
+            color: var(--text-primary, #111111);
+          }
+
+          .tool-button:disabled {
+            cursor: not-allowed;
+            opacity: 0.46;
+          }
+
+          .tool-button[data-primary="true"] {
+            font-weight: 600;
+          }
+
+          .export-options {
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin: 0;
+            padding: 5px 7px;
+            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.11));
+            border-radius: 8px;
+          }
+
+          .export-options legend {
+            padding-inline: 4px;
+            color: var(--text-tertiary, #777777);
+            font-size: 10px;
+          }
+
+          .export-option {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            color: var(--text-secondary, #4a4a4a);
+            font-size: 10.5px;
+            cursor: pointer;
+            user-select: none;
+          }
+
+          .export-option input {
+            width: 13px;
+            height: 13px;
+            margin: 0;
+            accent-color: currentColor;
+          }
+
+          .export-button-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+          }
+
+          .export-button-grid .tool-button {
+            min-width: 0;
+            padding-inline: 5px;
+          }
+
+          .conversation-tool-status {
+            min-width: 0;
+            flex: 1 1 90px;
+            overflow: hidden;
+            color: var(--text-tertiary, #777777);
+            font-size: 10px;
+            line-height: 1.25;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .conversation-row {
+            min-width: 0;
+            display: grid;
+            grid-template-columns: 24px minmax(0, 1fr);
+            align-items: stretch;
+            gap: 2px;
+          }
+
+          .conversation-row[data-selectable="false"] {
+            grid-template-columns: minmax(0, 1fr);
+          }
+
+          .conversation-select {
+            width: 24px;
+            display: grid;
+            place-items: center;
+            cursor: pointer;
+          }
+
+          .conversation-select input {
+            width: 14px;
+            height: 14px;
+            margin: 0;
+            accent-color: currentColor;
+            cursor: pointer;
+          }
+
+          .conversation-row[data-archived="true"] .prompt-index::after {
+            margin-inline-start: 2px;
+            color: var(--text-tertiary, #777777);
+            content: "✓";
+            font-size: 9px;
+          }
+
           .toc-nav {
             min-height: 0;
             flex: 1;
@@ -928,17 +1319,34 @@
            * 问答级目录只在提问过长时按配置限制行数和字符数；
            * 完整文本仍写入按钮 title。章节标题继续保持两行预览。
            */
-          #conversation-list .toc-item {
+          #conversation-list .toc-item,
+          #export-list .toc-item {
             height: auto;
             flex: 0 0 auto;
           }
 
-          #conversation-list .toc-item-label {
+          #conversation-list .toc-item-label,
+          #export-list .toc-item-label {
             ${conversationPreviewCss}
             max-height: none;
             text-overflow: clip;
             white-space: pre-wrap;
             word-break: break-word;
+          }
+
+          .export-asset-count {
+            flex: none;
+            align-self: center;
+            padding: 1px 5px;
+            border-radius: 999px;
+            background: color-mix(in srgb, var(--text-tertiary, #777777) 11%, transparent);
+            color: var(--text-tertiary, #777777);
+            font-size: 9.5px;
+            white-space: nowrap;
+          }
+
+          .export-nav {
+            padding-top: 5px;
           }
 
           .search-view {
@@ -1174,7 +1582,8 @@
 
             .panel-header,
             .view-tabs,
-            .search-toolbar {
+            .search-toolbar,
+            .conversation-tools {
               border-bottom-color: rgba(255, 255, 255, 0.11);
             }
           }
@@ -1231,6 +1640,7 @@
               <span>章节</span><span id="view-headings-count" class="view-count">0</span>
             </button>
             ${searchTabHtml}
+            ${exportTabHtml}
           </div>
 
           <nav id="conversation-nav" class="toc-nav" aria-label="对话问答导航" hidden>
@@ -1244,6 +1654,8 @@
           </nav>
 
           ${searchViewHtml}
+
+          ${exportViewHtml}
 
           <span class="resize-handle" aria-hidden="true" data-resize-corner="top-left"></span>
           <span class="resize-handle" aria-hidden="true" data-resize-corner="top-right"></span>
@@ -1262,8 +1674,26 @@
             this.tocNav = shadow.getElementById('heading-nav');
             this.conversationList = shadow.getElementById('conversation-list');
             this.conversationNav = shadow.getElementById('conversation-nav');
+            this.exportList = shadow.getElementById('export-list');
+            this.exportNav = shadow.getElementById('export-nav');
+            this.exportView = shadow.getElementById('export-view');
+            this.exportEmptyState = shadow.getElementById('export-empty');
             this.headingEmptyState = shadow.getElementById('heading-empty');
             this.conversationEmptyState = shadow.getElementById('conversation-empty');
+            this.conversationTools = shadow.getElementById('conversation-tools');
+            this.conversationLoadAllButton = shadow.getElementById('conversation-load-all');
+            this.conversationCancelLoadButton = shadow.getElementById('conversation-cancel-load');
+            this.conversationSelectAllButton = shadow.getElementById('conversation-select-all');
+            this.conversationClearSelectionButton = shadow.getElementById('conversation-clear-selection');
+            this.conversationExportSelectedButton = shadow.getElementById('conversation-export-selected');
+            this.conversationExportAllButton = shadow.getElementById('conversation-export-all');
+            this.conversationExportSelectedZipButton = shadow.getElementById('conversation-export-selected-zip');
+            this.conversationExportAllZipButton = shadow.getElementById('conversation-export-all-zip');
+            this.exportIncludeMarkdownInput = shadow.getElementById('export-include-markdown');
+            this.exportIncludeHtmlInput = shadow.getElementById('export-include-html');
+            this.exportIncludeAssetsInput = shadow.getElementById('export-include-assets');
+            this.conversationArchiveStatus = shadow.getElementById('conversation-archive-status');
+            this.conversationSelectionStatus = shadow.getElementById('conversation-selection-status');
             this.countLabel = shadow.getElementById('count-label');
             this.launcherCount = shadow.getElementById('launcher-count');
             this.launcherMode = shadow.getElementById('launcher-mode');
@@ -1272,9 +1702,11 @@
             this.viewConversationButton = shadow.getElementById('view-conversation');
             this.viewHeadingsButton = shadow.getElementById('view-headings');
             this.viewSearchButton = shadow.getElementById('view-search');
+            this.viewExportButton = shadow.getElementById('view-export');
             this.viewConversationCount = shadow.getElementById('view-conversation-count');
             this.viewHeadingsCount = shadow.getElementById('view-headings-count');
             this.viewSearchCount = shadow.getElementById('view-search-count');
+            this.viewExportCount = shadow.getElementById('view-export-count');
             this.searchView = shadow.getElementById('search-view');
             this.searchNav = shadow.getElementById('search-nav');
             this.searchList = shadow.getElementById('search-list');
@@ -1339,6 +1771,9 @@
             this.viewSearchButton?.addEventListener('click', () => {
                 this.setActiveView('search', true, { focusSearch: true });
             });
+            this.viewExportButton?.addEventListener('click', () => {
+                this.setActiveView('export', true);
+            });
 
             this.searchInput?.addEventListener('input', this.onSearchInput);
             this.searchInput?.addEventListener('keydown', this.onSearchKeyDown);
@@ -1365,7 +1800,56 @@
                 if (Number.isInteger(index)) this.jumpToHeading(index);
             });
 
-            this.conversationList.addEventListener('click', (event) => {
+            this.conversationLoadAllButton?.addEventListener('click', () => {
+                this.loadAllConversations();
+            });
+            this.conversationCancelLoadButton?.addEventListener('click', () => {
+                this.cancelConversationArchiveLoad('用户已停止');
+            });
+            this.conversationSelectAllButton?.addEventListener('click', () => {
+                this.selectAllConversations();
+            });
+            this.conversationClearSelectionButton?.addEventListener('click', () => {
+                this.clearConversationSelection();
+            });
+            this.conversationExportSelectedButton?.addEventListener('click', () => {
+                this.exportSelectedConversations();
+            });
+            this.conversationExportAllButton?.addEventListener('click', () => {
+                this.exportAllConversations();
+            });
+            this.conversationExportSelectedZipButton?.addEventListener('click', () => {
+                this.exportSelectedConversationsZip();
+            });
+            this.conversationExportAllZipButton?.addEventListener('click', () => {
+                this.exportAllConversationsZip();
+            });
+
+            const syncExportOptions = () => {
+                this.exportIncludeMarkdown = Boolean(this.exportIncludeMarkdownInput?.checked);
+                this.exportIncludeHtml = Boolean(this.exportIncludeHtmlInput?.checked);
+                this.exportIncludeAssets = Boolean(this.exportIncludeAssetsInput?.checked);
+                if (!this.exportIncludeMarkdown && !this.exportIncludeHtml) {
+                    this.exportIncludeMarkdown = true;
+                    if (this.exportIncludeMarkdownInput) this.exportIncludeMarkdownInput.checked = true;
+                }
+                this.updateConversationArchiveUi();
+            };
+            this.exportIncludeMarkdownInput?.addEventListener('change', syncExportOptions);
+            this.exportIncludeHtmlInput?.addEventListener('change', syncExportOptions);
+            this.exportIncludeAssetsInput?.addEventListener('change', syncExportOptions);
+
+            this.exportList?.addEventListener('change', (event) => {
+                const checkbox = event.target instanceof Element
+                    ? event.target.closest('input[data-conversation-select-index]')
+                    : null;
+                if (!(checkbox instanceof HTMLInputElement)) return;
+                const logicalIndex = Number.parseInt(checkbox.dataset.conversationSelectIndex ?? '', 10);
+                if (!Number.isInteger(logicalIndex)) return;
+                this.setConversationSelected(logicalIndex, checkbox.checked);
+            });
+
+            const handleConversationJumpClick = (event) => {
                 const button = event.target instanceof Element
                     ? event.target.closest('button[data-conversation-index]')
                     : null;
@@ -1373,7 +1857,9 @@
 
                 const index = Number.parseInt(button.dataset.conversationIndex ?? '', 10);
                 if (Number.isInteger(index)) this.jumpToConversation(index);
-            });
+            };
+            this.conversationList?.addEventListener('click', handleConversationJumpClick);
+            this.exportList?.addEventListener('click', handleConversationJumpClick);
 
             for (const handle of this.resizeHandles) {
                 handle.addEventListener('pointerdown', (event) => {
@@ -1539,6 +2025,11 @@
                 this.config.enableQuickSearch
             ) {
                 fallback = 'search';
+            } else if (
+                this.config.answerTocInitialView === 'export' &&
+                this.config.enableConversationArchive
+            ) {
+                fallback = 'export';
             }
             if (!this.config.answerTocRememberView) return fallback;
 
@@ -1546,6 +2037,7 @@
                 const stored = localStorage.getItem('cgpt-answer-toc-view-v1');
                 if (stored === 'conversation' || stored === 'headings') return stored;
                 if (stored === 'search' && this.config.enableQuickSearch) return stored;
+                if (stored === 'export' && this.config.enableConversationArchive) return stored;
             } catch {
                 // 忽略存储不可用的情况。
             }
@@ -1569,6 +2061,8 @@
                 nextView = 'conversation';
             } else if (view === 'search' && this.config.enableQuickSearch) {
                 nextView = 'search';
+            } else if (view === 'export' && this.config.enableConversationArchive) {
+                nextView = 'export';
             }
 
             const shouldFocusSearch = Boolean(options.focusSearch && nextView === 'search');
@@ -1600,15 +2094,19 @@
             const conversationActive = this.activeView === 'conversation';
             const headingsActive = this.activeView === 'headings';
             const searchActive = this.activeView === 'search' && this.config.enableQuickSearch;
+            const exportActive = this.activeView === 'export' && this.config.enableConversationArchive;
             this.conversationNav.hidden = !conversationActive;
             this.tocNav.hidden = !headingsActive;
             if (this.searchView) this.searchView.hidden = !searchActive;
+            if (this.exportView) this.exportView.hidden = !exportActive;
             this.viewConversationButton?.setAttribute('aria-selected', String(conversationActive));
             this.viewHeadingsButton?.setAttribute('aria-selected', String(headingsActive));
             this.viewSearchButton?.setAttribute('aria-selected', String(searchActive));
+            this.viewExportButton?.setAttribute('aria-selected', String(exportActive));
             this.viewConversationButton?.setAttribute('tabindex', conversationActive ? '0' : '-1');
             this.viewHeadingsButton?.setAttribute('tabindex', headingsActive ? '0' : '-1');
             this.viewSearchButton?.setAttribute('tabindex', searchActive ? '0' : '-1');
+            this.viewExportButton?.setAttribute('tabindex', exportActive ? '0' : '-1');
         }
 
         updateViewMeta() {
@@ -1622,13 +2120,20 @@
             const searchCountLabel = searchCount > maxSearchResults
                 ? `${maxSearchResults}+`
                 : String(searchCount);
+            const archiveTotal = this.getAllConversationLogicalIndices().length;
+            const archiveLoaded = this.getAllConversationLogicalIndices()
+                .filter((index) => this.conversationArchive.has(index)).length;
+            const archiveSelected = this.selectedConversationIndices.size;
             const conversationActive = this.activeView === 'conversation';
             const searchActive = this.activeView === 'search';
+            const exportActive = this.activeView === 'export';
             const activeCount = conversationActive
                 ? String(conversationCount)
                 : searchActive
                     ? searchCountLabel
-                    : String(headingCount);
+                    : exportActive
+                        ? String(archiveSelected || archiveLoaded)
+                        : String(headingCount);
 
             if (this.viewConversationCount) {
                 this.viewConversationCount.textContent = String(conversationCount);
@@ -1639,6 +2144,9 @@
             if (this.viewSearchCount) {
                 this.viewSearchCount.textContent = searchCountLabel;
             }
+            if (this.viewExportCount) {
+                this.viewExportCount.textContent = archiveTotal ? `${archiveLoaded}/${archiveTotal}` : '0';
+            }
             if (this.countLabel) {
                 if (conversationActive) {
                     this.countLabel.textContent = `${conversationCount} 问`;
@@ -1648,25 +2156,31 @@
                         : this.searchQuery.trim()
                             ? `${searchCount} 项`
                             : '快速搜索';
+                } else if (exportActive) {
+                    this.countLabel.textContent = `缓存 ${archiveLoaded}/${archiveTotal}，已选 ${archiveSelected}`;
                 } else {
                     this.countLabel.textContent = `${headingCount} 节`;
                 }
             }
             if (this.launcherMode) {
-                this.launcherMode.textContent = conversationActive ? '问' : searchActive ? '搜' : '章';
+                this.launcherMode.textContent = conversationActive ? '问' : searchActive ? '搜' : exportActive ? '导' : '章';
             }
             if (this.launcherCount) {
                 this.launcherCount.textContent = activeCount;
             }
             if (this.launcher) {
-                this.launcher.title = `悬停临时展开；在目录中点击、拖动或缩放后保持展开；问答 ${conversationCount}，章节 ${headingCount}，搜索 ${searchCount}（Alt+Shift+F）`;
+                this.launcher.title = `悬停临时展开；在目录中点击、拖动或缩放后保持展开；问答 ${conversationCount}，章节 ${headingCount}，搜索 ${searchCount}，缓存 ${archiveLoaded}/${archiveTotal}（Alt+Shift+F）`;
             }
             if (this.conversationEmptyState) {
                 this.conversationEmptyState.hidden = conversationCount > 0;
             }
+            if (this.exportEmptyState) {
+                this.exportEmptyState.hidden = conversationCount > 0;
+            }
             if (this.headingEmptyState) {
                 this.headingEmptyState.hidden = headingCount > 0;
             }
+            this.updateConversationArchiveUi();
         }
 
         getActiveViewNavigation() {
@@ -1680,6 +2194,12 @@
                 return {
                     nav: this.searchNav,
                     button: this.searchResultButtons[this.activeSearchResultIndex] || null,
+                };
+            }
+            if (this.activeView === 'export') {
+                return {
+                    nav: this.exportNav,
+                    button: this.exportItemButtons[this.activeConversationIndex] || null,
                 };
             }
             return {
@@ -2562,6 +3082,10 @@
         resetForNavigation() {
             this.lastUrl = location.href;
             this.cancelConversationJump();
+            this.cancelConversationArchiveLoad('页面已切换', false, true);
+            this.conversationArchive.clear();
+            this.conversationArchiveFailures.clear();
+            this.selectedConversationIndices.clear();
             this.clearConversationLabelCacheState();
             this.maxObservedOfficialLogicalIndex = -1;
             this.disconnectCurrentAnswer();
@@ -3074,7 +3598,9 @@
         getQuickSearchScopeLabel() {
             return this.config.quickSearchScope === 'current-answer'
                 ? '当前回答'
-                : '当前已加载内容';
+                : this.conversationArchive.size
+                    ? '当前对话（含已缓存问答）'
+                    : '当前已加载内容';
         }
 
         normalizeSearchText(text) {
@@ -3289,6 +3815,9 @@
         collectSearchCandidateDescriptors() {
             const assistants = this.getSearchAssistantElements();
             const contextMap = this.buildSearchAssistantContextMap(assistants);
+            const liveLogicalIndices = new Set(
+                [...contextMap.values()].filter((index) => Number.isInteger(index) && index >= 0),
+            );
             const headingSelector = String(
                 this.config.quickSearchHeadingSelector || 'h1, h2, h3, h4, h5, h6',
             );
@@ -3361,6 +3890,170 @@
                 }
             }
 
+            if (
+                this.config.quickSearchScope === 'conversation' &&
+                this.conversationArchive.size &&
+                descriptors.length < maxBlocks
+            ) {
+                const archives = [...this.conversationArchive.values()]
+                    .sort((a, b) => a.logicalIndex - b.logicalIndex);
+                for (const archive of archives) {
+                    if (liveLogicalIndices.has(archive.logicalIndex)) continue;
+                    const virtualDescriptors = this.parseArchiveMarkdownSearchDescriptors(
+                        archive,
+                        order,
+                    );
+                    for (const descriptor of virtualDescriptors) {
+                        descriptors.push(descriptor);
+                        order += 1;
+                        if (descriptors.length >= maxBlocks) return descriptors;
+                    }
+                }
+            }
+
+            return descriptors;
+        }
+
+        stripMarkdownInlineForSearch(text) {
+            return this.normalizeConversationText(
+                String(text || '')
+                    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+                    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+                    .replace(/`+([^`]+)`+/g, '$1')
+                    .replace(/<[^>]+>/g, ' ')
+                    .replace(/[*_~]+/g, '')
+                    .replace(/\\([\\`*_[\]{}()#+.!|>-])/g, '$1'),
+            );
+        }
+
+        parseArchiveMarkdownSearchDescriptors(archive, orderStart = 0) {
+            const markdown = String(archive?.assistantMarkdown || '');
+            if (!markdown) return [];
+            const descriptors = [];
+            const lines = markdown.split(/\r?\n/);
+            let paragraph = [];
+            let quote = [];
+            let code = [];
+            let inCode = false;
+            let codeFence = '';
+            let order = orderStart;
+
+            const pushDescriptor = (fullText, meta) => {
+                const text = this.stripMarkdownInlineForSearch(fullText);
+                if (!text) return;
+                descriptors.push({
+                    element: null,
+                    assistant: null,
+                    logicalIndex: archive.logicalIndex,
+                    tagName: meta.tagName,
+                    order,
+                    archiveBacked: true,
+                    fullText: text,
+                    kind: meta.kind,
+                    kindLabel: meta.kindLabel,
+                    level: meta.level || 0,
+                });
+                order += 1;
+            };
+            const flushParagraph = () => {
+                if (!paragraph.length) return;
+                pushDescriptor(paragraph.join(' '), {
+                    tagName: 'P', kind: 'paragraph', kindLabel: '段落', level: 0,
+                });
+                paragraph = [];
+            };
+            const flushQuote = () => {
+                if (!quote.length) return;
+                pushDescriptor(quote.join(' '), {
+                    tagName: 'BLOCKQUOTE', kind: 'quote', kindLabel: '引用', level: 0,
+                });
+                quote = [];
+            };
+            const flushCode = () => {
+                if (!code.length || !this.config.quickSearchIncludeCodeBlocks) {
+                    code = [];
+                    return;
+                }
+                pushDescriptor(code.join('\n'), {
+                    tagName: 'PRE', kind: 'code', kindLabel: '代码', level: 0,
+                });
+                code = [];
+            };
+
+            for (const rawLine of lines) {
+                const fence = /^\s*(`{3,}|~{3,})/.exec(rawLine);
+                if (fence) {
+                    flushParagraph();
+                    flushQuote();
+                    if (!inCode) {
+                        inCode = true;
+                        codeFence = fence[1][0];
+                    } else if (fence[1][0] === codeFence) {
+                        inCode = false;
+                        codeFence = '';
+                        flushCode();
+                    }
+                    continue;
+                }
+                if (inCode) {
+                    code.push(rawLine);
+                    continue;
+                }
+
+                const line = rawLine.trim();
+                if (!line) {
+                    flushParagraph();
+                    flushQuote();
+                    continue;
+                }
+                const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+                if (heading) {
+                    flushParagraph();
+                    flushQuote();
+                    const level = heading[1].length;
+                    pushDescriptor(heading[2], {
+                        tagName: `H${level}`,
+                        kind: 'heading',
+                        kindLabel: `H${level}`,
+                        level,
+                    });
+                    continue;
+                }
+                if (/^>\s?/.test(line)) {
+                    flushParagraph();
+                    quote.push(line.replace(/^>\s?/, ''));
+                    continue;
+                }
+                const list = /^(?:[-+*]|\d+[.)])\s+(.+)$/.exec(line);
+                if (list) {
+                    flushParagraph();
+                    flushQuote();
+                    pushDescriptor(list[1], {
+                        tagName: 'LI', kind: 'list', kindLabel: '列表', level: 0,
+                    });
+                    continue;
+                }
+                if (/^\|.*\|$/.test(line)) {
+                    flushParagraph();
+                    flushQuote();
+                    if (/^\|(?:\s*:?-+:?\s*\|)+$/.test(line)) continue;
+                    const cells = line.slice(1, -1).split('|').map((cell) => cell.trim());
+                    pushDescriptor(cells.join(' · '), {
+                        tagName: 'TR', kind: 'table', kindLabel: '表格', level: 0,
+                    });
+                    continue;
+                }
+                if (/^(?:-{3,}|_{3,}|\*{3,})$/.test(line)) {
+                    flushParagraph();
+                    flushQuote();
+                    continue;
+                }
+                flushQuote();
+                paragraph.push(line);
+            }
+            flushParagraph();
+            flushQuote();
+            flushCode();
             return descriptors;
         }
 
@@ -3376,8 +4069,10 @@
         }
 
         buildSearchIndexEntry(descriptor) {
-            if (!descriptor?.element?.isConnected) return null;
-            const fullText = this.extractSearchBlockText(descriptor.element);
+            if (!descriptor) return null;
+            if (descriptor.element && !descriptor.element.isConnected) return null;
+            if (!descriptor.element && !descriptor.archiveBacked) return null;
+            const fullText = descriptor.fullText || this.extractSearchBlockText(descriptor.element);
             const minLength = Math.max(
                 1,
                 Number(this.config.quickSearchMinBlockTextLength) || 2,
@@ -4345,6 +5040,7 @@
                 ...mapping.buttonsByIndex.keys(),
                 ...mapping.recordsByIndex.keys(),
                 ...this.conversationLabelCache.keys(),
+                ...this.conversationArchive.keys(),
             ]);
             const maxKnownIndex = knownIndices.size ? Math.max(...knownIndices) : -1;
             const maxIndex = Math.max(mapping.maxIndex, maxKnownIndex);
@@ -4353,7 +5049,10 @@
                 const mappedRecord = mapping.recordsByIndex.get(logicalIndex) ?? null;
                 const displayRecord = mapping.trustLabels ? mappedRecord : null;
                 const officialButton = mapping.buttonsByIndex.get(logicalIndex) ?? null;
-                let cachedLabel = this.conversationLabelCache.get(logicalIndex) || '';
+                let cachedLabel =
+                    this.conversationArchive.get(logicalIndex)?.userText ||
+                    this.conversationLabelCache.get(logicalIndex) ||
+                    '';
 
                 /*
                  * 若某个仅来自缓存的标签，与当前已可信挂载在另一个序号的记录完全
@@ -4384,6 +5083,7 @@
                     fullLabel,
                     label: this.formatConversationLabel(fullLabel),
                     mappingConfident: mapping.confident,
+                    archived: this.conversationArchive.has(logicalIndex),
                 });
             }
 
@@ -4410,15 +5110,19 @@
         renderConversationItems() {
             if (!this.conversationList) return;
 
-            const fragment = document.createDocumentFragment();
+            const navigationFragment = document.createDocumentFragment();
+            const exportFragment = document.createDocumentFragment();
             this.conversationItemButtons = [];
+            this.exportItemButtons = [];
+            const validIndices = new Set(this.conversationItems.map((item) => item.logicalIndex));
+            for (const logicalIndex of [...this.selectedConversationIndices]) {
+                if (!validIndices.has(logicalIndex)) this.selectedConversationIndices.delete(logicalIndex);
+            }
 
-            this.conversationItems.forEach((conversation, index) => {
-                const item = document.createElement('li');
+            const buildPromptButton = (conversation, index) => {
                 const button = document.createElement('button');
                 const number = document.createElement('span');
                 const label = document.createElement('span');
-
                 button.type = 'button';
                 button.className = 'toc-item';
                 button.dataset.kind = 'conversation';
@@ -4430,14 +5134,60 @@
                 number.textContent = String(conversation.logicalIndex + 1);
                 label.className = 'toc-item-label';
                 label.textContent = conversation.label;
-
                 button.append(number, label);
-                item.appendChild(button);
-                fragment.appendChild(item);
-                this.conversationItemButtons.push(button);
+                return button;
+            };
+
+            this.conversationItems.forEach((conversation, index) => {
+                const navigationItem = document.createElement('li');
+                const navigationRow = document.createElement('div');
+                const navigationButton = buildPromptButton(conversation, index);
+                navigationRow.className = 'conversation-row';
+                navigationRow.dataset.selectable = 'false';
+                navigationRow.dataset.archived = String(this.conversationArchive.has(conversation.logicalIndex));
+                navigationRow.appendChild(navigationButton);
+                navigationItem.appendChild(navigationRow);
+                navigationFragment.appendChild(navigationItem);
+                this.conversationItemButtons.push(navigationButton);
+
+                if (this.exportList) {
+                    const exportItem = document.createElement('li');
+                    const exportRow = document.createElement('div');
+                    const selectLabel = document.createElement('label');
+                    const checkbox = document.createElement('input');
+                    const exportButton = buildPromptButton(conversation, index);
+                    const archive = this.conversationArchive.get(conversation.logicalIndex);
+                    const assetCount = Array.isArray(archive?.assets) ? archive.assets.length : 0;
+
+                    exportRow.className = 'conversation-row';
+                    exportRow.dataset.selectable = 'true';
+                    exportRow.dataset.archived = String(Boolean(archive));
+
+                    selectLabel.className = 'conversation-select';
+                    selectLabel.title = `选择第 ${conversation.logicalIndex + 1} 轮用于导出`;
+                    checkbox.type = 'checkbox';
+                    checkbox.dataset.conversationSelectIndex = String(conversation.logicalIndex);
+                    checkbox.checked = this.selectedConversationIndices.has(conversation.logicalIndex);
+                    checkbox.setAttribute('aria-label', `选择第 ${conversation.logicalIndex + 1} 轮`);
+                    selectLabel.appendChild(checkbox);
+
+                    if (assetCount > 0) {
+                        const badge = document.createElement('span');
+                        badge.className = 'export-asset-count';
+                        badge.textContent = `附件 ${assetCount}`;
+                        badge.title = `已发现 ${assetCount} 个图片、附件或 Artifact 资源`;
+                        exportButton.appendChild(badge);
+                    }
+
+                    exportRow.append(selectLabel, exportButton);
+                    exportItem.appendChild(exportRow);
+                    exportFragment.appendChild(exportItem);
+                    this.exportItemButtons.push(exportButton);
+                }
             });
 
-            this.conversationList.replaceChildren(fragment);
+            this.conversationList.replaceChildren(navigationFragment);
+            this.exportList?.replaceChildren(exportFragment);
             this.updateViewMeta();
         }
 
@@ -4446,6 +5196,7 @@
             this.conversationRebuildTimer = 0;
             this.conversationItems = [];
             this.conversationItemButtons = [];
+            this.exportItemButtons = [];
             this.activeConversationIndex = -1;
             this.lastConversationSignature = '';
             this.pendingConversationLogicalIndex = -1;
@@ -4454,6 +5205,7 @@
             this.markSearchIndexDirty(true);
             if (clearCache) this.clearConversationLabelCacheState();
             this.conversationList?.replaceChildren();
+            this.exportList?.replaceChildren();
             this.updateViewMeta();
             this.syncVisibility();
         }
@@ -4521,19 +5273,28 @@
             if (this.activeConversationIndex === index && !ensureVisible) return;
 
             const previous = this.conversationItemButtons[this.activeConversationIndex];
-            if (previous) {
-                previous.dataset.active = 'false';
-                previous.removeAttribute('aria-current');
+            const previousExport = this.exportItemButtons[this.activeConversationIndex];
+            for (const button of [previous, previousExport]) {
+                if (!button) continue;
+                button.dataset.active = 'false';
+                button.removeAttribute('aria-current');
             }
 
             this.activeConversationIndex = index;
             const current = this.conversationItemButtons[index];
+            const currentExport = this.exportItemButtons[index];
             if (!current) return;
 
-            current.dataset.active = 'true';
-            current.setAttribute('aria-current', 'location');
+            for (const button of [current, currentExport]) {
+                if (!button) continue;
+                button.dataset.active = 'true';
+                button.setAttribute('aria-current', 'location');
+            }
             if (ensureVisible || (!this.collapsed && this.activeView === 'conversation')) {
                 this.scrollItemIntoView(this.conversationNav, current);
+            }
+            if (ensureVisible || (!this.collapsed && this.activeView === 'export')) {
+                this.scrollItemIntoView(this.exportNav, currentExport);
             }
         }
 
@@ -4737,6 +5498,1707 @@
                     }
                 }, 240);
             }, 2250, token);
+        }
+
+
+        getAllConversationLogicalIndices() {
+            const indices = new Set();
+            for (const button of this.getOfficialNavButtons()) {
+                const index = Number.parseInt(button.dataset.tocItemIndex ?? '', 10);
+                if (Number.isInteger(index) && index >= 0) indices.add(index);
+            }
+            for (const item of this.conversationItems) {
+                if (Number.isInteger(item.logicalIndex) && item.logicalIndex >= 0) {
+                    indices.add(item.logicalIndex);
+                }
+            }
+            for (const index of this.conversationArchive.keys()) indices.add(index);
+            return [...indices].sort((a, b) => a - b);
+        }
+
+        updateConversationArchiveUi(message = '') {
+            if (!this.config.enableConversationArchive) return;
+            const indices = this.getAllConversationLogicalIndices();
+            const total = indices.length;
+            const loaded = indices.filter((index) => this.conversationArchive.has(index)).length;
+            const selected = indices.filter((index) => this.selectedConversationIndices.has(index)).length;
+            const busy = Boolean(this.conversationLoadPromise || this.conversationExportInProgress);
+
+            if (this.conversationArchiveStatus) {
+                if (message) {
+                    this.conversationArchiveStatus.textContent = message;
+                } else if (this.conversationLoadPromise) {
+                    const { completed, total: taskTotal, failed } = this.conversationLoadProgress;
+                    this.conversationArchiveStatus.textContent = `处理中 ${completed}/${taskTotal}${failed ? `，失败 ${failed}` : ''}`;
+                } else if (this.conversationExportInProgress && this.conversationAssetProgress.total) {
+                    const { completed, total: taskTotal, failed } = this.conversationAssetProgress;
+                    this.conversationArchiveStatus.textContent = `附件 ${completed}/${taskTotal}${failed ? `，失败 ${failed}` : ''}`;
+                } else {
+                    this.conversationArchiveStatus.textContent = `已缓存 ${loaded}/${total}`;
+                }
+            }
+            if (this.conversationSelectionStatus) {
+                this.conversationSelectionStatus.textContent = `已选 ${selected}`;
+            }
+            if (this.conversationLoadAllButton) {
+                this.conversationLoadAllButton.disabled = busy || !total || loaded >= total;
+                this.conversationLoadAllButton.textContent = loaded >= total && total > 0 ? '已加载全部' : '加载全部';
+            }
+            if (this.conversationCancelLoadButton) {
+                this.conversationCancelLoadButton.hidden = !this.conversationLoadPromise && !this.conversationExportInProgress;
+            }
+            if (this.conversationSelectAllButton) {
+                this.conversationSelectAllButton.disabled = !total || selected >= total;
+            }
+            if (this.conversationClearSelectionButton) {
+                this.conversationClearSelectionButton.disabled = selected === 0;
+            }
+            if (this.conversationExportSelectedButton) {
+                this.conversationExportSelectedButton.disabled = busy || selected === 0;
+            }
+            if (this.conversationExportAllButton) {
+                this.conversationExportAllButton.disabled = busy || !total;
+            }
+            if (this.conversationExportSelectedZipButton) {
+                this.conversationExportSelectedZipButton.disabled = busy || selected === 0;
+            }
+            if (this.conversationExportAllZipButton) {
+                this.conversationExportAllZipButton.disabled = busy || !total;
+            }
+            for (const input of [
+                this.exportIncludeMarkdownInput,
+                this.exportIncludeHtmlInput,
+                this.exportIncludeAssetsInput,
+            ]) {
+                if (input) input.disabled = busy;
+            }
+            if (this.viewExportCount) {
+                this.viewExportCount.textContent = total ? `${loaded}/${total}` : '0';
+            }
+        }
+
+        setConversationSelected(logicalIndex, selected) {
+            if (!Number.isInteger(logicalIndex) || logicalIndex < 0) return;
+            if (selected) this.selectedConversationIndices.add(logicalIndex);
+            else this.selectedConversationIndices.delete(logicalIndex);
+            this.updateViewMeta();
+        }
+
+        selectAllConversations() {
+            for (const index of this.getAllConversationLogicalIndices()) {
+                this.selectedConversationIndices.add(index);
+            }
+            this.renderConversationItems();
+        }
+
+        clearConversationSelection() {
+            this.selectedConversationIndices.clear();
+            this.renderConversationItems();
+        }
+
+        cancelConversationArchiveLoad(reason = '已停止', updateUi = true, invalidate = false) {
+            if (invalidate) this.conversationLoadRunId += 1;
+            this.conversationLoadAbortController?.abort();
+            if (invalidate) {
+                this.conversationLoadAbortController = null;
+                this.conversationLoadPromise = null;
+                this.conversationLoadMode = '';
+                this.conversationExportInProgress = false;
+            }
+            if (updateUi) this.updateConversationArchiveUi(reason);
+        }
+
+        waitForDelay(ms, signal) {
+            return new Promise((resolve, reject) => {
+                if (signal?.aborted) {
+                    reject(new DOMException('Aborted', 'AbortError'));
+                    return;
+                }
+                const timer = window.setTimeout(resolve, Math.max(0, Number(ms) || 0));
+                signal?.addEventListener('abort', () => {
+                    window.clearTimeout(timer);
+                    reject(new DOMException('Aborted', 'AbortError'));
+                }, { once: true });
+            });
+        }
+
+        async waitForOfficialConversationButtonsStable(signal) {
+            let previousSignature = '';
+            const startedAt = performance.now();
+            let stableSince = startedAt;
+            const deadline = startedAt + 3200;
+
+            while (performance.now() < deadline) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                const buttons = this.syncOfficialConversationNav();
+                const signature = buttons.map((button) => button.dataset.tocItemIndex ?? '').join(',');
+                const now = performance.now();
+                if (signature !== previousSignature) {
+                    previousSignature = signature;
+                    stableSince = now;
+                } else if (
+                    buttons.length &&
+                    now - startedAt >= 850 &&
+                    now - stableSince >= 420
+                ) {
+                    return buttons;
+                }
+                await this.waitForDelay(90, signal);
+            }
+            return this.getOfficialNavButtons();
+        }
+
+        getConversationReturnPoint() {
+            const officialIndex = this.getOfficialActiveLogicalIndex();
+            const activeItem = this.conversationItems[this.activeConversationIndex];
+            const logicalIndex = officialIndex >= 0 ? officialIndex : activeItem?.logicalIndex ?? -1;
+            const target = logicalIndex >= 0 ? this.resolveConversationTarget(logicalIndex) : null;
+            const scrollRoot = target instanceof HTMLElement
+                ? this.findScrollRoot(target)
+                : this.currentScrollRoot;
+            return {
+                logicalIndex,
+                targetTop: target instanceof HTMLElement ? target.getBoundingClientRect().top : null,
+                scrollRoot: scrollRoot instanceof HTMLElement ? scrollRoot : null,
+                scrollTop: scrollRoot instanceof HTMLElement
+                    ? scrollRoot.scrollTop
+                    : window.scrollY || document.documentElement.scrollTop || 0,
+            };
+        }
+
+        async restoreConversationReturnPoint(returnPoint, signal) {
+            if (!returnPoint || signal?.aborted) return;
+            const { logicalIndex, targetTop, scrollRoot, scrollTop } = returnPoint;
+
+            if (Number.isInteger(logicalIndex) && logicalIndex >= 0) {
+                this.activateOfficialConversationButton(logicalIndex);
+                const pair = await this.waitForConversationPair(logicalIndex, signal, 2500, false).catch(() => null);
+                const target = pair?.targetElement || this.resolveConversationTarget(logicalIndex);
+                if (target instanceof HTMLElement && Number.isFinite(targetTop)) {
+                    const delta = target.getBoundingClientRect().top - targetTop;
+                    const root = this.findScrollRoot(target);
+                    if (root instanceof HTMLElement) root.scrollBy({ top: delta, behavior: 'auto' });
+                    else window.scrollBy({ top: delta, behavior: 'auto' });
+                    return;
+                }
+            }
+
+            if (scrollRoot?.isConnected) scrollRoot.scrollTop = scrollTop;
+            else window.scrollTo({ top: scrollTop, behavior: 'auto' });
+        }
+
+        getAssistantMessageElements() {
+            return [...document.querySelectorAll(ASSISTANT_SELECTOR)]
+                .filter((element) => element instanceof HTMLElement && element.isConnected)
+                .sort((a, b) => {
+                    if (a === b) return 0;
+                    const relation = a.compareDocumentPosition(b);
+                    if (relation & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+                    if (relation & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+                    return 0;
+                });
+        }
+
+        findAssistantForUser(userElement) {
+            if (!(userElement instanceof HTMLElement) || !userElement.isConnected) return null;
+            const userTurnNumber = this.getConversationTurnNumber(userElement);
+            if (Number.isInteger(userTurnNumber)) {
+                const exact = document.querySelector(
+                    `[data-testid="conversation-turn-${userTurnNumber + 1}"] ${ASSISTANT_SELECTOR.replace(/^main\s+/, '')}`,
+                );
+                if (exact instanceof HTMLElement && exact.isConnected) return exact;
+            }
+
+            const nextUser = this.getUserMessageElements().find((candidate) => {
+                if (candidate === userElement) return false;
+                const relation = userElement.compareDocumentPosition(candidate);
+                return Boolean(relation & Node.DOCUMENT_POSITION_FOLLOWING);
+            }) || null;
+
+            for (const assistant of this.getAssistantMessageElements()) {
+                const relation = userElement.compareDocumentPosition(assistant);
+                if (!(relation & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+                if (nextUser) {
+                    const assistantToNext = assistant.compareDocumentPosition(nextUser);
+                    if (assistantToNext & Node.DOCUMENT_POSITION_PRECEDING) continue;
+                }
+                return assistant;
+            }
+            return null;
+        }
+
+        resolveConversationPair(logicalIndex) {
+            const officialButtons = this.getOfficialNavButtons();
+            const records = this.collectUserMessageRecords();
+            const mapping = this.mapUserRecordsToLogicalIndices(records, officialButtons);
+            let record = mapping.recordsByIndex.get(logicalIndex) || null;
+
+            if (!record && this.getOfficialActiveLogicalIndex(officialButtons) === logicalIndex) {
+                const anchorIndex = this.findViewportPromptRecordIndex(records);
+                record = records[anchorIndex] || records[records.length - 1] || null;
+            }
+            if (!record?.userElement?.isConnected) return null;
+
+            const assistantElement = this.findAssistantForUser(record.userElement);
+            if (!(assistantElement instanceof HTMLElement) || !assistantElement.isConnected) return null;
+            return {
+                record,
+                userElement: record.userElement,
+                targetElement: record.targetElement || record.userElement,
+                assistantElement,
+            };
+        }
+
+        getConversationPairSignature(pair) {
+            if (!pair) return '';
+            const userText = this.extractUserPromptText(pair.userElement);
+            const assistantText = this.normalizeConversationText(pair.assistantElement.textContent ?? '');
+            const assistantRoot = pair.assistantElement.querySelector('.markdown, [data-message-content]') || pair.assistantElement;
+            const assetSignature = [...pair.assistantElement.querySelectorAll(
+                'img, iframe, canvas, a[href], video[src], audio[src], object[data], embed[src]',
+            )].slice(0, 24).map((element) => {
+                const value = element.getAttribute('src') || element.getAttribute('href') ||
+                    element.getAttribute('data') || element.getAttribute('srcdoc') || '';
+                return `${element.tagName}:${value.length}:${value.slice(-24)}`;
+            }).join('|');
+            return `${userText.length}:${assistantText.length}:${assistantRoot.childElementCount}:${assistantText.slice(-48)}:${assetSignature}`;
+        }
+
+        async waitForConversationPair(logicalIndex, signal, timeoutMs = this.config.conversationLoadTimeoutMs, activate = true) {
+            const deadline = performance.now() + Math.max(1200, Number(timeoutMs) || 7000);
+            const settleMs = Math.max(80, Number(this.config.conversationLoadSettleMs) || 260);
+            let lastSignature = '';
+            let stableSince = 0;
+            let lastActivation = 0;
+
+            while (performance.now() < deadline) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                const now = performance.now();
+                if (activate && now - lastActivation >= 900) {
+                    const activeIndex = this.getOfficialActiveLogicalIndex();
+                    if (activeIndex !== logicalIndex) this.activateOfficialConversationButton(logicalIndex);
+                    lastActivation = now;
+                }
+
+                this.syncOfficialConversationNav();
+                const pair = this.resolveConversationPair(logicalIndex);
+                const signature = this.getConversationPairSignature(pair);
+                if (pair && signature) {
+                    if (signature === lastSignature) {
+                        if (!stableSince) stableSince = now;
+                        if (now - stableSince >= settleMs) return pair;
+                    } else {
+                        lastSignature = signature;
+                        stableSince = now;
+                    }
+                }
+                await this.waitForDelay(90, signal);
+            }
+            return null;
+        }
+
+        getMessageExportSource(element) {
+            if (!(element instanceof HTMLElement)) return null;
+            return element.querySelector('.markdown, [data-message-content]') || element;
+        }
+
+        normalizeAssetCandidateUrl(rawValue) {
+            const raw = String(rawValue || '').trim();
+            if (!raw || /^(?:javascript|mailto|tel):/i.test(raw)) return '';
+            if (/^(?:data|blob|sandbox):/i.test(raw)) return raw;
+            try {
+                return new URL(raw, location.href).href;
+            } catch {
+                return raw;
+            }
+        }
+
+        getLargestImageCandidate(image) {
+            if (!(image instanceof HTMLImageElement)) return '';
+            const srcset = image.getAttribute('srcset') || '';
+            const candidates = srcset.split(',').map((item) => {
+                const match = item.trim().match(/^(\S+)(?:\s+(\d+(?:\.\d+)?)(w|x))?$/);
+                if (!match) return null;
+                const weight = match[3] === 'w'
+                    ? Number(match[2]) || 0
+                    : (Number(match[2]) || 1) * 10000;
+                return { url: match[1], weight };
+            }).filter(Boolean).sort((a, b) => b.weight - a.weight);
+            return this.normalizeAssetCandidateUrl(
+                candidates[0]?.url || image.currentSrc || image.getAttribute('src') || '',
+            );
+        }
+
+        getElementUrlAlternates(element, primary = '') {
+            const values = [];
+            const push = (value) => {
+                const normalized = this.normalizeAssetCandidateUrl(value);
+                if (normalized && normalized !== primary && !values.includes(normalized)) values.push(normalized);
+            };
+            if (!(element instanceof Element)) return values;
+            for (const attribute of element.attributes) {
+                if (!/^(?:href|src|data|poster|data-[\w-]*(?:url|href|src|download|file)[\w-]*)$/i.test(attribute.name)) continue;
+                push(attribute.value);
+            }
+            return values;
+        }
+
+        isLikelyDownloadAssetLink(anchor, url) {
+            if (!(anchor instanceof HTMLAnchorElement)) return false;
+            const raw = anchor.getAttribute('href') || '';
+            const signal = [
+                anchor.getAttribute('download'),
+                anchor.getAttribute('aria-label'),
+                anchor.getAttribute('title'),
+                anchor.getAttribute('data-testid'),
+                anchor.className,
+                anchor.textContent,
+                raw,
+                url,
+            ].filter(Boolean).join(' ');
+            if (anchor.hasAttribute('download')) return true;
+            if (/^(?:blob|data|sandbox):/i.test(raw)) return true;
+            if (/(?:下载|附件|文件|artifact|download|attachment|generated[-_ ]?file)/i.test(signal)) return true;
+            if (/(?:\/backend-api\/files?\/|\/files?\/|oaiusercontent\.com|oaistatic\.com)/i.test(url)) return true;
+            try {
+                const pathname = new URL(url, location.href).pathname;
+                return /\.(?:avif|bmp|csv|docx?|gif|gz|html?|ico|jpe?g|json|md|m4a|mov|mp3|mp4|odp|ods|odt|pdf|png|pptx?|py|rtf|svg|tar|tgz|tsv|txt|wav|webm|webp|xls[xbm]?|xml|yaml|yml|zip)(?:$|[?#])/i.test(`${pathname}${new URL(url, location.href).search}`);
+            } catch {
+                return false;
+            }
+        }
+
+        sanitizeAssetFilename(value, fallback = 'asset') {
+            const cleaned = String(value || '')
+                .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+                .replace(/\s+/g, ' ')
+                .replace(/[. ]+$/g, '')
+                .trim();
+            return (cleaned || fallback).slice(0, 140);
+        }
+
+        getMimeExtension(mimeType) {
+            const mime = String(mimeType || '').split(';')[0].trim().toLowerCase();
+            const map = {
+                'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+                'image/webp': 'webp', 'image/svg+xml': 'svg', 'image/avif': 'avif',
+                'application/pdf': 'pdf', 'application/zip': 'zip',
+                'application/json': 'json', 'text/plain': 'txt', 'text/markdown': 'md',
+                'text/html': 'html', 'text/csv': 'csv', 'application/xml': 'xml',
+                'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'video/mp4': 'mp4',
+                'video/webm': 'webm',
+            };
+            return map[mime] || '';
+        }
+
+        getAssetFilenameHint(candidate, sequence) {
+            const direct = candidate.filenameHint || candidate.element?.getAttribute?.('download') || '';
+            if (direct) return this.sanitizeAssetFilename(direct, `asset-${sequence}`);
+            const url = candidate.url || '';
+            if (/^data:/i.test(url)) {
+                const extension = this.getMimeExtension(candidate.mimeType) || 'bin';
+                return `asset-${sequence}.${extension}`;
+            }
+            try {
+                const pathname = decodeURIComponent(new URL(url, location.href).pathname);
+                const last = pathname.split('/').filter(Boolean).pop();
+                if (last && last.includes('.')) return this.sanitizeAssetFilename(last, `asset-${sequence}`);
+            } catch {
+                // 使用标签后备。
+            }
+            const base = this.sanitizeAssetFilename(candidate.label || candidate.kind || `asset-${sequence}`, `asset-${sequence}`);
+            const extension = this.getMimeExtension(candidate.mimeType);
+            return extension && !/\.[a-z0-9]{1,8}$/i.test(base) ? `${base}.${extension}` : base;
+        }
+
+        canvasToBlob(canvas) {
+            return new Promise((resolve) => {
+                try {
+                    canvas.toBlob((blob) => resolve(blob || null), 'image/png');
+                } catch {
+                    resolve(null);
+                }
+            });
+        }
+
+        serializeIframeDocument(iframe) {
+            try {
+                if (iframe.srcdoc) return iframe.srcdoc;
+                const doc = iframe.contentDocument;
+                if (doc?.documentElement) {
+                    return `<!doctype html>\n${doc.documentElement.outerHTML}`;
+                }
+            } catch {
+                // 跨域 iframe 无法直接读取；保留其 URL，导出时再尝试下载。
+            }
+            return '';
+        }
+
+        async discoverMessageAssets(root, logicalIndex, role, sequenceStart = 0) {
+            if (!(root instanceof HTMLElement)) return { assets: [], annotatedElements: [], nextSequence: sequenceStart };
+            const candidates = [];
+            const addCandidate = (element, data) => {
+                if (!(element instanceof Element)) return;
+                candidates.push({ element, role, ...data });
+            };
+
+            for (const image of root.querySelectorAll('img')) {
+                if (image.closest('[role="tooltip"], [data-message-actions]')) continue;
+                const url = this.getLargestImageCandidate(image);
+                if (!url) continue;
+                addCandidate(image, {
+                    kind: 'image',
+                    url,
+                    alternateUrls: this.getElementUrlAlternates(image, url),
+                    label: image.getAttribute('alt') || image.getAttribute('aria-label') || '图片',
+                    filenameHint: image.getAttribute('download') || '',
+                    mimeType: /^data:([^;,]+)/i.exec(url)?.[1] || '',
+                });
+            }
+
+            for (const anchor of root.querySelectorAll('a[href]')) {
+                const url = this.normalizeAssetCandidateUrl(anchor.getAttribute('href') || anchor.href);
+                if (!url || !this.isLikelyDownloadAssetLink(anchor, url)) continue;
+                addCandidate(anchor, {
+                    kind: /\.html?(?:$|[?#])/i.test(url) || /artifact/i.test(anchor.getAttribute('data-testid') || '')
+                        ? 'artifact-html'
+                        : 'file',
+                    url,
+                    alternateUrls: this.getElementUrlAlternates(anchor, url),
+                    label: anchor.textContent?.trim() || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || '附件',
+                    filenameHint: anchor.getAttribute('download') || '',
+                    mimeType: '',
+                });
+            }
+
+            for (const control of root.querySelectorAll('button, [role="button"]')) {
+                const signal = [
+                    control.getAttribute('aria-label'),
+                    control.getAttribute('title'),
+                    control.getAttribute('data-testid'),
+                    control.textContent,
+                ].filter(Boolean).join(' ');
+                if (!/(?:下载|附件|文件|artifact|download|attachment)/i.test(signal)) continue;
+                const alternates = this.getElementUrlAlternates(control, '');
+                const url = alternates[0] || '';
+                addCandidate(control, {
+                    kind: /artifact/i.test(signal) ? 'artifact' : 'file-control',
+                    url,
+                    alternateUrls: alternates.slice(1),
+                    label: control.textContent?.trim() || control.getAttribute('aria-label') || '附件',
+                    filenameHint: '',
+                    mimeType: '',
+                });
+            }
+
+            for (const iframe of root.querySelectorAll('iframe')) {
+                const html = this.serializeIframeDocument(iframe);
+                const url = this.normalizeAssetCandidateUrl(iframe.getAttribute('src') || '');
+                if (!html && !url) continue;
+                addCandidate(iframe, {
+                    kind: 'artifact-html',
+                    url,
+                    alternateUrls: this.getElementUrlAlternates(iframe, url),
+                    label: iframe.getAttribute('title') || iframe.getAttribute('aria-label') || '交互式 Artifact',
+                    filenameHint: 'artifact.html',
+                    mimeType: 'text/html',
+                    inlineBlob: html ? new Blob([html], { type: 'text/html;charset=utf-8' }) : null,
+                });
+            }
+
+            for (const canvas of root.querySelectorAll('canvas')) {
+                const rect = canvas.getBoundingClientRect();
+                if (rect.width < 24 && rect.height < 24) continue;
+                addCandidate(canvas, {
+                    kind: 'canvas-image',
+                    url: '',
+                    alternateUrls: [],
+                    label: canvas.getAttribute('aria-label') || 'Canvas 图像',
+                    filenameHint: 'canvas.png',
+                    mimeType: 'image/png',
+                    inlineBlob: await this.canvasToBlob(canvas),
+                });
+            }
+
+            for (const svg of root.querySelectorAll('svg:not(.icon)')) {
+                if (svg.closest('.katex, button, [aria-hidden="true"]')) continue;
+                const box = svg.getBoundingClientRect();
+                if (box.width < 48 && box.height < 48) continue;
+                const xml = new XMLSerializer().serializeToString(svg);
+                addCandidate(svg, {
+                    kind: 'svg-image',
+                    url: '',
+                    alternateUrls: [],
+                    label: svg.getAttribute('aria-label') || svg.querySelector('title')?.textContent || 'SVG 图像',
+                    filenameHint: 'graphic.svg',
+                    mimeType: 'image/svg+xml',
+                    inlineBlob: new Blob([xml], { type: 'image/svg+xml;charset=utf-8' }),
+                });
+            }
+
+            for (const element of root.querySelectorAll('video[src], audio[src], source[src], object[data], embed[src]')) {
+                const raw = element.getAttribute('src') || element.getAttribute('data') || '';
+                const url = this.normalizeAssetCandidateUrl(raw);
+                if (!url) continue;
+                addCandidate(element, {
+                    kind: element.tagName.toLowerCase(),
+                    url,
+                    alternateUrls: this.getElementUrlAlternates(element, url),
+                    label: element.getAttribute('aria-label') || element.getAttribute('title') || element.tagName.toLowerCase(),
+                    filenameHint: '',
+                    mimeType: element.getAttribute('type') || '',
+                });
+            }
+
+            const assets = [];
+            const annotatedElements = [];
+            const byKey = new Map();
+            let sequence = sequenceStart;
+            for (const candidate of candidates) {
+                const sourceUrl = candidate.url || '';
+                let inlineBlob = candidate.inlineBlob instanceof Blob ? candidate.inlineBlob : null;
+                if (!inlineBlob && /^(?:blob|data):/i.test(sourceUrl)) {
+                    try {
+                        const response = await fetch(sourceUrl);
+                        if (response.ok) inlineBlob = await response.blob();
+                    } catch {
+                        // blob: URL 可能已失效；仍保留原始 URL，导出时再尝试一次。
+                    }
+                }
+                const key = sourceUrl
+                    ? `${candidate.kind}|${sourceUrl}`
+                    : `${candidate.kind}|inline|${sequence + 1}`;
+                let asset = byKey.get(key);
+                if (!asset) {
+                    sequence += 1;
+                    const id = `q${String(logicalIndex + 1).padStart(3, '0')}-${role}-a${String(sequence).padStart(3, '0')}`;
+                    const mimeType = candidate.mimeType || inlineBlob?.type || '';
+                    asset = {
+                        id,
+                        logicalIndex,
+                        role,
+                        kind: candidate.kind,
+                        label: String(candidate.label || '附件').trim() || '附件',
+                        sourceUrl,
+                        alternateUrls: [...new Set(candidate.alternateUrls || [])],
+                        filenameHint: this.getAssetFilenameHint({ ...candidate, mimeType }, sequence),
+                        mimeType,
+                        byteLength: inlineBlob?.size || 0,
+                        blob: inlineBlob,
+                        capturedAt: new Date().toISOString(),
+                    };
+                    byKey.set(key, asset);
+                    assets.push(asset);
+                } else {
+                    for (const alternate of candidate.alternateUrls || []) {
+                        if (alternate && !asset.alternateUrls.includes(alternate)) asset.alternateUrls.push(alternate);
+                    }
+                }
+                candidate.element.setAttribute('data-cgpt-export-asset-id', asset.id);
+                annotatedElements.push(candidate.element);
+            }
+
+            return { assets, annotatedElements, nextSequence: sequence };
+        }
+
+        async discoverConversationAssets(logicalIndex, pair) {
+            const user = await this.discoverMessageAssets(pair.userElement, logicalIndex, 'user', 0);
+            const assistant = await this.discoverMessageAssets(
+                pair.assistantElement,
+                logicalIndex,
+                'assistant',
+                user.nextSequence,
+            );
+            return {
+                assets: [...user.assets, ...assistant.assets],
+                annotatedElements: [...user.annotatedElements, ...assistant.annotatedElements],
+            };
+        }
+
+        sanitizeExportHtmlClone(clone) {
+            if (!(clone instanceof Element)) return;
+            for (const element of clone.querySelectorAll('*')) {
+                for (const attribute of [...element.attributes]) {
+                    if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
+                }
+                element.removeAttribute('contenteditable');
+                element.removeAttribute('autofocus');
+            }
+            const selectors = [
+                'script', 'style', 'noscript', 'textarea', 'input', 'select',
+                '[role="tooltip"]', '[data-testid*="copy"]', '[data-testid*="feedback"]',
+                '[data-message-actions]', '.sr-only', 'svg.icon', '[aria-hidden="true"]',
+            ];
+            for (const removable of clone.querySelectorAll(selectors.join(','))) {
+                if (removable.hasAttribute('data-cgpt-export-asset-id')) continue;
+                removable.remove();
+            }
+            for (const button of clone.querySelectorAll('button')) {
+                const assetId = button.getAttribute('data-cgpt-export-asset-id');
+                if (!assetId) {
+                    button.remove();
+                    continue;
+                }
+                const link = clone.ownerDocument.createElement('a');
+                link.href = `cgpt-asset://${assetId}`;
+                link.setAttribute('data-cgpt-export-asset-id', assetId);
+                link.textContent = button.textContent?.trim() || '下载附件';
+                button.replaceWith(link);
+            }
+            for (const canvas of clone.querySelectorAll('canvas[data-cgpt-export-asset-id]')) {
+                const image = clone.ownerDocument.createElement('img');
+                image.src = `cgpt-asset://${canvas.getAttribute('data-cgpt-export-asset-id')}`;
+                image.alt = canvas.getAttribute('aria-label') || 'Canvas 图像';
+                image.setAttribute('data-cgpt-export-asset-id', canvas.getAttribute('data-cgpt-export-asset-id'));
+                canvas.replaceWith(image);
+            }
+        }
+
+        elementToExportHtml(element) {
+            const source = this.getMessageExportSource(element);
+            if (!(source instanceof HTMLElement)) return '';
+            const clone = source.cloneNode(true);
+            this.sanitizeExportHtmlClone(clone);
+            return clone.innerHTML.trim();
+        }
+
+        removeExportUiNoise(root) {
+            if (!(root instanceof Element)) return;
+            const selectors = [
+                'button', 'script', 'style', 'svg', 'textarea', 'input',
+                '[role="tooltip"]', '[aria-hidden="true"]', '[data-testid*="copy"]',
+                '[data-testid*="feedback"]', '[data-message-actions]', '.sr-only',
+            ];
+            for (const removable of root.querySelectorAll(selectors.join(','))) {
+                if (removable.hasAttribute('data-cgpt-export-asset-id')) continue;
+                removable.remove();
+            }
+        }
+
+        escapeMarkdownInline(text) {
+            return String(text || '').replace(/([\\[\]*_~])/g, '\\$1');
+        }
+
+        getMathLatex(element) {
+            if (!(element instanceof Element)) return '';
+            const annotation = element.querySelector('annotation[encoding="application/x-tex"]');
+            return annotation?.textContent?.trim() || '';
+        }
+
+        serializeInlineNodes(nodes) {
+            return [...nodes].map((node) => this.serializeInlineNode(node)).join('');
+        }
+
+        serializeInlineNode(node) {
+            if (node.nodeType === Node.TEXT_NODE) return String(node.nodeValue || '');
+            if (!(node instanceof Element)) return '';
+            const tag = node.tagName.toLowerCase();
+            const assetId = node.getAttribute('data-cgpt-export-asset-id');
+            if (assetId) {
+                const token = `cgpt-asset://${assetId}`;
+                const label = node.getAttribute('alt') || node.getAttribute('aria-label') ||
+                    node.getAttribute('title') || node.textContent?.trim() || '附件';
+                if (tag === 'img' || tag === 'canvas' || tag === 'svg') {
+                    return `![${this.escapeMarkdownInline(label)}](${token})`;
+                }
+                if (tag === 'a') {
+                    const inner = this.serializeInlineNodes(node.childNodes).trim() || this.escapeMarkdownInline(label);
+                    return `[${inner}](${token})`;
+                }
+                return `[${this.escapeMarkdownInline(label)}](${token})`;
+            }
+            if (tag === 'br') return '\n';
+            if (node.matches('.katex, .katex-display')) {
+                const latex = this.getMathLatex(node);
+                if (latex) return node.matches('.katex-display') ? `\n$$\n${latex}\n$$\n` : `$${latex}$`;
+            }
+            if (tag === 'strong' || tag === 'b') return `**${this.serializeInlineNodes(node.childNodes)}**`;
+            if (tag === 'em' || tag === 'i') return `*${this.serializeInlineNodes(node.childNodes)}*`;
+            if (tag === 'del' || tag === 's') return `~~${this.serializeInlineNodes(node.childNodes)}~~`;
+            if (tag === 'code' && node.parentElement?.tagName.toLowerCase() !== 'pre') {
+                const value = node.textContent || '';
+                const maxTicks = Math.max(0, ...[...value.matchAll(/`+/g)].map((match) => match[0].length));
+                const fence = '`'.repeat(Math.max(1, maxTicks + 1));
+                return `${fence}${value}${fence}`;
+            }
+            if (tag === 'a') {
+                const label = this.serializeInlineNodes(node.childNodes).trim() || node.textContent?.trim() || '';
+                const href = node.getAttribute('href') || '';
+                return href ? `[${label}](${href})` : label;
+            }
+            if (tag === 'img') {
+                const alt = node.getAttribute('alt') || 'image';
+                const src = node.getAttribute('src') || '';
+                return src ? `![${alt}](${src})` : alt;
+            }
+            if (tag === 'sup') return `<sup>${this.serializeInlineNodes(node.childNodes)}</sup>`;
+            if (tag === 'sub') return `<sub>${this.serializeInlineNodes(node.childNodes)}</sub>`;
+            return this.serializeInlineNodes(node.childNodes);
+        }
+
+        serializeList(element, depth = 0) {
+            const ordered = element.tagName.toLowerCase() === 'ol';
+            const start = Number.parseInt(element.getAttribute('start') || '1', 10) || 1;
+            const lines = [];
+            const children = [...element.children].filter((child) => child.tagName.toLowerCase() === 'li');
+            children.forEach((li, index) => {
+                const clone = li.cloneNode(true);
+                for (const nested of clone.querySelectorAll(':scope > ul, :scope > ol')) nested.remove();
+                const content = this.serializeInlineNodes(clone.childNodes).replace(/\s+/g, ' ').trim();
+                const marker = ordered ? `${start + index}.` : '-';
+                const indent = '  '.repeat(depth);
+                lines.push(`${indent}${marker} ${content}`.trimEnd());
+                for (const nested of [...li.children].filter((child) => /^(UL|OL)$/.test(child.tagName))) {
+                    lines.push(this.serializeList(nested, depth + 1));
+                }
+            });
+            return `${lines.filter(Boolean).join('\n')}\n\n`;
+        }
+
+        serializeTable(element) {
+            const rows = [...element.querySelectorAll('tr')];
+            if (!rows.length) return '';
+            const values = rows.map((row) => [...row.querySelectorAll(':scope > th, :scope > td')]
+                .map((cell) => this.serializeInlineNodes(cell.childNodes).replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim()));
+            const columns = Math.max(...values.map((row) => row.length));
+            if (!columns) return '';
+            const normalizeRow = (row) => [...row, ...Array(Math.max(0, columns - row.length)).fill('')];
+            const header = normalizeRow(values[0]);
+            const body = values.slice(1).map(normalizeRow);
+            const lines = [
+                `| ${header.join(' | ')} |`,
+                `| ${header.map(() => '---').join(' | ')} |`,
+                ...body.map((row) => `| ${row.join(' | ')} |`),
+            ];
+            return `${lines.join('\n')}\n\n`;
+        }
+
+        serializeBlockNode(node) {
+            if (node.nodeType === Node.TEXT_NODE) {
+                const value = String(node.nodeValue || '').trim();
+                return value ? `${value}\n\n` : '';
+            }
+            if (!(node instanceof Element)) return '';
+            const tag = node.tagName.toLowerCase();
+            if (node.hasAttribute('data-cgpt-export-asset-id')) {
+                const inline = this.serializeInlineNode(node).trim();
+                return inline ? `${inline}\n\n` : '';
+            }
+            if (/^h[1-6]$/.test(tag)) {
+                const level = Number.parseInt(tag.slice(1), 10);
+                const text = this.serializeInlineNodes(node.childNodes).trim();
+                return text ? `${'#'.repeat(level)} ${text}\n\n` : '';
+            }
+            if (tag === 'p') {
+                const text = this.serializeInlineNodes(node.childNodes).trim();
+                return text ? `${text}\n\n` : '';
+            }
+            if (tag === 'pre') {
+                const code = node.querySelector('code') || node;
+                const value = (code.textContent || '').replace(/\n$/, '');
+                const className = code.getAttribute('class') || '';
+                const language = /(?:language-|lang-)([\w+-]+)/.exec(className)?.[1] || '';
+                const maxTicks = Math.max(2, ...[...value.matchAll(/`+/g)].map((match) => match[0].length));
+                const fence = '`'.repeat(maxTicks + 1);
+                return `${fence}${language}\n${value}\n${fence}\n\n`;
+            }
+            if (tag === 'ul' || tag === 'ol') return this.serializeList(node);
+            if (tag === 'blockquote') {
+                const inner = this.serializeBlockChildren(node).trim();
+                return inner ? `${inner.split('\n').map((line) => `> ${line}`.trimEnd()).join('\n')}\n\n` : '';
+            }
+            if (tag === 'table') return this.serializeTable(node);
+            if (tag === 'hr') return '---\n\n';
+            if (node.matches('.katex-display')) {
+                const latex = this.getMathLatex(node);
+                return latex ? `$$\n${latex}\n$$\n\n` : '';
+            }
+            const hasBlockChildren = [...node.children].some((child) => /^(H[1-6]|P|PRE|UL|OL|BLOCKQUOTE|TABLE|HR|DIV|SECTION|ARTICLE)$/.test(child.tagName));
+            if (hasBlockChildren) return this.serializeBlockChildren(node);
+            const inline = this.serializeInlineNodes(node.childNodes).trim();
+            return inline ? `${inline}\n\n` : '';
+        }
+
+        serializeBlockChildren(element) {
+            return [...element.childNodes].map((node) => this.serializeBlockNode(node)).join('');
+        }
+
+        normalizeExportMarkdown(markdown) {
+            return String(markdown || '')
+                .replace(/\r\n?/g, '\n')
+                .replace(/[ \t]+$/gm, '')
+                .replace(/\n{4,}/g, '\n\n\n')
+                .trim();
+        }
+
+        elementToMarkdown(element) {
+            if (!(element instanceof HTMLElement)) return '';
+            const source = this.getMessageExportSource(element);
+            const clone = source.cloneNode(true);
+            this.removeExportUiNoise(clone);
+            return this.normalizeExportMarkdown(this.serializeBlockChildren(clone));
+        }
+
+        async captureConversationPair(logicalIndex, pair) {
+            if (!pair) return null;
+            const assetCapture = await this.discoverConversationAssets(logicalIndex, pair);
+            try {
+                const userText = this.extractUserPromptText(pair.userElement);
+                const userMarkdown = this.elementToMarkdown(pair.userElement) || userText;
+                const assistantMarkdown = this.elementToMarkdown(pair.assistantElement);
+                const userHtml = this.elementToExportHtml(pair.userElement);
+                const assistantHtml = this.elementToExportHtml(pair.assistantElement);
+                if (!userText || (!assistantMarkdown && !assistantHtml && !assetCapture.assets.length)) return null;
+
+                const archive = {
+                    logicalIndex,
+                    userText,
+                    userMarkdown,
+                    assistantMarkdown: assistantMarkdown || '_此回答主要包含图片、文件或 Artifact。_',
+                    userHtml,
+                    assistantHtml,
+                    assets: assetCapture.assets,
+                    capturedAt: new Date().toISOString(),
+                };
+                this.conversationArchive.set(logicalIndex, archive);
+                this.conversationArchiveFailures.delete(logicalIndex);
+                this.cacheConversationRecordLabel(logicalIndex, {
+                    ...pair.record,
+                    fullLabel: userText,
+                });
+                this.markSearchIndexDirty(true);
+                this.scheduleConversationRebuild(0);
+                return archive;
+            } finally {
+                for (const element of assetCapture.annotatedElements) {
+                    if (element?.isConnected) element.removeAttribute('data-cgpt-export-asset-id');
+                }
+            }
+        }
+
+        async loadSingleConversation(logicalIndex, signal) {
+            if (this.conversationArchive.has(logicalIndex)) {
+                return this.conversationArchive.get(logicalIndex);
+            }
+            const retries = Math.max(0, Number(this.config.conversationLoadRetryCount) || 0);
+            for (let attempt = 0; attempt <= retries; attempt += 1) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                this.activateOfficialConversationButton(logicalIndex);
+                const pair = await this.waitForConversationPair(logicalIndex, signal);
+                const archive = await this.captureConversationPair(logicalIndex, pair);
+                if (archive) return archive;
+                if (attempt < retries) await this.waitForDelay(180 + attempt * 140, signal);
+            }
+            this.conversationArchiveFailures.set(logicalIndex, '未能在页面中挂载完整问答');
+            return null;
+        }
+
+        async loadConversationIndices(indices, options = {}) {
+            if (!this.config.enableConversationArchive) return { loaded: [], failed: [] };
+            if (this.conversationLoadPromise) return this.conversationLoadPromise;
+
+            const uniqueIndices = [...new Set(indices)]
+                .filter((index) => Number.isInteger(index) && index >= 0)
+                .sort((a, b) => a - b);
+            if (!uniqueIndices.length) return { loaded: [], failed: [] };
+
+            const controller = new AbortController();
+            const signal = controller.signal;
+            const runId = ++this.conversationLoadRunId;
+            const returnPoint = this.getConversationReturnPoint();
+            this.conversationLoadAbortController = controller;
+            this.conversationLoadMode = options.mode || 'load';
+            this.conversationLoadProgress = { completed: 0, total: uniqueIndices.length, failed: 0 };
+            this.pinTransientHoverOpen(true);
+            this.updateConversationArchiveUi();
+
+            const task = (async () => {
+                const loaded = [];
+                const failed = [];
+                try {
+                    await this.waitForOfficialConversationButtonsStable(signal);
+                    for (const logicalIndex of uniqueIndices) {
+                        if (signal.aborted || runId !== this.conversationLoadRunId) {
+                            throw new DOMException('Aborted', 'AbortError');
+                        }
+                        const archive = await this.loadSingleConversation(logicalIndex, signal);
+                        if (archive) loaded.push(logicalIndex);
+                        else failed.push(logicalIndex);
+                        this.conversationLoadProgress.completed += 1;
+                        this.conversationLoadProgress.failed = failed.length;
+                        this.updateConversationArchiveUi();
+                        await this.waitForDelay(this.config.conversationLoadStepDelayMs, signal);
+                    }
+                    return { loaded, failed, aborted: false };
+                } catch (error) {
+                    if (error?.name !== 'AbortError') {
+                        console.warn('[ChatGPT 导航与导出] 加载问答失败：', error);
+                    }
+                    return { loaded, failed, aborted: true, error };
+                } finally {
+                    if (options.restore !== false && runId === this.conversationLoadRunId) {
+                        await this.restoreConversationReturnPoint(returnPoint, null).catch(() => { });
+                    }
+                    if (runId === this.conversationLoadRunId) {
+                        this.conversationLoadAbortController = null;
+                        this.conversationLoadPromise = null;
+                        this.conversationLoadMode = '';
+                        this.scheduleConversationRebuild(0);
+                    }
+                }
+            })();
+
+            this.conversationLoadPromise = task;
+            const result = await task;
+            if (runId === this.conversationLoadRunId) {
+                const message = result.aborted
+                    ? `已停止：缓存 ${this.conversationArchive.size} 轮`
+                    : result.failed.length
+                        ? `完成：成功 ${result.loaded.length}，失败 ${result.failed.length}`
+                        : `已加载 ${result.loaded.length} 轮问答`;
+                this.updateConversationArchiveUi(message);
+            }
+            return result;
+        }
+
+        async loadAllConversations() {
+            if (this.conversationLoadPromise) return;
+            const controller = new AbortController();
+            try {
+                await this.waitForOfficialConversationButtonsStable(controller.signal);
+            } catch {
+                // 后续仍使用当前可见索引。
+            }
+            const indices = this.getAllConversationLogicalIndices();
+            const missing = indices.filter((index) => !this.conversationArchive.has(index));
+            if (!missing.length) {
+                this.updateConversationArchiveUi('全部问答已经缓存');
+                return;
+            }
+            await this.loadConversationIndices(missing, { mode: 'load-all', restore: true });
+        }
+
+        shiftMarkdownHeadings(markdown, amount) {
+            const shift = Math.max(0, Number(amount) || 0);
+            if (!shift) return markdown;
+            let inFence = false;
+            let fenceMarker = '';
+            return String(markdown || '').split('\n').map((line) => {
+                const fence = /^\s*(`{3,}|~{3,})/.exec(line);
+                if (fence) {
+                    if (!inFence) {
+                        inFence = true;
+                        fenceMarker = fence[1][0];
+                    } else if (fence[1][0] === fenceMarker) {
+                        inFence = false;
+                        fenceMarker = '';
+                    }
+                    return line;
+                }
+                if (inFence) return line;
+                return line.replace(/^(#{1,6})\s+/, (match, hashes) => `${'#'.repeat(Math.min(6, hashes.length + shift))} `);
+            }).join('\n');
+        }
+
+        getConversationExportTitle() {
+            return String(document.title || 'ChatGPT Conversation')
+                .replace(/\s*[-–—|]\s*ChatGPT\s*$/i, '')
+                .trim() || 'ChatGPT Conversation';
+        }
+
+        sanitizeExportFilename(value) {
+            const max = Math.max(24, Number(this.config.conversationExportFilenameMaxLength) || 90);
+            const normalized = String(value || 'ChatGPT Conversation')
+                .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+                .replace(/\s+/g, ' ')
+                .replace(/[. ]+$/g, '')
+                .trim();
+            return (normalized || 'ChatGPT Conversation').slice(0, max).trim();
+        }
+
+        getAssetFallbackReference(asset) {
+            const candidates = [asset?.sourceUrl, ...(asset?.alternateUrls || [])]
+                .map((value) => String(value || '').trim())
+                .filter(Boolean);
+            return candidates[0] || '';
+        }
+
+        replaceArchiveAssetTokens(markdown, archive, assetPathMap = new Map()) {
+            const assetsById = new Map((archive?.assets || []).map((asset) => [asset.id, asset]));
+            return String(markdown || '').replace(/cgpt-asset:\/\/([\w.-]+)/g, (match, assetId) => {
+                const local = assetPathMap.get(assetId);
+                if (local) return encodeURI(local);
+                const fallback = this.getAssetFallbackReference(assetsById.get(assetId));
+                return fallback || '#asset-not-available';
+            });
+        }
+
+        buildArchiveAssetMarkdown(archive, assetPathMap = new Map()) {
+            const assets = Array.isArray(archive?.assets) ? archive.assets : [];
+            if (!assets.length) return '';
+            const lines = ['#### 图片、附件与 Artifacts', ''];
+            for (const asset of assets) {
+                const local = assetPathMap.get(asset.id);
+                const reference = local || this.getAssetFallbackReference(asset);
+                const label = this.escapeMarkdownInline(asset.label || asset.filenameHint || '附件');
+                const suffix = local ? '' : reference ? '（外部链接）' : '（未能获取）';
+                lines.push(reference ? `- [${label}](${encodeURI(reference)})${suffix}` : `- ${label}${suffix}`);
+            }
+            return `${lines.join('\n')}\n`;
+        }
+
+        buildConversationMarkdown(indices, options = {}) {
+            const sorted = [...indices].sort((a, b) => a - b);
+            const title = this.getConversationExportTitle();
+            const assetPathMap = options.assetPathMap instanceof Map ? options.assetPathMap : new Map();
+            const includeAssetAppendix = options.includeAssetAppendix !== false;
+            const lines = [`# ${title}`, ''];
+            if (this.config.conversationExportIncludeMetadata) {
+                lines.push(`> 导出时间：${new Date().toLocaleString()}`);
+                lines.push(`> 来源：${location.href}`);
+                lines.push(`> 问答数量：${sorted.length}`);
+                lines.push('');
+            }
+
+            const shift = Math.max(0, Number(this.config.conversationExportShiftAnswerHeadingsBy) || 0);
+            for (const logicalIndex of sorted) {
+                const archive = this.conversationArchive.get(logicalIndex);
+                lines.push(`## 问答 ${logicalIndex + 1}`, '');
+                lines.push('### 用户', '');
+                if (archive?.userMarkdown || archive?.userText) {
+                    const userMarkdown = this.replaceArchiveAssetTokens(
+                        archive.userMarkdown || archive.userText,
+                        archive,
+                        assetPathMap,
+                    );
+                    lines.push(this.shiftMarkdownHeadings(userMarkdown, shift), '');
+                } else {
+                    const fallback = this.conversationItems.find((item) => item.logicalIndex === logicalIndex)?.fullLabel;
+                    lines.push(fallback || `_未能加载第 ${logicalIndex + 1} 轮提问_`, '');
+                }
+                lines.push('### ChatGPT', '');
+                if (archive?.assistantMarkdown) {
+                    const assistantMarkdown = this.replaceArchiveAssetTokens(
+                        archive.assistantMarkdown,
+                        archive,
+                        assetPathMap,
+                    );
+                    lines.push(this.shiftMarkdownHeadings(assistantMarkdown, shift), '');
+                } else {
+                    const reason = this.conversationArchiveFailures.get(logicalIndex) || '未能加载回答内容';
+                    lines.push(`_${reason}_`, '');
+                }
+                if (archive && includeAssetAppendix) {
+                    const appendix = this.buildArchiveAssetMarkdown(archive, assetPathMap);
+                    if (appendix) lines.push(appendix, '');
+                }
+                lines.push('---', '');
+            }
+            return `${lines.join('\n').replace(/\n{4,}/g, '\n\n\n').trim()}\n`;
+        }
+
+        escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        rewriteArchiveHtmlFragment(html, archive, assetPathMap, urlPathMap) {
+            const template = document.createElement('template');
+            template.innerHTML = String(html || '');
+            const assetsById = new Map((archive?.assets || []).map((asset) => [asset.id, asset]));
+            for (const element of template.content.querySelectorAll('*')) {
+                const assetId = element.getAttribute('data-cgpt-export-asset-id');
+                if (assetId) {
+                    const asset = assetsById.get(assetId);
+                    const reference = assetPathMap.get(assetId) || this.getAssetFallbackReference(asset);
+                    if (reference) {
+                        const tag = element.tagName.toLowerCase();
+                        if (tag === 'a') element.setAttribute('href', reference);
+                        else if (tag === 'object') element.setAttribute('data', reference);
+                        else {
+                            element.setAttribute('src', reference);
+                            if (tag === 'iframe' && assetPathMap.has(assetId)) element.removeAttribute('srcdoc');
+                        }
+                    }
+                    element.removeAttribute('data-cgpt-export-asset-id');
+                }
+                for (const attributeName of ['href', 'src', 'poster', 'data']) {
+                    const raw = element.getAttribute(attributeName);
+                    if (!raw) continue;
+                    const tokenMatch = /^cgpt-asset:\/\/([\w.-]+)$/.exec(raw);
+                    if (tokenMatch) {
+                        const asset = assetsById.get(tokenMatch[1]);
+                        const replacement = assetPathMap.get(tokenMatch[1]) || this.getAssetFallbackReference(asset);
+                        if (replacement) element.setAttribute(attributeName, replacement);
+                        else element.removeAttribute(attributeName);
+                        continue;
+                    }
+                    const normalized = this.normalizeAssetCandidateUrl(raw);
+                    const local = urlPathMap.get(normalized) || urlPathMap.get(raw);
+                    if (local) element.setAttribute(attributeName, local);
+                }
+                for (const attribute of [...element.attributes]) {
+                    if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
+                }
+                if (element.tagName.toLowerCase() === 'a') {
+                    element.setAttribute('rel', 'noopener noreferrer');
+                } else if (element.tagName.toLowerCase() === 'iframe') {
+                    element.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
+                }
+            }
+            return template.innerHTML;
+        }
+
+        buildArchiveAssetHtml(archive, assetPathMap) {
+            const assets = Array.isArray(archive?.assets) ? archive.assets : [];
+            if (!assets.length) return '';
+            const items = assets.map((asset) => {
+                const local = assetPathMap.get(asset.id);
+                const reference = local || this.getAssetFallbackReference(asset);
+                const label = this.escapeHtml(asset.label || asset.filenameHint || '附件');
+                const suffix = local ? '' : reference ? ' <span class="muted">（外部链接）</span>' : ' <span class="muted">（未能获取）</span>';
+                return reference
+                    ? `<li><a href="${this.escapeHtml(reference)}">${label}</a>${suffix}</li>`
+                    : `<li>${label}${suffix}</li>`;
+            }).join('');
+            return `<section class="assets"><h4>图片、附件与 Artifacts</h4><ul>${items}</ul></section>`;
+        }
+
+        buildConversationHtml(indices, options = {}) {
+            const sorted = [...indices].sort((a, b) => a - b);
+            const title = this.getConversationExportTitle();
+            const assetPathMap = options.assetPathMap instanceof Map ? options.assetPathMap : new Map();
+            const urlPathMap = options.urlPathMap instanceof Map ? options.urlPathMap : new Map();
+            const sections = [];
+            for (const logicalIndex of sorted) {
+                const archive = this.conversationArchive.get(logicalIndex);
+                const userHtml = archive?.userHtml
+                    ? this.rewriteArchiveHtmlFragment(archive.userHtml, archive, assetPathMap, urlPathMap)
+                    : `<p>${this.escapeHtml(archive?.userText || `未能加载第 ${logicalIndex + 1} 轮提问`)}</p>`;
+                const assistantHtml = archive?.assistantHtml
+                    ? this.rewriteArchiveHtmlFragment(archive.assistantHtml, archive, assetPathMap, urlPathMap)
+                    : `<pre>${this.escapeHtml(archive?.assistantMarkdown || '未能加载回答内容')}</pre>`;
+                const assetHtml = archive ? this.buildArchiveAssetHtml(archive, assetPathMap) : '';
+                sections.push(`
+          <article class="qa" id="qa-${logicalIndex + 1}">
+            <h2>问答 ${logicalIndex + 1}</h2>
+            <section class="message user"><h3>用户</h3><div class="message-content">${userHtml}</div></section>
+            <section class="message assistant"><h3>ChatGPT</h3><div class="message-content">${assistantHtml}</div></section>
+            ${assetHtml}
+          </article>`);
+            }
+            const metadata = this.config.conversationExportIncludeMetadata
+                ? `<p class="metadata">导出时间：${this.escapeHtml(new Date().toLocaleString())}<br>来源：<a href="${this.escapeHtml(location.href)}">${this.escapeHtml(location.href)}</a><br>问答数量：${sorted.length}</p>`
+                : '';
+            return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${this.escapeHtml(title)}</title>
+<style>
+  :root{color-scheme:light dark}body{max-width:980px;margin:0 auto;padding:32px 24px;font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif;background:#fff;color:#1f2328}a{color:#0969da;overflow-wrap:anywhere}.metadata,.muted{color:#656d76}.qa{padding:12px 0 28px;border-bottom:1px solid #d0d7de}.message{margin:16px 0;padding:16px 18px;border-radius:12px;background:#f6f8fa}.assistant{background:#fff;border:1px solid #d8dee4}.message-content img,.message-content video,.message-content iframe{max-width:100%;height:auto}.message-content iframe{width:100%;min-height:420px;border:1px solid #d0d7de;border-radius:8px}.message-content pre{overflow:auto;padding:14px;border-radius:8px;background:#161b22;color:#f0f6fc}.message-content code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.message-content table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.message-content th,.message-content td{padding:6px 10px;border:1px solid #d0d7de}.assets{margin:12px 0}.assets ul{padding-left:24px}@media(prefers-color-scheme:dark){body{background:#111;color:#e6edf3}.message{background:#1c2128}.assistant{background:#111;border-color:#30363d}.qa{border-color:#30363d}a{color:#58a6ff}.metadata,.muted{color:#8b949e}}
+</style>
+</head>
+<body>
+<header><h1>${this.escapeHtml(title)}</h1>${metadata}</header>
+<main>${sections.join('\n')}</main>
+</body>
+</html>`;
+        }
+
+        downloadMarkdown(markdown, selectedOnly) {
+            const title = this.sanitizeExportFilename(this.getConversationExportTitle());
+            const date = new Date();
+            const stamp = [
+                date.getFullYear(),
+                String(date.getMonth() + 1).padStart(2, '0'),
+                String(date.getDate()).padStart(2, '0'),
+                '-',
+                String(date.getHours()).padStart(2, '0'),
+                String(date.getMinutes()).padStart(2, '0'),
+            ].join('');
+            const suffix = selectedOnly ? '-selected' : '-all';
+            const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = `${title}${suffix}-${stamp}.md`;
+            anchor.style.display = 'none';
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            window.setTimeout(() => URL.revokeObjectURL(url), 3000);
+        }
+
+        getExportTimestamp() {
+            const date = new Date();
+            return [
+                date.getFullYear(),
+                String(date.getMonth() + 1).padStart(2, '0'),
+                String(date.getDate()).padStart(2, '0'),
+                '-',
+                String(date.getHours()).padStart(2, '0'),
+                String(date.getMinutes()).padStart(2, '0'),
+            ].join('');
+        }
+
+        downloadBlob(blob, filename) {
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = filename;
+            anchor.style.display = 'none';
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+        }
+
+        parseContentDispositionFilename(value) {
+            const header = String(value || '');
+            const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(header)?.[1];
+            if (utf8) {
+                try { return decodeURIComponent(utf8); } catch { return utf8; }
+            }
+            const plain = /filename\s*=\s*(?:"([^"]+)"|([^;]+))/i.exec(header);
+            return plain?.[1] || plain?.[2]?.trim() || '';
+        }
+
+        async fetchAssetWithPageFetch(url, signal) {
+            const controller = new AbortController();
+            const timeoutMs = Math.max(2000, Number(this.config.conversationExportAssetTimeoutMs) || 30000);
+            const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+            const abort = () => controller.abort();
+            signal?.addEventListener('abort', abort, { once: true });
+            try {
+                const response = await fetch(url, {
+                    method: 'GET',
+                    credentials: 'include',
+                    redirect: 'follow',
+                    cache: 'no-store',
+                    signal: controller.signal,
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const declaredSize = Number(response.headers.get('content-length')) || 0;
+                const maxAsset = Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0);
+                if (declaredSize && declaredSize > maxAsset) {
+                    throw new Error(`附件超过大小限制（${Math.round(declaredSize / 1024 / 1024)} MiB）`);
+                }
+                return {
+                    blob: await response.blob(),
+                    finalUrl: response.url || url,
+                    contentType: response.headers.get('content-type') || '',
+                    contentDisposition: response.headers.get('content-disposition') || '',
+                };
+            } finally {
+                window.clearTimeout(timer);
+                signal?.removeEventListener('abort', abort);
+            }
+        }
+
+        fetchAssetWithGmRequest(url, signal) {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                return Promise.reject(new Error('GM_xmlhttpRequest 不可用'));
+            }
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const finish = (callback, value) => {
+                    if (settled) return;
+                    settled = true;
+                    signal?.removeEventListener('abort', onAbort);
+                    callback(value);
+                };
+                const request = GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    responseType: 'arraybuffer',
+                    timeout: Math.max(2000, Number(this.config.conversationExportAssetTimeoutMs) || 30000),
+                    anonymous: false,
+                    onload: (response) => {
+                        const status = Number(response.status) || 0;
+                        if (status && (status < 200 || status >= 300)) {
+                            finish(reject, new Error(`HTTP ${status}`));
+                            return;
+                        }
+                        const headers = String(response.responseHeaders || '');
+                        const contentType = /^content-type:\s*(.+)$/im.exec(headers)?.[1]?.trim() || '';
+                        const contentDisposition = /^content-disposition:\s*(.+)$/im.exec(headers)?.[1]?.trim() || '';
+                        const buffer = response.response;
+                        if (!(buffer instanceof ArrayBuffer)) {
+                            finish(reject, new Error('跨域请求没有返回二进制内容'));
+                            return;
+                        }
+                        finish(resolve, {
+                            blob: new Blob([buffer], { type: contentType || 'application/octet-stream' }),
+                            finalUrl: response.finalUrl || url,
+                            contentType,
+                            contentDisposition,
+                        });
+                    },
+                    onerror: () => finish(reject, new Error('跨域附件请求失败')),
+                    ontimeout: () => finish(reject, new Error('附件下载超时')),
+                    onabort: () => finish(reject, new DOMException('Aborted', 'AbortError')),
+                });
+                const onAbort = () => {
+                    try { request?.abort?.(); } catch { }
+                    finish(reject, new DOMException('Aborted', 'AbortError'));
+                };
+                signal?.addEventListener('abort', onAbort, { once: true });
+                if (signal?.aborted) onAbort();
+            });
+        }
+
+        async fetchArchiveAsset(asset, signal) {
+            if (asset?.blob instanceof Blob) {
+                return {
+                    blob: asset.blob,
+                    finalUrl: asset.sourceUrl || '',
+                    contentType: asset.blob.type || asset.mimeType || '',
+                    contentDisposition: '',
+                };
+            }
+            const candidates = [asset?.sourceUrl, ...(asset?.alternateUrls || [])]
+                .map((value) => this.normalizeAssetCandidateUrl(value))
+                .filter((value, index, array) => value && array.indexOf(value) === index);
+            const errors = [];
+            for (const url of candidates) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                if (/^sandbox:/i.test(url)) {
+                    errors.push(`${url}: sandbox 链接没有暴露可直接读取的下载地址`);
+                    continue;
+                }
+                try {
+                    const result = await this.fetchAssetWithPageFetch(url, signal);
+                    if (result.blob.size > Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0)) {
+                        throw new Error(`附件超过大小限制（${Math.round(result.blob.size / 1024 / 1024)} MiB）`);
+                    }
+                    return result;
+                } catch (error) {
+                    if (error?.name === 'AbortError') throw error;
+                    errors.push(`${url}: ${error?.message || error}`);
+                }
+                if (/^https?:/i.test(url)) {
+                    try {
+                        const result = await this.fetchAssetWithGmRequest(url, signal);
+                        if (result.blob.size > Math.max(1, Number(this.config.conversationExportMaxAssetBytes) || 0)) {
+                            throw new Error(`附件超过大小限制（${Math.round(result.blob.size / 1024 / 1024)} MiB）`);
+                        }
+                        return result;
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        errors.push(`${url}: ${error?.message || error}`);
+                    }
+                }
+            }
+            throw new Error(errors.join('；') || '没有可读取的附件地址');
+        }
+
+        ensureAssetFilenameExtension(filename, mimeType) {
+            const safe = this.sanitizeAssetFilename(filename, 'asset');
+            const extension = this.getMimeExtension(mimeType);
+            if (/\.bin$/i.test(safe) && extension && extension !== 'bin') {
+                return `${safe.slice(0, -4)}.${extension}`;
+            }
+            if (/\.[a-z0-9]{1,10}$/i.test(safe)) return safe;
+            return extension ? `${safe}.${extension}` : safe;
+        }
+
+        createUniqueAssetPath(logicalIndex, filename, usedPaths) {
+            const folder = `assets/q${String(logicalIndex + 1).padStart(3, '0')}`;
+            const safe = this.sanitizeAssetFilename(filename, 'asset').replace(/\s+/g, '-');
+            const dot = safe.lastIndexOf('.');
+            const stem = dot > 0 ? safe.slice(0, dot) : safe;
+            const extension = dot > 0 ? safe.slice(dot) : '';
+            let candidate = `${folder}/${safe}`;
+            let suffix = 2;
+            while (usedPaths.has(candidate.toLowerCase())) {
+                candidate = `${folder}/${stem}-${suffix}${extension}`;
+                suffix += 1;
+            }
+            usedPaths.add(candidate.toLowerCase());
+            return candidate;
+        }
+
+        getArchiveAssetsForIndices(indices) {
+            const entries = [];
+            for (const logicalIndex of indices) {
+                const archive = this.conversationArchive.get(logicalIndex);
+                for (const asset of archive?.assets || []) entries.push({ logicalIndex, archive, asset });
+            }
+            return entries;
+        }
+
+        async prepareZipAssets(indices, includeAssets, signal) {
+            const tokenPathMap = new Map();
+            const urlPathMap = new Map();
+            const files = [];
+            const manifest = [];
+            if (!includeAssets) {
+                for (const { logicalIndex, asset } of this.getArchiveAssetsForIndices(indices)) {
+                    manifest.push({
+                        logicalIndex,
+                        id: asset.id,
+                        label: asset.label,
+                        kind: asset.kind,
+                        sourceUrl: asset.sourceUrl || '',
+                        included: false,
+                        reason: '用户未勾选“图片和附件”',
+                    });
+                }
+                return { tokenPathMap, urlPathMap, files, manifest };
+            }
+
+            const entries = this.getArchiveAssetsForIndices(indices);
+            const uniqueJobs = new Map();
+            for (const entry of entries) {
+                const key = entry.asset.sourceUrl || entry.asset.blob
+                    ? `${entry.asset.kind}|${entry.asset.sourceUrl || entry.asset.id}`
+                    : entry.asset.id;
+                if (!uniqueJobs.has(key)) uniqueJobs.set(key, { ...entry, refs: [] });
+                uniqueJobs.get(key).refs.push(entry);
+            }
+
+            this.conversationAssetProgress = { completed: 0, total: uniqueJobs.size, failed: 0 };
+            const usedPaths = new Set();
+            let plannedZipBytes = 0;
+            const maxZip = Math.max(1, Number(this.config.conversationExportMaxZipBytes) || 0);
+            for (const job of uniqueJobs.values()) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                const { asset, logicalIndex } = job;
+                this.updateConversationArchiveUi(
+                    `正在获取附件 ${this.conversationAssetProgress.completed + 1}/${this.conversationAssetProgress.total}：${asset.label || asset.filenameHint || '附件'}`,
+                );
+                try {
+                    const result = await this.fetchArchiveAsset(asset, signal);
+                    if (plannedZipBytes + result.blob.size > maxZip) {
+                        throw new Error(`加入此文件后 ZIP 将超过 ${Math.round(maxZip / 1024 / 1024)} MiB 限制`);
+                    }
+                    const dispositionName = this.parseContentDispositionFilename(result.contentDisposition);
+                    const filename = this.ensureAssetFilenameExtension(
+                        dispositionName || asset.filenameHint || asset.label || 'asset',
+                        result.contentType || asset.mimeType || result.blob.type,
+                    );
+                    const path = this.createUniqueAssetPath(logicalIndex, filename, usedPaths);
+                    plannedZipBytes += result.blob.size;
+                    files.push({ path, blob: result.blob, asset, logicalIndex });
+                    for (const ref of job.refs) {
+                        tokenPathMap.set(ref.asset.id, path);
+                        for (const url of [ref.asset.sourceUrl, ...(ref.asset.alternateUrls || [])]) {
+                            if (!url) continue;
+                            urlPathMap.set(url, path);
+                            urlPathMap.set(this.normalizeAssetCandidateUrl(url), path);
+                        }
+                        manifest.push({
+                            logicalIndex: ref.logicalIndex,
+                            id: ref.asset.id,
+                            label: ref.asset.label,
+                            kind: ref.asset.kind,
+                            sourceUrl: ref.asset.sourceUrl || '',
+                            included: true,
+                            path,
+                            size: result.blob.size,
+                            mimeType: result.contentType || ref.asset.mimeType || result.blob.type || '',
+                        });
+                    }
+                } catch (error) {
+                    if (error?.name === 'AbortError') throw error;
+                    this.conversationAssetProgress.failed += 1;
+                    for (const ref of job.refs) {
+                        manifest.push({
+                            logicalIndex: ref.logicalIndex,
+                            id: ref.asset.id,
+                            label: ref.asset.label,
+                            kind: ref.asset.kind,
+                            sourceUrl: ref.asset.sourceUrl || '',
+                            included: false,
+                            reason: error?.message || String(error),
+                        });
+                    }
+                } finally {
+                    this.conversationAssetProgress.completed += 1;
+                }
+            }
+            return { tokenPathMap, urlPathMap, files, manifest };
+        }
+
+        buildZipReadme(assetManifest) {
+            const failures = assetManifest.filter((item) => !item.included);
+            const lines = [
+                'ChatGPT 对话归档',
+                '',
+                'conversation.md：适合 Markdown 阅读器。',
+                'conversation.html：可直接在浏览器中离线打开。',
+                'assets/：成功获取的图片、文件和 HTML Artifacts。',
+                'manifest.json：每个资源的来源、导出路径和失败原因。',
+                '',
+                '说明：页面没有暴露真实下载 URL、链接已过期、登录权限、CORS、文件过大，',
+                '或 sandbox: 链接只能由 ChatGPT 应用内部解析时，附件可能无法被打包。',
+            ];
+            if (failures.length) {
+                lines.push('', `未打包资源：${failures.length} 个`, '');
+                for (const item of failures) {
+                    lines.push(`- 第 ${item.logicalIndex + 1} 轮 / ${item.label || item.id}: ${item.reason || '未知原因'}`);
+                }
+            }
+            return `${lines.join('\n')}\n`;
+        }
+
+        async exportConversationIndicesZip(indices, selectedOnly) {
+            if (this.conversationExportInProgress || this.conversationLoadPromise) return;
+            const uniqueIndices = [...new Set(indices)]
+                .filter((index) => Number.isInteger(index) && index >= 0)
+                .sort((a, b) => a - b);
+            if (!uniqueIndices.length) {
+                this.updateConversationArchiveUi('没有可导出的问答');
+                return;
+            }
+
+            this.conversationExportInProgress = true;
+            const controller = new AbortController();
+            this.conversationLoadAbortController = controller;
+            this.pinTransientHoverOpen(true);
+            let completionMessage = '';
+            try {
+                this.updateConversationArchiveUi('正在准备 ZIP…');
+                const missing = uniqueIndices.filter((index) => !this.conversationArchive.has(index));
+                if (missing.length) {
+                    this.conversationLoadAbortController = null;
+                    const loadResult = await this.loadConversationIndices(missing, { mode: 'zip-export', restore: true });
+                    if (loadResult?.aborted) {
+                        completionMessage = 'ZIP 导出已取消';
+                        return;
+                    }
+                    this.conversationLoadAbortController = controller;
+                }
+
+                const assetPlan = await this.prepareZipAssets(
+                    uniqueIndices,
+                    this.exportIncludeAssets,
+                    controller.signal,
+                );
+                const zip = new StoredZipBuilder();
+                const title = this.sanitizeExportFilename(this.getConversationExportTitle());
+                const documentBase = this.sanitizeAssetFilename(title, 'conversation').replace(/\s+/g, '-');
+
+                if (this.exportIncludeMarkdown) {
+                    const markdown = this.buildConversationMarkdown(uniqueIndices, {
+                        assetPathMap: assetPlan.tokenPathMap,
+                        includeAssetAppendix: true,
+                    });
+                    await zip.add(`${documentBase}.md`, new Blob([markdown], { type: 'text/markdown;charset=utf-8' }));
+                }
+                if (this.exportIncludeHtml) {
+                    const html = this.buildConversationHtml(uniqueIndices, {
+                        assetPathMap: assetPlan.tokenPathMap,
+                        urlPathMap: assetPlan.urlPathMap,
+                    });
+                    await zip.add(`${documentBase}.html`, new Blob([html], { type: 'text/html;charset=utf-8' }));
+                }
+                for (let index = 0; index < assetPlan.files.length; index += 1) {
+                    const file = assetPlan.files[index];
+                    this.updateConversationArchiveUi(`正在写入 ZIP ${index + 1}/${assetPlan.files.length}：${file.path.split('/').pop()}`);
+                    await zip.add(file.path, file.blob);
+                }
+
+                const manifest = {
+                    version: 1,
+                    generatedAt: new Date().toISOString(),
+                    source: location.href,
+                    title: this.getConversationExportTitle(),
+                    selectedOnly,
+                    conversationIndices: uniqueIndices.map((index) => index + 1),
+                    options: {
+                        markdown: this.exportIncludeMarkdown,
+                        html: this.exportIncludeHtml,
+                        assets: this.exportIncludeAssets,
+                    },
+                    assets: assetPlan.manifest,
+                };
+                await zip.add('manifest.json', new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json;charset=utf-8' }));
+                await zip.add('README.txt', new Blob([this.buildZipReadme(assetPlan.manifest)], { type: 'text/plain;charset=utf-8' }));
+
+                const blob = zip.build();
+                const suffix = selectedOnly ? '-selected' : '-all';
+                this.downloadBlob(blob, `${title}${suffix}-${this.getExportTimestamp()}.zip`);
+                const failedAssets = assetPlan.manifest.filter((item) => !item.included).length;
+                completionMessage = failedAssets
+                    ? `ZIP 已导出；${failedAssets} 个资源未能打包，详见 manifest`
+                    : `ZIP 已导出：${uniqueIndices.length} 轮，附件 ${assetPlan.files.length} 个`;
+            } catch (error) {
+                if (error?.name === 'AbortError') completionMessage = 'ZIP 导出已取消';
+                else {
+                    completionMessage = `ZIP 导出失败：${error?.message || error}`;
+                    console.error('[ChatGPT 导航与导出] ZIP 导出失败：', error);
+                }
+            } finally {
+                if (this.conversationLoadAbortController === controller) {
+                    this.conversationLoadAbortController = null;
+                }
+                this.conversationExportInProgress = false;
+                this.updateConversationArchiveUi(completionMessage);
+                window.setTimeout(() => this.updateConversationArchiveUi(), 2600);
+            }
+        }
+
+        exportSelectedConversationsZip() {
+            const valid = new Set(this.getAllConversationLogicalIndices());
+            const indices = [...this.selectedConversationIndices].filter((index) => valid.has(index));
+            return this.exportConversationIndicesZip(indices, true);
+        }
+
+        exportAllConversationsZip() {
+            return this.exportConversationIndicesZip(this.getAllConversationLogicalIndices(), false);
+        }
+
+        async exportConversationIndices(indices, selectedOnly) {
+            if (this.conversationExportInProgress || this.conversationLoadPromise) return;
+            const uniqueIndices = [...new Set(indices)]
+                .filter((index) => Number.isInteger(index) && index >= 0)
+                .sort((a, b) => a - b);
+            if (!uniqueIndices.length) {
+                this.updateConversationArchiveUi('没有可导出的问答');
+                return;
+            }
+
+            this.conversationExportInProgress = true;
+            this.updateConversationArchiveUi('正在准备 Markdown…');
+            let completionMessage = '';
+            try {
+                const missing = uniqueIndices.filter((index) => !this.conversationArchive.has(index));
+                if (missing.length) {
+                    const loadResult = await this.loadConversationIndices(missing, { mode: 'export', restore: true });
+                    if (loadResult?.aborted) {
+                        completionMessage = '导出已取消';
+                        return;
+                    }
+                }
+                const markdown = this.buildConversationMarkdown(uniqueIndices);
+                this.downloadMarkdown(markdown, selectedOnly);
+                const succeeded = uniqueIndices.filter((index) => this.conversationArchive.has(index)).length;
+                const failed = uniqueIndices.length - succeeded;
+                completionMessage = failed
+                    ? `已导出 ${uniqueIndices.length} 轮，其中 ${failed} 轮不完整`
+                    : `已导出 ${uniqueIndices.length} 轮`;
+            } finally {
+                this.conversationExportInProgress = false;
+                this.updateConversationArchiveUi(completionMessage);
+                window.setTimeout(() => this.updateConversationArchiveUi(), 1800);
+            }
+        }
+
+        exportSelectedConversations() {
+            const valid = new Set(this.getAllConversationLogicalIndices());
+            const indices = [...this.selectedConversationIndices].filter((index) => valid.has(index));
+            return this.exportConversationIndices(indices, true);
+        }
+
+        exportAllConversations() {
+            return this.exportConversationIndices(this.getAllConversationLogicalIndices(), false);
         }
 
         isViewportEligible() {
