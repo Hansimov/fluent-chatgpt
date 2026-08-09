@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      3.8.0
-// @description  优化长对话渲染，提供导航、全文搜索、安全全量加载，并支持严格校验原始生成文件、图片、附件与 Artifacts 的离线归档，并保证导出 HTML/Markdown 使用可移植的本地附件链接，且采用可信资源清单消除虚假附件、重复计数与无效获取任务
+// @version      3.9.0
+// @description  优化长对话渲染，提供稳定的 SPA 会话切换导航、当前回答章节、自愈式全文搜索、默认定位到底部、安全全量加载，以及原始附件与 Artifacts 的离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -220,6 +220,22 @@
 
         // 问答跳转后，目标提问与滚动视口顶部之间保留的距离。
         conversationTocScrollOffsetPx: 88,
+
+        // 打开已有会话或从左侧栏切换到另一个会话时，默认定位到最后一轮回答的底部。
+        // 会优先使用官方最后一个 Prompt 导航确保虚拟化页面挂载末轮，再多次校正到底部；
+        // 用户一旦主动滚轮、触摸或点击正文区域，就立即停止自动定位，避免与人工操作争夺滚动位置。
+        answerTocOpenConversationAtBottom: true,
+        answerTocBottomPinDurationMs: 3200,
+
+        // ChatGPT 是 SPA；切换左侧会话时 URL、消息 DOM、官方 Prompt 导航并非同一帧更新。
+        // 这里用路由世代 + DOM 静默窗口隔离旧会话，防止上一会话的问答数量/标签泄漏到新会话。
+        answerTocRouteWatchIntervalMs: 220,
+        answerTocRouteSettleQuietMs: 140,
+        answerTocRouteSettleMinMs: 260,
+        answerTocRouteSettleMaxMs: 4200,
+
+        // 当前回答在 React 分阶段挂载、aria-hidden 切换或 Markdown 容器替换时，章节目录会自愈重试。
+        answerTocHeadingRecoveryMaxMs: 2400,
 
         // 隐藏官方问答导航后，自定义目录距页面右侧的默认距离。
         answerTocStandaloneInlineEndPx: 20,
@@ -586,6 +602,7 @@
             this.resizeHandles = [];
 
             this.currentAnswer = null;
+            this.headingRecoveryExhaustedAnswer = null;
             this.currentContentRoot = null;
             this.currentScrollRoot = null;
             this.headings = [];
@@ -687,7 +704,29 @@
             this.conversationRebuildTimer = 0;
             this.rebindTimer = 0;
             this.healthTimer = 0;
+            this.routeWatchTimer = 0;
             this.lastUrl = location.href;
+            this.currentRouteKey = this.getConversationRouteKey();
+            this.routeEpoch = 0;
+            this.routeTransitioning = false;
+            this.routeTransitionStartedAt = 0;
+            this.routeTransitionBaseMutationSerial = 0;
+            this.routePreviousDomSignature = '';
+            this.routeAllowEquivalentDom = false;
+            this.stableConversationDomSignature = '';
+            this.routeSettleTimer = 0;
+            this.mainMutationSerial = 0;
+            this.lastMainMutationAt = performance.now();
+
+            this.bottomPinToken = 0;
+            this.bottomPinTimers = new Set();
+            this.bottomPinActive = false;
+            this.bottomPinStartedAt = 0;
+            this.bottomPinLastPromptActivated = false;
+
+            this.headingRecoveryToken = 0;
+            this.headingRecoveryTimers = new Set();
+            this.headingRecoveryExhaustedAnswer = null;
 
             this.hoverExpandTimer = 0;
             this.hoverCollapseTimer = 0;
@@ -727,6 +766,7 @@
             this.onKeyDown = this.onKeyDown.bind(this);
             this.onVisibilityChange = this.onVisibilityChange.bind(this);
             this.onRouteSignal = this.onRouteSignal.bind(this);
+            this.onUserScrollIntent = this.onUserScrollIntent.bind(this);
             this.onMainMutations = this.onMainMutations.bind(this);
             this.onAnswerMutations = this.onAnswerMutations.bind(this);
             this.onLauncherPointerEnter = this.onLauncherPointerEnter.bind(this);
@@ -753,6 +793,7 @@
             this.bindMainObserver();
             this.syncOfficialConversationNav();
             this.rebuildConversationToc();
+            this.stableConversationDomSignature = this.getConversationDomSignature();
             this.updateInlineEndOffset();
             this.syncVisibility();
 
@@ -763,6 +804,8 @@
             window.addEventListener('resize', this.onResize, { passive: true });
             window.addEventListener('popstate', this.onRouteSignal, { passive: true });
             window.addEventListener('hashchange', this.onRouteSignal, { passive: true });
+            window.addEventListener('wheel', this.onUserScrollIntent, { capture: true, passive: true });
+            window.addEventListener('touchstart', this.onUserScrollIntent, { capture: true, passive: true });
             document.addEventListener('keydown', this.onKeyDown, true);
             document.addEventListener('pointerdown', this.onDocumentPointerDown, true);
             document.addEventListener('click', this.onDocumentClick, true);
@@ -772,19 +815,34 @@
                 window.navigation.addEventListener('navigatesuccess', this.onRouteSignal);
             }
 
+            this.routeWatchTimer = window.setInterval(() => {
+                if (document.hidden) return;
+                this.checkForRouteChange();
+            }, Math.max(120, Number(this.config.answerTocRouteWatchIntervalMs) || 220));
+
             this.healthTimer = window.setInterval(() => {
                 if (document.hidden) return;
 
-                if (location.href !== this.lastUrl || !this.mainElement?.isConnected) {
-                    this.resetForNavigation();
+                if (this.checkForRouteChange()) return;
+                this.lastUrl = location.href;
+
+                if (!this.mainElement?.isConnected) {
+                    this.resetForNavigation(this.currentRouteKey, { force: true, reason: 'main-remount' });
+                    return;
+                }
+
+                if (this.routeTransitioning) {
+                    this.scheduleRouteSettleCheck(0);
                     return;
                 }
 
                 this.syncOfficialConversationNav();
                 this.refreshConversationTocIfNeeded();
-            }, 1600);
+            }, 1200);
 
             this.requestFrame(true);
+            this.scheduleBottomPin('initial');
+            this.scheduleHeadingRecovery();
         }
         createUi() {
             document.querySelector('#cgpt-answer-toc-host')?.remove();
@@ -2468,6 +2526,11 @@
         }
 
         onDocumentPointerDown(event) {
+            if (this.bottomPinActive && event?.isTrusted) {
+                const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+                if (!(this.host && path.includes(this.host))) this.cancelBottomPin();
+            }
+
             if (!this.transientHoverOpen || this.collapsed) return;
             if (
                 event instanceof PointerEvent &&
@@ -3112,6 +3175,82 @@
             this.setManualPosition(clamped.left, clamped.top, persist);
         }
 
+        onUserScrollIntent(event) {
+            if (!this.bottomPinActive || !event?.isTrusted) return;
+            const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+            if (this.host && path.includes(this.host)) return;
+            this.cancelBottomPin();
+        }
+
+        cancelBottomPin() {
+            this.bottomPinToken += 1;
+            for (const timer of this.bottomPinTimers) window.clearTimeout(timer);
+            this.bottomPinTimers.clear();
+            this.bottomPinActive = false;
+            this.bottomPinLastPromptActivated = false;
+        }
+
+        findConversationScrollRoot() {
+            const messages = [...document.querySelectorAll(`${USER_SELECTOR}, ${ASSISTANT_SELECTOR}`)]
+                .filter((element) => element instanceof HTMLElement && element.isConnected);
+            const anchor = messages[messages.length - 1] || this.currentAnswer;
+            return anchor instanceof HTMLElement ? this.findScrollRoot(anchor) : null;
+        }
+
+        scrollConversationToBottom() {
+            const scrollRoot = this.findConversationScrollRoot();
+            if (scrollRoot instanceof HTMLElement) {
+                const before = scrollRoot.scrollTop;
+                scrollRoot.scrollTop = Math.max(0, scrollRoot.scrollHeight - scrollRoot.clientHeight);
+                return Math.abs(scrollRoot.scrollTop - before) > 0.5 || scrollRoot.scrollTop > 0;
+            }
+            const root = document.scrollingElement || document.documentElement;
+            const target = Math.max(0, root.scrollHeight - window.innerHeight);
+            window.scrollTo({ top: target, behavior: 'auto' });
+            return target > 0;
+        }
+
+        scheduleBottomPin(reason = 'conversation-open') {
+            if (!this.config.answerTocOpenConversationAtBottom || this.routeTransitioning) return;
+            this.cancelBottomPin();
+            const token = this.bottomPinToken;
+            this.bottomPinActive = true;
+            this.bottomPinStartedAt = performance.now();
+            const duration = Math.max(800, Number(this.config.answerTocBottomPinDurationMs) || 3200);
+            const delays = [0, 90, 220, 460, 820, 1300, 2000, duration]
+                .filter((value, index, array) => value <= duration && array.indexOf(value) === index);
+
+            const attempt = () => {
+                if (token !== this.bottomPinToken || !this.bottomPinActive || this.routeTransitioning) return;
+                if (this.checkForRouteChange()) return;
+
+                if (!this.bottomPinLastPromptActivated) {
+                    const buttons = this.getOfficialNavButtons();
+                    const lastButton = buttons[buttons.length - 1];
+                    const lastIndex = Number.parseInt(lastButton?.dataset.tocItemIndex ?? '', 10);
+                    const activeIndex = this.getOfficialActiveLogicalIndex(buttons);
+                    if (lastButton && Number.isInteger(lastIndex) && lastIndex >= 0) {
+                        if (activeIndex !== lastIndex) {
+                            try { lastButton.click(); } catch { }
+                        }
+                        this.bottomPinLastPromptActivated = true;
+                    }
+                }
+
+                this.scrollConversationToBottom();
+                this.requestFrame(true);
+            };
+
+            for (const delay of delays) {
+                const timer = window.setTimeout(() => {
+                    this.bottomPinTimers.delete(timer);
+                    attempt();
+                    if (delay >= duration) this.bottomPinActive = false;
+                }, delay);
+                this.bottomPinTimers.add(timer);
+            }
+        }
+
         onScroll(event) {
             const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
             if (this.host && path.includes(this.host)) return;
@@ -3154,6 +3293,14 @@
         }
 
         onKeyDown(event) {
+            if (this.bottomPinActive && event instanceof KeyboardEvent && event.isTrusted) {
+                const target = event.target;
+                const isEditing = target instanceof Element && Boolean(target.closest('input, textarea, [contenteditable="true"]'));
+                if (!isEditing && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', 'Space'].includes(event.code === 'Space' ? 'Space' : event.key)) {
+                    this.cancelBottomPin();
+                }
+            }
+
             if (event.altKey && event.shiftKey && event.code === 'KeyO') {
                 if (!this.host?.hidden) {
                     event.preventDefault();
@@ -3196,19 +3343,135 @@
 
         onVisibilityChange() {
             if (!document.hidden) {
+                if (this.checkForRouteChange()) return;
+                if (this.routeTransitioning) {
+                    this.scheduleRouteSettleCheck(0);
+                    return;
+                }
                 this.syncOfficialConversationNav();
                 this.refreshConversationTocIfNeeded();
                 this.requestFrame(true);
             }
         }
 
-        onRouteSignal() {
-            window.setTimeout(() => this.resetForNavigation(), 0);
-            window.setTimeout(() => this.requestFrame(true), 180);
+        getConversationRouteKey() {
+            const conversationId = this.getCurrentConversationId();
+            if (conversationId) return `conversation:${conversationId}`;
+            const path = String(location.pathname || '/');
+            const search = String(location.search || '');
+            return `route:${path}${search}`;
         }
 
-        resetForNavigation() {
+        checkForRouteChange() {
+            const nextKey = this.getConversationRouteKey();
+            if (nextKey === this.currentRouteKey) return false;
+            this.resetForNavigation(nextKey, { reason: 'route-change' });
+            return true;
+        }
+
+        onRouteSignal() {
+            window.setTimeout(() => {
+                if (!this.checkForRouteChange()) {
+                    this.lastUrl = location.href;
+                    if (this.routeTransitioning) this.scheduleRouteSettleCheck(0);
+                }
+            }, 0);
+        }
+
+        releaseOfficialConversationNav() {
+            // 隐藏官方导航时，SPA 过渡阶段可能让旧/新导航同时存在。
+            // 不主动解除旧容器的隐藏标记，避免它在新会话挂载期间短暂闪回。
+            if (!this.config.hideOfficialConversationToc && this.officialNavContainer?.isConnected) {
+                this.officialNavContainer.removeAttribute('data-cgpt-native-conversation-toc-hidden');
+            }
+            this.officialNavContainer = null;
+        }
+
+        getConversationDomSignature() {
+            const parts = [];
+            const nodes = [...document.querySelectorAll(`${USER_SELECTOR}, ${ASSISTANT_SELECTOR}`)]
+                .filter((element) => element instanceof HTMLElement && element.isConnected)
+                .slice(-10);
+            for (const [index, element] of nodes.entries()) {
+                const role = element.getAttribute('data-message-author-role') || '?';
+                const identity = this.getConversationRecordIdentity(element, index);
+                const text = this.normalizeConversationText(element.textContent || '').slice(0, 96);
+                parts.push(`${role}:${identity}:${text}`);
+            }
+            return parts.join('|');
+        }
+
+        scheduleRouteSettleCheck(delay = 70) {
+            window.clearTimeout(this.routeSettleTimer);
+            const epoch = this.routeEpoch;
+            this.routeSettleTimer = window.setTimeout(() => {
+                this.routeSettleTimer = 0;
+                if (epoch !== this.routeEpoch) return;
+                this.tryFinishRouteTransition();
+            }, Math.max(0, Number(delay) || 0));
+        }
+
+        tryFinishRouteTransition() {
+            if (!this.routeTransitioning) return;
+            if (this.checkForRouteChange()) return;
+
+            const now = performance.now();
+            const elapsed = now - this.routeTransitionStartedAt;
+            const quietFor = now - this.lastMainMutationAt;
+            const quietMs = Math.max(40, Number(this.config.answerTocRouteSettleQuietMs) || 140);
+            const minMs = Math.max(80, Number(this.config.answerTocRouteSettleMinMs) || 260);
+            const maxMs = Math.max(minMs, Number(this.config.answerTocRouteSettleMaxMs) || 4200);
+            const signature = this.getConversationDomSignature();
+            const hasMessages = Boolean(signature);
+            const domChanged = Boolean(
+                signature &&
+                (!this.routePreviousDomSignature || signature !== this.routePreviousDomSignature)
+            );
+            const mutated = this.mainMutationSerial > this.routeTransitionBaseMutationSerial;
+            const settled = elapsed >= minMs && quietFor >= quietMs && hasMessages && (
+                domChanged || (this.routeAllowEquivalentDom && mutated)
+            );
+            const timedOut = elapsed >= maxMs;
+
+            if (!settled && !timedOut) {
+                this.scheduleRouteSettleCheck(Math.min(160, Math.max(40, quietMs - quietFor + 20)));
+                return;
+            }
+
+            this.routeTransitioning = false;
+            this.stableConversationDomSignature = signature;
+            this.bindMainObserver();
+            this.syncOfficialConversationNav();
+            this.rebuildConversationToc();
+            this.updateInlineEndOffset();
+            this.requestFrame(true);
+            this.scheduleBottomPin('route-ready');
+            this.scheduleHeadingRecovery();
+        }
+
+        resetForNavigation(nextRouteKey = this.getConversationRouteKey(), options = {}) {
+            const force = Boolean(options.force);
+            if (!force && nextRouteKey === this.currentRouteKey && this.routeTransitioning) {
+                this.scheduleRouteSettleCheck(0);
+                return;
+            }
+
+            const previousStableSignature = this.getConversationDomSignature() || this.stableConversationDomSignature;
+            this.routeEpoch += 1;
+            this.currentRouteKey = nextRouteKey;
             this.lastUrl = location.href;
+            this.routeTransitioning = true;
+            this.routeTransitionStartedAt = performance.now();
+            this.routeTransitionBaseMutationSerial = this.mainMutationSerial;
+            this.routePreviousDomSignature = previousStableSignature;
+            this.routeAllowEquivalentDom = Boolean(force && options.reason === 'main-remount');
+            this.lastMainMutationAt = performance.now();
+            window.clearTimeout(this.routeSettleTimer);
+            this.routeSettleTimer = 0;
+            this.cancelBottomPin();
+            this.clearHeadingRecovery();
+            this.releaseOfficialConversationNav();
+
             this.cancelConversationJump();
             this.cancelConversationArchiveLoad('页面已切换', false, true);
             this.conversationArchive.clear();
@@ -3235,10 +3498,8 @@
             this.clearConversationToc();
             this.resetQuickSearchForNavigation();
             this.bindMainObserver();
-            this.syncOfficialConversationNav();
-            this.scheduleConversationRebuild(80);
             this.updateInlineEndOffset();
-            this.requestFrame(true);
+            this.scheduleRouteSettleCheck(80);
         }
 
         bindMainObserver() {
@@ -3273,6 +3534,15 @@
         }
 
         onMainMutations(records) {
+            this.mainMutationSerial += Math.max(1, records.length);
+            this.lastMainMutationAt = performance.now();
+
+            if (this.checkForRouteChange()) return;
+            if (this.routeTransitioning) {
+                this.scheduleRouteSettleCheck(50);
+                return;
+            }
+
             let assistantAdded = false;
             let conversationChanged = false;
             let searchContentChanged = false;
@@ -3319,6 +3589,12 @@
         }
 
         requestFrame(forceAnswerDetection) {
+            if (this.checkForRouteChange()) return;
+            if (this.routeTransitioning) {
+                this.scheduleRouteSettleCheck(50);
+                return;
+            }
+
             this.forceAnswerDetection ||= Boolean(forceAnswerDetection);
             if (this.frameId) return;
 
@@ -3363,6 +3639,8 @@
             } else if (this.currentAnswer && !this.currentAnswer.isConnected) {
                 this.disconnectCurrentAnswer();
                 this.clearToc();
+            } else if (this.currentAnswer?.isConnected && !this.headings.length) {
+                this.scheduleHeadingRecovery();
             }
         }
 
@@ -3370,6 +3648,27 @@
             const width = document.documentElement.clientWidth;
             const height = document.documentElement.clientHeight;
             if (width < 1 || height < 1) return null;
+
+            // 官方 Prompt 导航的 active 项是“当前问答”最稳定的语义锚点。
+            // 尤其在视口判定线正好落在用户提问区域时，纯几何采样容易误选上一条回答，
+            // 从而让“章节”显示上一轮或错误地变成 0。
+            const activeLogicalIndex = this.getOfficialActiveLogicalIndex();
+            if (activeLogicalIndex >= 0) {
+                const item = this.conversationItems.find(
+                    (entry) => entry.logicalIndex === activeLogicalIndex,
+                );
+                const anchoredAnswer = item?.userElement?.isConnected
+                    ? this.findAssistantForUser(item.userElement)
+                    : null;
+                if (anchoredAnswer instanceof HTMLElement && anchoredAnswer.isConnected) {
+                    const rect = anchoredAnswer.getBoundingClientRect();
+                    const visiblePixels = Math.max(
+                        0,
+                        Math.min(rect.bottom, height) - Math.max(rect.top, 0),
+                    );
+                    if (visiblePixels >= 24) return anchoredAnswer;
+                }
+            }
 
             const yRatios = [
                 this.config.answerTocActiveLineRatio,
@@ -3385,14 +3684,20 @@
 
                 for (const yRatio of yRatios) {
                     const y = Math.min(height - 1, Math.max(0, height * yRatio));
-                    const element = document.elementFromPoint(x, y);
-                    const answer = element?.closest?.('[data-message-author-role="assistant"]');
-                    if (!answer) continue;
-
-                    const verticalWeight =
-                        1 / (0.18 + Math.abs(yRatio - this.config.answerTocActiveLineRatio));
-                    const currentBonus = answer === this.currentAnswer ? 0.15 : 0;
-                    scores.set(answer, (scores.get(answer) ?? 0) + verticalWeight + currentBonus);
+                    const stack = typeof document.elementsFromPoint === 'function'
+                        ? document.elementsFromPoint(x, y)
+                        : [document.elementFromPoint(x, y)].filter(Boolean);
+                    const answersAtPoint = new Set();
+                    for (const element of stack) {
+                        const answer = element?.closest?.('[data-message-author-role="assistant"]');
+                        if (answer instanceof HTMLElement && answer.isConnected) answersAtPoint.add(answer);
+                    }
+                    for (const answer of answersAtPoint) {
+                        const verticalWeight =
+                            1 / (0.18 + Math.abs(yRatio - this.config.answerTocActiveLineRatio));
+                        const currentBonus = answer === this.currentAnswer ? 0.15 : 0;
+                        scores.set(answer, (scores.get(answer) ?? 0) + verticalWeight + currentBonus);
+                    }
                 }
             };
 
@@ -3440,6 +3745,7 @@
             this.disconnectCurrentAnswer();
 
             this.currentAnswer = answer;
+            this.headingRecoveryExhaustedAnswer = null;
             this.currentContentRoot = answer;
             this.currentScrollRoot = this.findScrollRoot(answer);
             this.lastScrollTop = this.getScrollTop();
@@ -3449,6 +3755,8 @@
                 childList: true,
                 subtree: true,
                 characterData: true,
+                attributes: true,
+                attributeFilter: ['hidden', 'aria-hidden'],
             });
 
             if (this.config.quickSearchScope === 'current-answer') {
@@ -3461,12 +3769,14 @@
         }
 
         disconnectCurrentAnswer() {
+            this.clearHeadingRecovery();
             const hadCurrentAnswer = Boolean(this.currentAnswer);
             this.answerObserver?.disconnect();
             this.answerObserver = null;
             this.headingTextObserver?.disconnect();
             this.headingTextObserver = null;
             this.currentAnswer = null;
+            this.headingRecoveryExhaustedAnswer = null;
             this.currentContentRoot = null;
             this.currentScrollRoot = null;
             if (hadCurrentAnswer && this.config.quickSearchScope === 'current-answer') {
@@ -3486,6 +3796,10 @@
             if (records.length) this.markSearchIndexDirty(true);
 
             for (const record of records) {
+                if (record.type === 'attributes') {
+                    touchesHeading = true;
+                    break;
+                }
                 if (record.type === 'characterData') {
                     if (record.target.parentElement?.closest(this.config.answerTocHeadingSelector)) {
                         touchesHeading = true;
@@ -3517,7 +3831,10 @@
                 if (touchesHeading) break;
             }
 
-            if (touchesHeading) this.scheduleTocRebuild();
+            if (touchesHeading) {
+                this.headingRecoveryExhaustedAnswer = null;
+                this.scheduleTocRebuild();
+            }
         }
 
         scheduleTocRebuild() {
@@ -3536,32 +3853,7 @@
 
             this.headingTextObserver?.disconnect();
 
-            const headings = [];
-            const hasMarkdownRoot =
-                this.currentAnswer.matches('.markdown') ||
-                Boolean(this.currentAnswer.querySelector('.markdown'));
-            const nodes = this.currentContentRoot.querySelectorAll(
-                this.config.answerTocHeadingSelector,
-            );
-
-            for (const element of nodes) {
-                if (!(element instanceof HTMLElement)) continue;
-                if (element.closest('[hidden], [aria-hidden="true"]')) continue;
-                if (hasMarkdownRoot && !element.closest('.markdown')) continue;
-                if (element.closest('[data-message-author-role="assistant"]') !== this.currentAnswer) {
-                    continue;
-                }
-
-                const fullLabel = this.normalizeText(element.textContent ?? '');
-                if (!fullLabel) continue;
-
-                headings.push({
-                    element,
-                    level: Number.parseInt(element.tagName.slice(1), 10) || 2,
-                    fullLabel,
-                    label: this.truncateLabel(fullLabel, this.config.answerTocMaxLabelLength, 180),
-                });
-            }
+            const headings = this.collectHeadingsForAnswer(this.currentAnswer);
 
             this.headings = headings;
             this.observeHeadingText();
@@ -3571,6 +3863,113 @@
             this.applyActiveIndex(nextActiveIndex, false);
             this.updateViewMeta();
             this.syncVisibility();
+            if (headings.length) this.clearHeadingRecovery();
+            else this.scheduleHeadingRecovery();
+        }
+
+        collectHeadingsForAnswer(answer) {
+            if (!(answer instanceof HTMLElement) || !answer.isConnected) return [];
+            const selector = this.config.answerTocHeadingSelector;
+            const all = [...answer.querySelectorAll(selector)].filter((element) => {
+                if (!(element instanceof HTMLElement) || !element.isConnected) return false;
+                if (element.closest('[data-message-author-role="assistant"]') !== answer) return false;
+                if (element.closest('[hidden], nav, aside, [role="menu"], [role="tooltip"]')) return false;
+                const label = this.normalizeText(element.textContent || '');
+                return Boolean(label);
+            });
+
+            const semantic = all.filter((element) => Boolean(
+                element.closest('.markdown, [data-message-content], .prose')
+            ));
+            const chosen = semantic.length ? semantic : all;
+            return chosen.map((element) => {
+                const fullLabel = this.normalizeText(element.textContent || '');
+                return {
+                    element,
+                    level: Number.parseInt(element.tagName.slice(1), 10) || 2,
+                    fullLabel,
+                    label: this.truncateLabel(fullLabel, this.config.answerTocMaxLabelLength, 180),
+                };
+            });
+        }
+
+        clearHeadingRecovery() {
+            this.headingRecoveryToken += 1;
+            for (const timer of this.headingRecoveryTimers) window.clearTimeout(timer);
+            this.headingRecoveryTimers.clear();
+        }
+
+        findVisibleAnswerWithHeadings() {
+            const viewportHeight = Math.max(1, window.innerHeight);
+            const lineY = this.getActiveLineViewportY();
+            let best = null;
+            let bestScore = -Infinity;
+
+            const answers = [...document.querySelectorAll(ASSISTANT_SELECTOR)]
+                .filter((answer) => answer instanceof HTMLElement && answer.isConnected);
+            for (const answer of answers) {
+                if (!answer.querySelector(this.config.answerTocHeadingSelector)) continue;
+                if (!this.collectHeadingsForAnswer(answer).length) continue;
+                const rect = answer.getBoundingClientRect();
+                const visible = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+                if (visible <= 0) continue;
+                const containsLine = rect.top <= lineY && rect.bottom >= lineY;
+                const distance = containsLine ? 0 : Math.min(Math.abs(rect.top - lineY), Math.abs(rect.bottom - lineY));
+                const score = (containsLine ? 1_000_000 : 0) + visible * 10 - distance;
+                if (score > bestScore) {
+                    best = answer;
+                    bestScore = score;
+                }
+            }
+            return best;
+        }
+
+        scheduleHeadingRecovery() {
+            if (!this.config.enableAnswerToc || this.routeTransitioning || this.headings.length) return;
+            if (this.headingRecoveryExhaustedAnswer === this.currentAnswer && this.currentAnswer) return;
+            if (this.headingRecoveryTimers.size) return;
+            this.clearHeadingRecovery();
+            const token = this.headingRecoveryToken;
+            const maxMs = Math.max(600, Number(this.config.answerTocHeadingRecoveryMaxMs) || 2400);
+            const delays = [120, 360, 820, 1500, maxMs].filter((value, index, array) => (
+                value <= maxMs && array.indexOf(value) === index
+            ));
+            const finalDelay = delays[delays.length - 1] ?? maxMs;
+            for (const delay of delays) {
+                const timer = window.setTimeout(() => {
+                    this.headingRecoveryTimers.delete(timer);
+                    if (delay === finalDelay) this.headingRecoveryExhaustedAnswer = this.currentAnswer;
+                    if (token !== this.headingRecoveryToken || this.routeTransitioning || this.headings.length) return;
+                    const candidate = this.findVisibleAnswerWithHeadings();
+                    if (candidate && candidate !== this.currentAnswer) {
+                        const viewportHeight = Math.max(1, window.innerHeight);
+                        const currentRect = this.currentAnswer?.isConnected
+                            ? this.currentAnswer.getBoundingClientRect()
+                            : null;
+                        const candidateRect = candidate.getBoundingClientRect();
+                        const currentVisible = currentRect
+                            ? Math.max(0, Math.min(currentRect.bottom, viewportHeight) - Math.max(currentRect.top, 0))
+                            : 0;
+                        const candidateVisible = Math.max(
+                            0,
+                            Math.min(candidateRect.bottom, viewportHeight) - Math.max(candidateRect.top, 0),
+                        );
+                        // 章节自愈不能为了“非 0”而把一个仍明显可见、但确实没有标题的当前回答
+                        // 偷换成上一条回答。只有当前回答几乎离开视口、候选明显更可见时才纠正。
+                        if (
+                            !this.currentAnswer?.isConnected ||
+                            currentVisible < 48 ||
+                            (currentVisible < 120 && candidateVisible > currentVisible * 2.5)
+                        ) {
+                            this.setCurrentAnswer(candidate);
+                            return;
+                        }
+                    }
+                    if (this.currentAnswer?.isConnected) this.rebuildToc();
+                    else this.requestFrame(true);
+                }, delay);
+                this.headingRecoveryTimers.add(timer);
+            }
         }
 
         observeHeadingText() {
@@ -4732,13 +5131,60 @@
         }
 
         getOfficialNavButtons() {
-            return [...document.querySelectorAll('button[data-toc-item-index]')]
-                .filter((button) => button instanceof HTMLButtonElement && button.isConnected)
-                .sort((a, b) => {
-                    const ai = Number.parseInt(a.dataset.tocItemIndex ?? '', 10);
-                    const bi = Number.parseInt(b.dataset.tocItemIndex ?? '', 10);
-                    return (Number.isFinite(ai) ? ai : 0) - (Number.isFinite(bi) ? bi : 0);
-                });
+            const buttons = [...document.querySelectorAll('button[data-toc-item-index]')]
+                .filter((button) => button instanceof HTMLButtonElement && button.isConnected);
+            if (!buttons.length) return [];
+
+            // SPA 会话切换的过渡帧里，旧/新 Prompt 导航可能同时存在。
+            // 不能把 document 中所有按钮混为一个列表，否则问答数量会叠加并继承上一会话。
+            const groups = new Map();
+            buttons.forEach((button, order) => {
+                const container = this.findFixedAncestor(button) || button.parentElement || button;
+                let group = groups.get(container);
+                if (!group) {
+                    group = { container, buttons: [], lastOrder: order };
+                    groups.set(container, group);
+                }
+                group.buttons.push(button);
+                group.lastOrder = order;
+            });
+
+            let bestGroup = null;
+            let bestScore = -Infinity;
+            for (const group of groups.values()) {
+                const { container } = group;
+                const hiddenByMarkup = Boolean(
+                    container instanceof Element &&
+                    (container.closest('[hidden], [aria-hidden="true"]') || container.getAttribute('aria-hidden') === 'true')
+                );
+                const rect = container instanceof Element ? container.getBoundingClientRect() : null;
+                const hasBox = Boolean(rect && rect.width > 0 && rect.height > 0);
+                const hasActive = group.buttons.some((button) => button.hasAttribute('data-toc-active'));
+                const uniqueCount = new Set(group.buttons.map((button) => button.dataset.tocItemIndex)).size;
+                const score =
+                    (hiddenByMarkup ? -10_000_000 : 10_000_000) +
+                    (hasBox ? 1_000_000 : 0) +
+                    (hasActive ? 100_000 : 0) +
+                    group.lastOrder * 100 +
+                    uniqueCount;
+                if (score > bestScore) {
+                    bestGroup = group;
+                    bestScore = score;
+                }
+            }
+
+            const chosen = bestGroup?.buttons || [];
+            const byIndex = new Map();
+            for (const button of chosen) {
+                const index = Number.parseInt(button.dataset.tocItemIndex ?? '', 10);
+                if (!Number.isInteger(index) || index < 0) continue;
+                const current = byIndex.get(index);
+                if (!current || button.hasAttribute('data-toc-active')) byIndex.set(index, button);
+            }
+            return [...byIndex.values()].sort((a, b) => (
+                Number.parseInt(a.dataset.tocItemIndex ?? '0', 10) -
+                Number.parseInt(b.dataset.tocItemIndex ?? '0', 10)
+            ));
         }
 
         getOfficialActiveLogicalIndex(buttons = this.getOfficialNavButtons()) {
@@ -4760,28 +5206,27 @@
         }
 
         syncOfficialConversationNav() {
+            if (this.routeTransitioning) return [];
             const buttons = this.getOfficialNavButtons();
             const container = buttons.length ? this.findFixedAncestor(buttons[0]) : null;
 
-            if (
-                this.officialNavContainer &&
-                this.officialNavContainer !== container &&
-                this.officialNavContainer.isConnected
-            ) {
-                this.officialNavContainer.removeAttribute(
-                    'data-cgpt-native-conversation-toc-hidden',
-                );
+            // 不只处理“被选中的”那一组。SPA 切会话时旧/新官方导航可同时留在 DOM；
+            // 若仅隐藏新组、却把旧组恢复显示，就会出现右侧官方竖条闪回或双导航。
+            const allContainers = new Set();
+            for (const button of document.querySelectorAll('button[data-toc-item-index]')) {
+                if (!(button instanceof HTMLButtonElement) || !button.isConnected) continue;
+                const fixed = this.findFixedAncestor(button);
+                if (fixed) allContainers.add(fixed);
             }
-
-            this.officialNavContainer = container;
-            if (container) {
+            for (const candidate of allContainers) {
                 if (this.config.hideOfficialConversationToc) {
-                    container.setAttribute('data-cgpt-native-conversation-toc-hidden', '');
+                    candidate.setAttribute('data-cgpt-native-conversation-toc-hidden', '');
                 } else {
-                    container.removeAttribute('data-cgpt-native-conversation-toc-hidden');
+                    candidate.removeAttribute('data-cgpt-native-conversation-toc-hidden');
                 }
             }
 
+            this.officialNavContainer = container;
             return buttons;
         }
 
@@ -4812,6 +5257,10 @@
         }
 
         scheduleConversationRebuild(delay = 120) {
+            if (this.routeTransitioning) {
+                this.scheduleRouteSettleCheck(Math.min(90, Math.max(30, Number(delay) || 0)));
+                return;
+            }
             window.clearTimeout(this.conversationRebuildTimer);
             this.conversationRebuildTimer = window.setTimeout(() => {
                 this.conversationRebuildTimer = 0;
@@ -5135,6 +5584,10 @@
         }
 
         rebuildConversationToc() {
+            if (this.routeTransitioning) {
+                this.scheduleRouteSettleCheck(50);
+                return;
+            }
             if (!this.config.enableConversationToc) {
                 this.clearConversationToc();
                 return;
@@ -5230,6 +5683,7 @@
             }
 
             this.conversationItems = items;
+            this.stableConversationDomSignature = this.getConversationDomSignature() || this.stableConversationDomSignature;
             this.lastConversationSignature = this.getConversationSignature();
             const searchConversationMapSignature = items.map((item, index) => {
                 const identity = item.userElement?.isConnected
@@ -6044,12 +6498,19 @@
                 return this.conversationApiSnapshotPromise;
             }
             this.conversationApiSnapshotId = conversationId;
+            const requestEpoch = this.routeEpoch;
             const task = this.fetchChatGptApiJson(
                 `/backend-api/conversation/${encodeURIComponent(conversationId)}`,
                 signal,
             ).then((snapshot) => {
-                this.conversationApiSnapshot = snapshot;
-                this.conversationApiAssetsByIndex = this.buildConversationApiAssetMap(snapshot);
+                // 上一会话的异步请求即使在路由切换后才返回，也绝不能覆盖新会话缓存。
+                if (
+                    requestEpoch === this.routeEpoch &&
+                    conversationId === this.getCurrentConversationId()
+                ) {
+                    this.conversationApiSnapshot = snapshot;
+                    this.conversationApiAssetsByIndex = this.buildConversationApiAssetMap(snapshot);
+                }
                 return snapshot;
             }).finally(() => {
                 if (this.conversationApiSnapshotPromise === task) this.conversationApiSnapshotPromise = null;
