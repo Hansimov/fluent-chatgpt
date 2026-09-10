@@ -1,1 +1,7 @@
 *.txt
+
+# Local browser automation, fixtures, screenshots, and build artifacts.
+.codex-*
+bin/
+obj/
+test-results/

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.1.0
+// @version      4.2.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -70,7 +70,9 @@
         generatedImagePreviewConcurrency: 3,
         generatedImageMinZoom: 0.25,
         generatedImageMaxZoom: 8,
-        generatedImageWheelZoomSensitivity: 0.0015,
+        generatedImageZoomStep: 1.1,
+        generatedImageWheelZoomSensitivity: 0.0008,
+        generatedImageKeyboardPanStepPx: 72,
 
         // 一级目录：整段对话中的用户提问；二级目录：当前回答里的 H1/H2。
         enableConversationToc: true,
@@ -994,7 +996,14 @@
               <div class="image-lightbox-shell">
                 <header class="image-lightbox-header">
                   <span id="image-lightbox-counter" class="image-lightbox-counter"></span>
-                  <div class="image-lightbox-zoom-tools" role="toolbar" aria-label="图片缩放与全屏工具">
+                  <div class="image-lightbox-zoom-tools" role="toolbar" aria-label="图片切换、缩放与全屏工具">
+                    <button id="image-lightbox-previous" class="image-lightbox-icon" type="button" aria-label="上一张" title="上一张（Page Up）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <button id="image-lightbox-next" class="image-lightbox-icon" type="button" aria-label="下一张" title="下一张（Page Down）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <span class="image-lightbox-tool-separator" aria-hidden="true"></span>
                     <button id="image-lightbox-zoom-out" class="image-lightbox-icon" type="button" aria-label="缩小图片" title="缩小（-）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7.5 10.5h6M15.5 15.5 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
                     </button>
@@ -1015,15 +1024,9 @@
                   </button>
                 </header>
                 <div class="image-lightbox-stage">
-                  <button id="image-lightbox-previous" class="image-lightbox-arrow" data-direction="previous" type="button" aria-label="上一张" title="上一张（←）">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  </button>
-                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮缩放，放大后拖动平移，双击切换原始大小与适应窗口">
+                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Ctrl 加滚轮缩放，双击切换原始大小与适应窗口">
                     <img id="image-lightbox-image" alt="" draggable="false"/>
                   </div>
-                  <button id="image-lightbox-next" class="image-lightbox-arrow" data-direction="next" type="button" aria-label="下一张" title="下一张（→）">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  </button>
                 </div>
                 <footer class="image-lightbox-footer">
                   <strong id="image-lightbox-title" class="image-lightbox-title" aria-live="polite"></strong>
@@ -1868,8 +1871,46 @@
           .image-lightbox-shell:fullscreen {
             width: 100vw;
             height: 100vh;
+            position: relative;
+            display: block;
             border-radius: 0;
-            background: var(--main-surface-primary, #111111);
+            background: #050505;
+            color: #ffffff;
+          }
+
+          .image-lightbox-shell:fullscreen .image-lightbox-stage {
+            position: absolute;
+            z-index: 0;
+            inset: 0;
+          }
+
+          .image-lightbox-shell:fullscreen .image-lightbox-header,
+          .image-lightbox-shell:fullscreen .image-lightbox-footer {
+            position: absolute;
+            z-index: 3;
+            left: 12px;
+            right: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 13px;
+            background: rgba(18, 18, 18, 0.72);
+            color: #ffffff;
+            box-shadow: 0 8px 34px rgba(0, 0, 0, 0.32);
+            backdrop-filter: blur(12px);
+          }
+
+          .image-lightbox-shell:fullscreen .image-lightbox-header {
+            top: 12px;
+            border-bottom-color: rgba(255, 255, 255, 0.16);
+          }
+
+          .image-lightbox-shell:fullscreen .image-lightbox-footer {
+            bottom: 12px;
+            border-top-color: rgba(255, 255, 255, 0.16);
+          }
+
+          .image-lightbox-shell:fullscreen .image-lightbox-counter,
+          .image-lightbox-shell:fullscreen .image-lightbox-zoom-value {
+            color: rgba(255, 255, 255, 0.82);
           }
 
           .image-lightbox-header {
@@ -1897,6 +1938,15 @@
             gap: 3px;
           }
 
+          .image-lightbox-tool-separator {
+            width: 1px;
+            height: 20px;
+            flex: none;
+            margin-inline: 3px;
+            background: currentColor;
+            opacity: 0.16;
+          }
+
           .image-lightbox-zoom-value {
             min-width: 46px;
             padding-inline: 3px;
@@ -1915,8 +1965,7 @@
             line-height: 1.45;
           }
 
-          .image-lightbox-icon,
-          .image-lightbox-arrow {
+          .image-lightbox-icon {
             display: grid;
             flex: none;
             place-items: center;
@@ -1941,8 +1990,7 @@
             font-weight: 700;
           }
 
-          .image-lightbox-icon:hover,
-          .image-lightbox-arrow:hover:not(:disabled) {
+          .image-lightbox-icon:hover:not(:disabled) {
             background: color-mix(in srgb, currentColor 10%, transparent);
           }
 
@@ -1955,8 +2003,7 @@
             opacity: 0.35;
           }
 
-          .image-lightbox-icon svg,
-          .image-lightbox-arrow svg {
+          .image-lightbox-icon svg {
             width: 21px;
             height: 21px;
           }
@@ -1965,19 +2012,9 @@
             min-width: 0;
             min-height: 0;
             display: grid;
-            grid-template-columns: 52px minmax(0, 1fr) 52px;
+            grid-template-columns: minmax(0, 1fr);
             align-items: stretch;
             background: rgba(0, 0, 0, 0.92);
-          }
-
-          .image-lightbox-arrow {
-            width: 100%;
-            color: #ffffff;
-          }
-
-          .image-lightbox-arrow:disabled {
-            cursor: default;
-            opacity: 0.25;
           }
 
           .image-lightbox-media {
@@ -2045,10 +2082,6 @@
               border-radius: 12px;
             }
 
-            .image-lightbox-stage {
-              grid-template-columns: 42px minmax(0, 1fr) 42px;
-            }
-
             .image-lightbox-zoom-tools {
               gap: 0;
             }
@@ -2069,6 +2102,20 @@
             .image-lightbox-footer {
               grid-template-columns: 1fr;
               gap: 8px;
+            }
+
+            .image-lightbox-shell:fullscreen .image-lightbox-header,
+            .image-lightbox-shell:fullscreen .image-lightbox-footer {
+              left: 6px;
+              right: 6px;
+            }
+
+            .image-lightbox-shell:fullscreen .image-lightbox-header {
+              top: 6px;
+            }
+
+            .image-lightbox-shell:fullscreen .image-lightbox-footer {
+              bottom: 6px;
             }
           }
 
@@ -2551,10 +2598,10 @@
                 this.closeGeneratedImageLightbox();
             });
             this.imageLightboxZoomOutButton?.addEventListener('click', () => {
-                this.zoomGeneratedImageBy(1 / 1.25);
+                this.zoomGeneratedImageBy(1 / this.getGeneratedImageZoomStep());
             });
             this.imageLightboxZoomInButton?.addEventListener('click', () => {
-                this.zoomGeneratedImageBy(1.25);
+                this.zoomGeneratedImageBy(this.getGeneratedImageZoomStep());
             });
             this.imageLightboxActualSizeButton?.addEventListener('click', () => {
                 this.showGeneratedImageAtActualSize();
@@ -3963,13 +4010,13 @@
                 if (!isEditing && (event.key === '+' || event.key === '=')) {
                     event.preventDefault();
                     event.stopPropagation();
-                    this.zoomGeneratedImageBy(1.25);
+                    this.zoomGeneratedImageBy(this.getGeneratedImageZoomStep());
                     return;
                 }
                 if (!isEditing && event.key === '-') {
                     event.preventDefault();
                     event.stopPropagation();
-                    this.zoomGeneratedImageBy(1 / 1.25);
+                    this.zoomGeneratedImageBy(1 / this.getGeneratedImageZoomStep());
                     return;
                 }
                 if (!isEditing && event.key === '0') {
@@ -3990,10 +4037,19 @@
                     this.toggleGeneratedImageFullscreen();
                     return;
                 }
-                if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+                if (!isEditing && (event.key === 'PageUp' || event.key === 'PageDown')) {
                     event.preventDefault();
                     event.stopPropagation();
-                    this.stepGeneratedImageLightbox(event.key === 'ArrowLeft' ? -1 : 1);
+                    this.stepGeneratedImageLightbox(event.key === 'PageUp' ? -1 : 1);
+                    return;
+                }
+                if (!isEditing && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const step = Math.max(12, Number(this.config.generatedImageKeyboardPanStepPx) || 72);
+                    const x = event.key === 'ArrowLeft' ? step : event.key === 'ArrowRight' ? -step : 0;
+                    const y = event.key === 'ArrowUp' ? step : event.key === 'ArrowDown' ? -step : 0;
+                    this.panGeneratedImageBy(x, y);
                     return;
                 }
                 if (event.key === 'Escape') {
@@ -7419,6 +7475,7 @@
             const stem = title.replace(/\.(?:png|jpe?g|webp|gif|avif|bmp|tiff?)$/i, '').trim();
             if (/^(?:generated[-_ ]?)?(?:image|picture|photo|artwork|illustration|图片|图像|(?:已)?生成(?:的)?图片|(?:已)?生成(?:的)?图像)(?:[-_ ]?\d+)?$/i.test(stem)) return true;
             if (/^(?:image[_ -]?(?:gen(?:eration)?|creator)|gpt[_ -]?image|dall[-_. ]?e)(?:\s+tool)?$/i.test(stem)) return true;
+            if (/^(?:(?:dall[-_. ]?e|gpt[_ -]?image|image[_ -]?gen(?:eration)?)\s+)?(?:generation\s+)?metadata$/i.test(stem)) return true;
             if (/^(?:(?:open|view|preview|download|zoom)(?: the)?|打开|查看|预览|下载|放大)?\s*(?:image|picture|图片|图像)(?:\s*\d+)?$/i.test(stem)) return true;
             if (/^第\s*\d+\s*(?:轮|张)(?:生成(?:的)?)?(?:图片|图像)$/i.test(stem)) return true;
             if (/^(?:image|picture|图片|图像)\s*\d+$/i.test(stem)) return true;
@@ -7444,6 +7501,7 @@
             }
             if (/^(?:image|picture|图片|图像)\s+(?:created|generated|ready|complete|已创建|已生成|已完成)(?:\s+successfully)?[.!。]?$/i.test(title)) return false;
             if (/^(?:dall[-_. ]?e|image[_ -]?gen(?:eration)?|gpt[_ -]?image)\s+(?:displayed|generated|created|returned|produced)\s*\d*\s*images?[.!。]?$/i.test(title)) return false;
+            if (/^(?:serialization|generation|image|asset|tool|result|output)[_ -]*(?:title|name|metadata)$/i.test(title)) return false;
             return true;
         }
 
@@ -7459,14 +7517,17 @@
                 const signal = `${normalized} ${String(path || '').toLowerCase()}`;
                 if (!normalized) return 0;
                 if (/(?:url|uri|href|src|path|pointer|mime|mediatype|contenttype|filename|fileid|assetid|generationid|promptid|seed|hash|slug|status|token)$/.test(normalized)) return 0;
-                if (/^(?:serializationtitle|imagetitle|generatedimagetitle|displaytitle|displayname|标题|图片标题|图像标题)$/.test(normalized)) return 240;
-                if (normalized === 'title') return 220;
+                // ChatGPT 的 image_asset_pointer 使用 serialization_title 标识元数据结构；它不是图片标题。
+                if (/^(?:serializationtitle|serializationname|metadatatitle|metadataname)$/.test(normalized)) return 0;
+                if (/^(?:imagetitle|generatedimagetitle|displaytitle|displayname|标题|图片标题|图像标题)$/.test(normalized)) return 240;
                 if (normalized === 'name' && /(?:image|generation|dalle|gpt|asset|result|output|metadata|图片|图像)/i.test(signal)) return 130;
-                if (/(?:imagecaption|caption|figcaption|图注|说明文字)$/.test(normalized)) return 210;
-                if (/(?:imagedescription|visualdescription|description|descriptivealt|alttext|aria-label|arialabel|图片描述|图像描述)$/.test(normalized)) return 200;
+                if (/(?:imagecaption|caption|figcaption|图注|说明文字)$/.test(normalized)) return 225;
+                if (/(?:imagedescription|visualdescription|description|descriptivealt|alttext|aria-label|arialabel|图片描述|图像描述)$/.test(normalized)) return 215;
+                if (normalized === 'alt') return 210;
+                if (normalized === 'title') return 195;
                 if (/(?:revisedprompt|finalprompt|visualprompt|generationprompt|生成提示词)$/.test(normalized)) return 180;
                 if (/^(?:prompt|prompttext|originalprompt|instruction|instructions|提示词)$/.test(normalized)) return 160;
-                if (/^(?:alt|label)$/.test(normalized) && /(?:image|generation|asset|result|output|图片|图像)/i.test(signal)) return 145;
+                if (normalized === 'label' && /(?:image|generation|asset|result|output|图片|图像)/i.test(signal)) return 145;
                 return 0;
             };
             const push = (value, score) => {
@@ -8298,21 +8359,57 @@
             if (!apiItems.length) return domItems.map((item, index) => ({ ...item, galleryOrder: index }));
             const merged = apiItems.map((item) => ({ ...item }));
             const usedApi = new Set();
+            const assignments = new Map();
+
+            // 先只按 file_id / 原图 URL 等强身份配对，避免顺序后备抢占精确匹配。
             for (const domItem of domItems) {
-                let index = merged.findIndex((apiItem, candidateIndex) =>
+                const index = merged.findIndex((apiItem, candidateIndex) =>
                     !usedApi.has(candidateIndex) && this.assetsShareStrongIdentity(apiItem, domItem)
                 );
-                if (index < 0 && domItem.logicalIndex >= 0) {
-                    index = merged.findIndex((apiItem, candidateIndex) =>
-                        !usedApi.has(candidateIndex) && apiItem.logicalIndex === domItem.logicalIndex
-                    );
+                if (index >= 0) {
+                    assignments.set(domItem, index);
+                    usedApi.add(index);
                 }
-                if (index < 0) index = merged.findIndex((unused, candidateIndex) => !usedApi.has(candidateIndex));
-                if (index < 0) {
+            }
+
+            // ChatGPT 同一轮通常只在 DOM 中挂载当前选中的版本，而 API 会返回全部历史版本。
+            // 将未命中的 DOM 项与该轮 API 尾部对齐，才能把当前（通常也是最新）版本放回正确位置。
+            const remainingByLogicalIndex = new Map();
+            for (const domItem of domItems) {
+                if (assignments.has(domItem) || domItem.logicalIndex < 0) continue;
+                if (!remainingByLogicalIndex.has(domItem.logicalIndex)) remainingByLogicalIndex.set(domItem.logicalIndex, []);
+                remainingByLogicalIndex.get(domItem.logicalIndex).push(domItem);
+            }
+            for (const [logicalIndex, group] of remainingByLogicalIndex) {
+                const candidates = merged
+                    .map((item, index) => ({ item, index }))
+                    .filter(({ item, index }) => !usedApi.has(index) && item.logicalIndex === logicalIndex)
+                    .map(({ index }) => index);
+                const aligned = candidates.slice(Math.max(0, candidates.length - group.length));
+                for (let position = 0; position < Math.min(group.length, aligned.length); position += 1) {
+                    assignments.set(group[position], aligned[position]);
+                    usedApi.add(aligned[position]);
+                }
+            }
+
+            // DOM 上下文尚未映射到问答索引时，仍按整页顺序从尾部对齐；不跨问答盲配已知索引。
+            const unknownDomItems = domItems.filter((item) => !assignments.has(item) && item.logicalIndex < 0);
+            const unknownApiIndices = merged
+                .map((item, index) => ({ item, index }))
+                .filter(({ index }) => !usedApi.has(index))
+                .map(({ index }) => index);
+            const alignedUnknown = unknownApiIndices.slice(Math.max(0, unknownApiIndices.length - unknownDomItems.length));
+            for (let position = 0; position < Math.min(unknownDomItems.length, alignedUnknown.length); position += 1) {
+                assignments.set(unknownDomItems[position], alignedUnknown[position]);
+                usedApi.add(alignedUnknown[position]);
+            }
+
+            for (const domItem of domItems) {
+                const index = assignments.get(domItem);
+                if (!Number.isInteger(index)) {
                     merged.push({ ...domItem, galleryOrder: merged.length });
                     continue;
                 }
-                usedApi.add(index);
                 const apiItem = merged[index];
                 const domTitle = this.isGenericGeneratedImageTitle(domItem.explicitTitle) ? '' : domItem.explicitTitle;
                 const mergedTitle = this.pickGeneratedImageTitle(
@@ -8530,6 +8627,11 @@
             return { min, max: Math.max(min, max) };
         }
 
+        getGeneratedImageZoomStep() {
+            const configured = Number(this.config.generatedImageZoomStep);
+            return Number.isFinite(configured) ? Math.max(1.01, Math.min(1.5, configured)) : 1.1;
+        }
+
         getGeneratedImageFitRatio() {
             const image = this.imageLightboxImage;
             if (!(image instanceof HTMLImageElement) || !image.naturalWidth || !image.naturalHeight) return 1;
@@ -8545,9 +8647,12 @@
             if (!(media instanceof HTMLElement) || !(image instanceof HTMLImageElement)) return { x: 0, y: 0 };
             const baseWidth = image.offsetWidth || 0;
             const baseHeight = image.offsetHeight || 0;
+            const overflowX = Math.max(0, baseWidth * zoom - media.clientWidth);
+            const overflowY = Math.max(0, baseHeight * zoom - media.clientHeight);
+            // 半像素安全余量确保到达极限时图片仍覆盖画布，不会因亚像素取整露出黑边。
             return {
-                x: Math.max(0, (baseWidth * zoom - media.clientWidth) / 2),
-                y: Math.max(0, (baseHeight * zoom - media.clientHeight) / 2),
+                x: Math.max(0, overflowX / 2 - Math.min(0.5, overflowX / 2)),
+                y: Math.max(0, overflowY / 2 - Math.min(0.5, overflowY / 2)),
             };
         }
 
@@ -8602,6 +8707,16 @@
             this.setGeneratedImageZoom(this.generatedImageZoom * Number(factor || 1), anchor);
         }
 
+        panGeneratedImageBy(deltaX = 0, deltaY = 0) {
+            const beforeX = Number(this.generatedImagePanX) || 0;
+            const beforeY = Number(this.generatedImagePanY) || 0;
+            this.generatedImagePanX = beforeX + (Number(deltaX) || 0);
+            this.generatedImagePanY = beforeY + (Number(deltaY) || 0);
+            this.applyGeneratedImageTransform();
+            return Math.abs(this.generatedImagePanX - beforeX) > 0.01 ||
+                Math.abs(this.generatedImagePanY - beforeY) > 0.01;
+        }
+
         fitGeneratedImageToViewport() {
             this.generatedImageZoom = 1;
             this.generatedImagePanX = 0;
@@ -8633,9 +8748,22 @@
                 : event.deltaMode === 2
                     ? Math.max(1, this.imageLightboxMedia?.clientHeight || 600)
                     : 1;
-            const sensitivity = Math.max(0.0002, Number(this.config.generatedImageWheelZoomSensitivity) || 0.0015);
-            const factor = Math.exp(-event.deltaY * modeMultiplier * sensitivity);
-            this.zoomGeneratedImageBy(factor, event);
+            if (event.ctrlKey || event.metaKey) {
+                const sensitivity = Math.max(0.0001, Number(this.config.generatedImageWheelZoomSensitivity) || 0.0008);
+                const zoomDelta = event.deltaY || event.deltaX;
+                const factor = Math.exp(-zoomDelta * modeMultiplier * sensitivity);
+                this.zoomGeneratedImageBy(factor, event);
+                return;
+            }
+
+            const limit = Math.max(80, (this.imageLightboxMedia?.clientHeight || 600) * 0.8);
+            const clampDelta = (value) => Math.max(-limit, Math.min(limit, value * modeMultiplier));
+            if (event.shiftKey) {
+                const horizontalDelta = event.deltaY || event.deltaX;
+                this.panGeneratedImageBy(-clampDelta(horizontalDelta), 0);
+            } else {
+                this.panGeneratedImageBy(0, -clampDelta(event.deltaY));
+            }
         }
 
         getGeneratedImagePointerPair() {
@@ -8804,7 +8932,7 @@
                 else this.imageLightboxImage.removeAttribute('src');
             }
             if (this.imageLightboxMedia) {
-                this.imageLightboxMedia.setAttribute('aria-label', `${item.title}；滚轮或加减按钮缩放，放大后拖动平移，双击切换原始大小与适应窗口`);
+                this.imageLightboxMedia.setAttribute('aria-label', `${item.title}；滚轮或上下方向键纵向平移，Shift 加滚轮或左右方向键横向平移，Ctrl 加滚轮或加减按钮缩放，Page Up 和 Page Down 切换图片`);
             }
             const onlyOne = this.generatedImages.length < 2;
             if (this.imageLightboxPreviousButton) this.imageLightboxPreviousButton.disabled = onlyOne;
