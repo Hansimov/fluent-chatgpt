@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.0.0
+// @version      4.1.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -68,6 +68,9 @@
         generatedImageTitleMaxLength: 240,
         generatedImageFilenameMaxLength: 96,
         generatedImagePreviewConcurrency: 3,
+        generatedImageMinZoom: 0.25,
+        generatedImageMaxZoom: 8,
+        generatedImageWheelZoomSensitivity: 0.0015,
 
         // 一级目录：整段对话中的用户提问；二级目录：当前回答里的 H1/H2。
         enableConversationToc: true,
@@ -579,9 +582,17 @@
             this.imageGalleryStatus = null;
             this.imageDownloadAllButton = null;
             this.imageLightbox = null;
+            this.imageLightboxShell = null;
+            this.imageLightboxMedia = null;
             this.imageLightboxImage = null;
             this.imageLightboxTitle = null;
             this.imageLightboxCounter = null;
+            this.imageLightboxZoomOutButton = null;
+            this.imageLightboxZoomValue = null;
+            this.imageLightboxZoomInButton = null;
+            this.imageLightboxActualSizeButton = null;
+            this.imageLightboxFitButton = null;
+            this.imageLightboxFullscreenButton = null;
             this.imageLightboxPreviousButton = null;
             this.imageLightboxNextButton = null;
             this.imageLightboxDownloadButton = null;
@@ -699,6 +710,12 @@
             this.generatedImageDownloadAbortController = null;
             this.generatedImageDownloadInProgress = false;
             this.generatedImagePreviewObjectUrls = new Set();
+            this.generatedImageZoom = 1;
+            this.generatedImagePanX = 0;
+            this.generatedImagePanY = 0;
+            this.generatedImagePanState = null;
+            this.generatedImagePointers = new Map();
+            this.generatedImagePinchState = null;
 
             // ZIP 附件获取缓存。成功结果在当前对话页面内复用；失败只短期缓存，
             // 避免重复点击“全部 ZIP”时再次等待同一失效端点。
@@ -817,6 +834,7 @@
             this.onResizePointerCancel = this.onResizePointerCancel.bind(this);
             this.onSearchInput = this.onSearchInput.bind(this);
             this.onSearchKeyDown = this.onSearchKeyDown.bind(this);
+            this.onGeneratedImageFullscreenChange = this.onGeneratedImageFullscreenChange.bind(this);
         }
 
         start() {
@@ -976,7 +994,22 @@
               <div class="image-lightbox-shell">
                 <header class="image-lightbox-header">
                   <span id="image-lightbox-counter" class="image-lightbox-counter"></span>
-                  <strong id="image-lightbox-title" class="image-lightbox-title"></strong>
+                  <div class="image-lightbox-zoom-tools" role="toolbar" aria-label="图片缩放与全屏工具">
+                    <button id="image-lightbox-zoom-out" class="image-lightbox-icon" type="button" aria-label="缩小图片" title="缩小（-）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7.5 10.5h6M15.5 15.5 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                    </button>
+                    <output id="image-lightbox-zoom-value" class="image-lightbox-zoom-value" aria-live="polite">100%</output>
+                    <button id="image-lightbox-zoom-in" class="image-lightbox-icon" type="button" aria-label="放大图片" title="放大（+）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7.5 10.5h6M10.5 7.5v6M15.5 15.5 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                    </button>
+                    <button id="image-lightbox-actual-size" class="image-lightbox-icon image-lightbox-text-icon" type="button" aria-label="按原始像素显示图片" title="原始大小（1）">1:1</button>
+                    <button id="image-lightbox-fit" class="image-lightbox-icon" type="button" aria-label="使图片适应窗口" title="适应窗口（0）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 5 5M9.5 6v3.5H6m13.5-5-5 5M18 9.5h-3.5V6m-10 13.5 5-5M6 14.5h3.5V18m10 1.5-5-5M14.5 18v-3.5H18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <button id="image-lightbox-fullscreen" class="image-lightbox-icon" type="button" aria-label="全屏浏览图片" aria-pressed="false" title="全屏浏览（F）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                  </div>
                   <button id="image-lightbox-close" class="image-lightbox-icon" type="button" aria-label="关闭图片预览" title="关闭（Esc）">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
                   </button>
@@ -985,14 +1018,19 @@
                   <button id="image-lightbox-previous" class="image-lightbox-arrow" data-direction="previous" type="button" aria-label="上一张" title="上一张（←）">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
                   </button>
-                  <div class="image-lightbox-media"><img id="image-lightbox-image" alt=""/></div>
+                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮缩放，放大后拖动平移，双击切换原始大小与适应窗口">
+                    <img id="image-lightbox-image" alt="" draggable="false"/>
+                  </div>
                   <button id="image-lightbox-next" class="image-lightbox-arrow" data-direction="next" type="button" aria-label="下一张" title="下一张（→）">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
                   </button>
                 </div>
-                <footer class="image-lightbox-actions">
-                  <button id="image-lightbox-locate" class="tool-button" type="button">定位到网页</button>
-                  <button id="image-lightbox-download" class="tool-button" data-primary="true" type="button">下载这张原图</button>
+                <footer class="image-lightbox-footer">
+                  <strong id="image-lightbox-title" class="image-lightbox-title" aria-live="polite"></strong>
+                  <div class="image-lightbox-actions">
+                    <button id="image-lightbox-locate" class="tool-button" type="button">定位到网页</button>
+                    <button id="image-lightbox-download" class="tool-button" data-primary="true" type="button">下载这张原图</button>
+                  </div>
                 </footer>
               </div>
             </dialog>`
@@ -1822,6 +1860,16 @@
             height: 100%;
             display: grid;
             grid-template-rows: auto minmax(0, 1fr) auto;
+            overflow: hidden;
+            border-radius: inherit;
+            background: color-mix(in srgb, var(--main-surface-primary, #ffffff) 96%, transparent);
+          }
+
+          .image-lightbox-shell:fullscreen {
+            width: 100vw;
+            height: 100vh;
+            border-radius: 0;
+            background: var(--main-surface-primary, #111111);
           }
 
           .image-lightbox-header {
@@ -1829,7 +1877,7 @@
             display: flex;
             align-items: center;
             gap: 10px;
-            padding: 10px 12px;
+            padding: 8px 10px;
             border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
           }
 
@@ -1840,15 +1888,31 @@
             font-variant-numeric: tabular-nums;
           }
 
+          .image-lightbox-zoom-tools {
+            min-width: 0;
+            display: flex;
+            flex: 1;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 3px;
+          }
+
+          .image-lightbox-zoom-value {
+            min-width: 46px;
+            padding-inline: 3px;
+            color: var(--text-secondary, #444444);
+            font-size: 11px;
+            font-variant-numeric: tabular-nums;
+            text-align: center;
+          }
+
           .image-lightbox-title {
             min-width: 0;
-            flex: 1;
-            overflow: hidden;
-            font-size: 13px;
+            display: block;
+            overflow-wrap: anywhere;
+            font-size: 12.5px;
             font-weight: 600;
-            line-height: 1.35;
-            text-overflow: ellipsis;
-            white-space: nowrap;
+            line-height: 1.45;
           }
 
           .image-lightbox-icon,
@@ -1869,9 +1933,26 @@
             border-radius: 9px;
           }
 
+          .image-lightbox-text-icon {
+            width: auto;
+            min-width: 38px;
+            padding-inline: 7px;
+            font-size: 10px;
+            font-weight: 700;
+          }
+
           .image-lightbox-icon:hover,
           .image-lightbox-arrow:hover:not(:disabled) {
             background: color-mix(in srgb, currentColor 10%, transparent);
+          }
+
+          .image-lightbox-icon[aria-pressed="true"] {
+            background: color-mix(in srgb, currentColor 13%, transparent);
+          }
+
+          .image-lightbox-icon:disabled {
+            cursor: default;
+            opacity: 0.35;
           }
 
           .image-lightbox-icon svg,
@@ -1905,21 +1986,56 @@
             display: grid;
             place-items: center;
             overflow: hidden;
+            outline: 0;
+            cursor: zoom-in;
+            touch-action: none;
+            user-select: none;
+          }
+
+          .image-lightbox-media:focus-visible {
+            box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.72);
+          }
+
+          .image-lightbox-media[data-can-pan="true"] {
+            cursor: grab;
+          }
+
+          .image-lightbox-media[data-panning="true"] {
+            cursor: grabbing;
           }
 
           .image-lightbox-media img {
-            width: 100%;
-            height: 100%;
+            width: auto;
+            height: auto;
+            max-width: 100%;
+            max-height: 100%;
             display: block;
             object-fit: contain;
+            pointer-events: none;
+            transform: translate3d(0, 0, 0) scale(1);
+            transform-origin: center center;
+            transition: transform 110ms ease-out;
+            will-change: transform;
+          }
+
+          .image-lightbox-media[data-panning="true"] img {
+            transition: none;
+          }
+
+          .image-lightbox-footer {
+            min-width: 0;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 12px;
+            padding: 9px 12px;
+            border-top: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
           }
 
           .image-lightbox-actions {
             display: flex;
             justify-content: flex-end;
             gap: 7px;
-            padding: 9px 12px;
-            border-top: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
           }
 
           @media (max-width: 640px) {
@@ -1931,6 +2047,28 @@
 
             .image-lightbox-stage {
               grid-template-columns: 42px minmax(0, 1fr) 42px;
+            }
+
+            .image-lightbox-zoom-tools {
+              gap: 0;
+            }
+
+            .image-lightbox-zoom-tools .image-lightbox-icon {
+              width: 31px;
+              height: 31px;
+            }
+
+            .image-lightbox-zoom-tools .image-lightbox-text-icon {
+              display: none;
+            }
+
+            .image-lightbox-zoom-value {
+              min-width: 40px;
+            }
+
+            .image-lightbox-footer {
+              grid-template-columns: 1fr;
+              gap: 8px;
             }
           }
 
@@ -2279,9 +2417,17 @@
             this.imageGalleryStatus = shadow.getElementById('image-gallery-status');
             this.imageDownloadAllButton = shadow.getElementById('image-download-all');
             this.imageLightbox = shadow.getElementById('image-lightbox');
+            this.imageLightboxShell = shadow.querySelector('.image-lightbox-shell');
+            this.imageLightboxMedia = shadow.getElementById('image-lightbox-media');
             this.imageLightboxImage = shadow.getElementById('image-lightbox-image');
             this.imageLightboxTitle = shadow.getElementById('image-lightbox-title');
             this.imageLightboxCounter = shadow.getElementById('image-lightbox-counter');
+            this.imageLightboxZoomOutButton = shadow.getElementById('image-lightbox-zoom-out');
+            this.imageLightboxZoomValue = shadow.getElementById('image-lightbox-zoom-value');
+            this.imageLightboxZoomInButton = shadow.getElementById('image-lightbox-zoom-in');
+            this.imageLightboxActualSizeButton = shadow.getElementById('image-lightbox-actual-size');
+            this.imageLightboxFitButton = shadow.getElementById('image-lightbox-fit');
+            this.imageLightboxFullscreenButton = shadow.getElementById('image-lightbox-fullscreen');
             this.imageLightboxPreviousButton = shadow.getElementById('image-lightbox-previous');
             this.imageLightboxNextButton = shadow.getElementById('image-lightbox-next');
             this.imageLightboxDownloadButton = shadow.getElementById('image-lightbox-download');
@@ -2404,6 +2550,21 @@
             shadow.getElementById('image-lightbox-close')?.addEventListener('click', () => {
                 this.closeGeneratedImageLightbox();
             });
+            this.imageLightboxZoomOutButton?.addEventListener('click', () => {
+                this.zoomGeneratedImageBy(1 / 1.25);
+            });
+            this.imageLightboxZoomInButton?.addEventListener('click', () => {
+                this.zoomGeneratedImageBy(1.25);
+            });
+            this.imageLightboxActualSizeButton?.addEventListener('click', () => {
+                this.showGeneratedImageAtActualSize();
+            });
+            this.imageLightboxFitButton?.addEventListener('click', () => {
+                this.fitGeneratedImageToViewport();
+            });
+            this.imageLightboxFullscreenButton?.addEventListener('click', () => {
+                this.toggleGeneratedImageFullscreen();
+            });
             this.imageLightboxPreviousButton?.addEventListener('click', () => {
                 this.stepGeneratedImageLightbox(-1);
             });
@@ -2419,6 +2580,36 @@
             this.imageLightbox?.addEventListener('click', (event) => {
                 if (event.target === this.imageLightbox) this.closeGeneratedImageLightbox();
             });
+            this.imageLightbox?.addEventListener('cancel', (event) => {
+                event.preventDefault();
+                if (!this.isGeneratedImageFullscreen()) this.closeGeneratedImageLightbox();
+            });
+            this.imageLightboxMedia?.addEventListener('wheel', (event) => {
+                this.onGeneratedImageWheel(event);
+            }, { passive: false });
+            this.imageLightboxMedia?.addEventListener('pointerdown', (event) => {
+                this.beginGeneratedImagePan(event);
+            });
+            this.imageLightboxMedia?.addEventListener('pointermove', (event) => {
+                this.moveGeneratedImagePan(event);
+            });
+            this.imageLightboxMedia?.addEventListener('pointerup', (event) => {
+                this.endGeneratedImagePan(event);
+            });
+            this.imageLightboxMedia?.addEventListener('pointercancel', (event) => {
+                this.endGeneratedImagePan(event);
+            });
+            this.imageLightboxMedia?.addEventListener('lostpointercapture', (event) => {
+                this.endGeneratedImagePan(event);
+            });
+            this.imageLightboxMedia?.addEventListener('dblclick', (event) => {
+                this.toggleGeneratedImageActualSize(event);
+            });
+            this.imageLightboxImage?.addEventListener('load', () => {
+                this.fitGeneratedImageToViewport();
+            });
+            this.imageLightboxImage?.addEventListener('dragstart', (event) => event.preventDefault());
+            document.addEventListener('fullscreenchange', this.onGeneratedImageFullscreenChange);
             this.searchList?.addEventListener('click', (event) => {
                 const button = event.target instanceof Element
                     ? event.target.closest('button[data-search-result-index]')
@@ -3747,6 +3938,10 @@
                 } else {
                     this.updateInlineEndOffset();
                 }
+                if (this.imageLightbox?.open) {
+                    this.clampGeneratedImagePan();
+                    this.applyGeneratedImageTransform();
+                }
             });
 
             this.syncVisibility();
@@ -3763,6 +3958,38 @@
             }
 
             if (this.imageLightbox?.open) {
+                const target = event.target;
+                const isEditing = target instanceof Element && Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
+                if (!isEditing && (event.key === '+' || event.key === '=')) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.zoomGeneratedImageBy(1.25);
+                    return;
+                }
+                if (!isEditing && event.key === '-') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.zoomGeneratedImageBy(1 / 1.25);
+                    return;
+                }
+                if (!isEditing && event.key === '0') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.fitGeneratedImageToViewport();
+                    return;
+                }
+                if (!isEditing && event.key === '1') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.showGeneratedImageAtActualSize();
+                    return;
+                }
+                if (!isEditing && event.key.toLowerCase() === 'f') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.toggleGeneratedImageFullscreen();
+                    return;
+                }
                 if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
                     event.preventDefault();
                     event.stopPropagation();
@@ -3770,6 +3997,7 @@
                     return;
                 }
                 if (event.key === 'Escape') {
+                    if (this.isGeneratedImageFullscreen()) return;
                     event.preventDefault();
                     event.stopPropagation();
                     this.closeGeneratedImageLightbox();
@@ -7190,6 +7418,10 @@
             if (!title) return true;
             const stem = title.replace(/\.(?:png|jpe?g|webp|gif|avif|bmp|tiff?)$/i, '').trim();
             if (/^(?:generated[-_ ]?)?(?:image|picture|photo|artwork|illustration|图片|图像|(?:已)?生成(?:的)?图片|(?:已)?生成(?:的)?图像)(?:[-_ ]?\d+)?$/i.test(stem)) return true;
+            if (/^(?:image[_ -]?(?:gen(?:eration)?|creator)|gpt[_ -]?image|dall[-_. ]?e)(?:\s+tool)?$/i.test(stem)) return true;
+            if (/^(?:(?:open|view|preview|download|zoom)(?: the)?|打开|查看|预览|下载|放大)?\s*(?:image|picture|图片|图像)(?:\s*\d+)?$/i.test(stem)) return true;
+            if (/^第\s*\d+\s*(?:轮|张)(?:生成(?:的)?)?(?:图片|图像)$/i.test(stem)) return true;
+            if (/^(?:image|picture|图片|图像)\s*\d+$/i.test(stem)) return true;
             if (/^(?:file[-_])?[a-z0-9_-]{24,}$/i.test(stem)) return true;
             if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(stem)) return true;
             return false;
@@ -7203,44 +7435,132 @@
             return this.normalizeGeneratedImageTitle(fallback) || '生成图像';
         }
 
-        getGeneratedImageTitleFromPart(part, message, logicalIndex) {
-            const metadata = part?.metadata && typeof part.metadata === 'object' ? part.metadata : {};
-            const generation = metadata.dalle || metadata.generation || metadata.image_generation ||
-                metadata.imageGeneration || metadata.image_gen || metadata.imageGen || metadata.gpt_image || {};
-            const messageMetadata = message?.metadata && typeof message.metadata === 'object' ? message.metadata : {};
-            const textParts = (Array.isArray(message?.content?.parts) ? message.content.parts : [])
-                .filter((value) => typeof value === 'string' && value.trim());
+        isUsableGeneratedImageTitleCandidate(value) {
+            const title = this.normalizeGeneratedImageTitle(value);
+            if (!title || this.isGenericGeneratedImageTitle(title)) return false;
+            if (/^(?:https?:|data:|blob:|file-service:|sediment:|sandbox:|\/backend-api\/)/i.test(title)) return false;
+            if (/^(?:\{|\[)/.test(title)) {
+                try { JSON.parse(title); return false; } catch { }
+            }
+            if (/^(?:image|picture|图片|图像)\s+(?:created|generated|ready|complete|已创建|已生成|已完成)(?:\s+successfully)?[.!。]?$/i.test(title)) return false;
+            if (/^(?:dall[-_. ]?e|image[_ -]?gen(?:eration)?|gpt[_ -]?image)\s+(?:displayed|generated|created|returned|produced)\s*\d*\s*images?[.!。]?$/i.test(title)) return false;
+            return true;
+        }
+
+        collectGeneratedImageTitleCandidates(root) {
+            const candidates = [];
+            const visited = new WeakSet();
+            const seenTitles = new Map();
+            let order = 0;
+            let visitedNodes = 0;
+            const normalizeKey = (key) => String(key || '').replace(/[^a-z0-9\u4e00-\u9fff]+/gi, '').toLowerCase();
+            const getPriority = (key, path) => {
+                const normalized = normalizeKey(key);
+                const signal = `${normalized} ${String(path || '').toLowerCase()}`;
+                if (!normalized) return 0;
+                if (/(?:url|uri|href|src|path|pointer|mime|mediatype|contenttype|filename|fileid|assetid|generationid|promptid|seed|hash|slug|status|token)$/.test(normalized)) return 0;
+                if (/^(?:serializationtitle|imagetitle|generatedimagetitle|displaytitle|displayname|标题|图片标题|图像标题)$/.test(normalized)) return 240;
+                if (normalized === 'title') return 220;
+                if (normalized === 'name' && /(?:image|generation|dalle|gpt|asset|result|output|metadata|图片|图像)/i.test(signal)) return 130;
+                if (/(?:imagecaption|caption|figcaption|图注|说明文字)$/.test(normalized)) return 210;
+                if (/(?:imagedescription|visualdescription|description|descriptivealt|alttext|aria-label|arialabel|图片描述|图像描述)$/.test(normalized)) return 200;
+                if (/(?:revisedprompt|finalprompt|visualprompt|generationprompt|生成提示词)$/.test(normalized)) return 180;
+                if (/^(?:prompt|prompttext|originalprompt|instruction|instructions|提示词)$/.test(normalized)) return 160;
+                if (/^(?:alt|label)$/.test(normalized) && /(?:image|generation|asset|result|output|图片|图像)/i.test(signal)) return 145;
+                return 0;
+            };
+            const push = (value, score) => {
+                const title = this.normalizeGeneratedImageTitle(value);
+                if (!this.isUsableGeneratedImageTitleCandidate(title)) return;
+                const key = title.toLocaleLowerCase();
+                const existing = seenTitles.get(key);
+                if (existing) {
+                    existing.score = Math.max(existing.score, score);
+                    return;
+                }
+                const candidate = { title, score, order: order++ };
+                seenTitles.set(key, candidate);
+                candidates.push(candidate);
+            };
+            const walk = (value, path = '', depth = 0, inheritedPriority = 0) => {
+                if (value == null || depth > 10 || visitedNodes >= 1800) return;
+                visitedNodes += 1;
+                if (typeof value === 'string') {
+                    const raw = value.trim();
+                    if (!raw) return;
+                    if (/^(?:\{|\[)/.test(raw) && raw.length <= 1_000_000) {
+                        try {
+                            walk(JSON.parse(raw), `${path}.json`, depth + 1, inheritedPriority);
+                        } catch { }
+                    }
+                    if (inheritedPriority) push(raw, inheritedPriority - Math.min(depth, 8));
+                    return;
+                }
+                if (typeof value !== 'object') return;
+                if (visited.has(value)) return;
+                visited.add(value);
+                if (Array.isArray(value)) {
+                    for (let index = 0; index < value.length; index += 1) {
+                        walk(value[index], `${path}[${index}]`, depth + 1, inheritedPriority);
+                    }
+                    return;
+                }
+                let entries = [];
+                try { entries = Object.entries(value); } catch { return; }
+                for (const [key, child] of entries) {
+                    const priority = getPriority(key, path);
+                    walk(child, path ? `${path}.${key}` : key, depth + 1, priority || inheritedPriority);
+                }
+            };
+            walk(root);
+            return candidates
+                .sort((first, second) => second.score - first.score || first.order - second.order)
+                .map((candidate) => candidate.title);
+        }
+
+        extractApiMessagePromptText(message) {
+            const values = [];
+            const seen = new Set();
+            const push = (value) => {
+                const text = this.normalizeConversationText(value);
+                if (!text || /^(?:https?:|data:|blob:|file-service:|sediment:)/i.test(text) || seen.has(text)) return;
+                seen.add(text);
+                values.push(text);
+            };
+            const walkText = (value, key = '', depth = 0) => {
+                if (value == null || depth > 6) return;
+                if (typeof value === 'string') {
+                    if (!key || /^(?:text|content|prompt|prompttext|caption|description)$/i.test(key)) push(value);
+                    return;
+                }
+                if (Array.isArray(value)) {
+                    for (const item of value) walkText(item, key, depth + 1);
+                    return;
+                }
+                if (typeof value !== 'object') return;
+                if (value.content_type === 'image_asset_pointer') return;
+                for (const [childKey, child] of Object.entries(value)) {
+                    if (/^(?:parts|text|content|prompt|prompttext|caption|description)$/i.test(childKey)) {
+                        walkText(child, childKey === 'parts' ? '' : childKey, depth + 1);
+                    }
+                }
+            };
+            walkText(message?.content || null);
+            return values.join('\n');
+        }
+
+        getGeneratedImageTitleFromPart(part, message, logicalIndex, apiPromptText = '') {
             const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
+            const messageText = this.extractApiMessagePromptText(message);
             return this.pickGeneratedImageTitle([
-                part?.title,
-                part?.image_title,
-                part?.imageTitle,
-                part?.caption,
-                part?.description,
-                metadata.title,
-                metadata.image_title,
-                metadata.imageTitle,
-                generation.title,
-                generation.image_title,
-                generation.imageTitle,
-                generation.display_name,
-                generation.displayName,
-                generation.caption,
-                generation.name,
-                metadata.caption,
-                generation.revised_prompt,
-                generation.revisedPrompt,
-                generation.prompt,
-                generation.image_description,
-                generation.imageDescription,
-                metadata.prompt,
-                messageMetadata.image_title,
-                messageMetadata.imageTitle,
-                messageMetadata.title,
-                ...textParts,
+                ...this.collectGeneratedImageTitleCandidates(part),
+                ...this.collectGeneratedImageTitleCandidates(message?.content || null),
+                ...this.collectGeneratedImageTitleCandidates(message?.metadata || null),
+                this.isUsableGeneratedImageTitleCandidate(messageText) ? messageText : '',
+                apiPromptText,
                 promptRecord?.fullLabel,
                 promptRecord?.label,
-            ], `第 ${logicalIndex + 1} 轮生成图像`);
+            ], apiPromptText || promptRecord?.fullLabel || promptRecord?.label || '图片描述不可用');
         }
 
         isImageGenerationMessage(message, part = null) {
@@ -7289,7 +7609,7 @@
             return false;
         }
 
-        collectApiAssetsFromMessage(message, logicalIndex) {
+        collectApiAssetsFromMessage(message, logicalIndex, apiPromptText = '') {
             if (!message || logicalIndex < 0) return [];
             const role = String(message.author?.role || 'assistant');
             const messageSignal = [
@@ -7379,6 +7699,7 @@
                     if (imageTitle && (!existing.imageTitle || this.isGenericGeneratedImageTitle(existing.imageTitle))) {
                         existing.imageTitle = this.normalizeGeneratedImageTitle(imageTitle);
                     }
+                    if (!existing.promptText && apiPromptText) existing.promptText = this.normalizeConversationText(apiPromptText);
                     if (!existing.width && Number(width) > 0) existing.width = Number(width);
                     if (!existing.height && Number(height) > 0) existing.height = Number(height);
                     if (kind && (existing.kind === 'file' || existing.kind === 'artifact' || !existing.kind)) existing.kind = finalKind;
@@ -7406,6 +7727,7 @@
                     expectedSize: Number(expectedSize) > 0 ? Number(expectedSize) : 0,
                     generatedImage: Boolean(generatedImage),
                     imageTitle: this.normalizeGeneratedImageTitle(imageTitle),
+                    promptText: this.normalizeConversationText(apiPromptText),
                     width: Number(width) > 0 ? Number(width) : 0,
                     height: Number(height) > 0 ? Number(height) : 0,
                     messageId: String(message.id || ''),
@@ -7517,7 +7839,7 @@
                 const partSignal = `content.parts ${part.content_type || ''} ${part.type || ''} ${part.kind || ''}`;
                 if (part.content_type === 'image_asset_pointer' && part.asset_pointer) {
                     const generatedImage = this.isImageGenerationMessage(message, part);
-                    const imageTitle = this.getGeneratedImageTitleFromPart(part, message, logicalIndex);
+                    const imageTitle = this.getGeneratedImageTitleFromPart(part, message, logicalIndex, apiPromptText);
                     add({
                         fileId: this.extractFileIdFromValue(part.asset_pointer, 'asset_pointer'),
                         fileIds: [part.original_file_id, part.source_file_id, part.upload_id, part.file_id, part.asset_pointer].filter(Boolean),
@@ -7577,7 +7899,7 @@
                     const signal = `${collectionName} ${item.type || ''} ${item.kind || ''} ${item.content_type || ''}`;
                     const generatedImage = this.isImageGenerationMessage(message, item) || /generated[_ -]?images?/i.test(signal);
                     const imageTitle = generatedImage
-                        ? this.getGeneratedImageTitleFromPart(item, message, logicalIndex)
+                        ? this.getGeneratedImageTitleFromPart(item, message, logicalIndex, apiPromptText)
                         : '';
                     const payload = this.inferArtifactPayload(item, signal, `${collectionName}-${sequence + 1}`) ||
                         this.inferArtifactPayload(metadata, signal, `${collectionName}-${sequence + 1}`);
@@ -7689,7 +8011,7 @@
                     /image/i.test(signal) || String(mimeType).startsWith('image/')
                 );
                 const imageTitle = generatedImage
-                    ? this.getGeneratedImageTitleFromPart(value, message, logicalIndex)
+                    ? this.getGeneratedImageTitleFromPart(value, message, logicalIndex, apiPromptText)
                     : '';
                 const internalOrDownloadUrl = /^(?:sandbox|file-service|sediment|artifact|canvas|canmore|textdoc|document):/i.test(String(url || '')) ||
                     /(?:\/backend-api\/(?:files?|file|artifacts?|canvas|canmore|textdocs?|documents?)\/|\/download(?:[/?#]|$))/i.test(String(url || ''));
@@ -7759,11 +8081,15 @@
         buildConversationApiAssetMap(snapshot) {
             const map = new Map();
             let logicalIndex = -1;
+            let apiPromptText = '';
             for (const message of this.getConversationBranchMessages(snapshot)) {
                 const role = String(message?.author?.role || '');
-                if (role === 'user') logicalIndex += 1;
+                if (role === 'user') {
+                    logicalIndex += 1;
+                    apiPromptText = this.extractApiMessagePromptText(message);
+                }
                 if (logicalIndex < 0) continue;
-                const assets = this.collectApiAssetsFromMessage(message, logicalIndex);
+                const assets = this.collectApiAssetsFromMessage(message, logicalIndex, apiPromptText);
                 if (!assets.length) continue;
                 if (!map.has(logicalIndex)) map.set(logicalIndex, []);
                 map.get(logicalIndex).push(...assets);
@@ -7842,9 +8168,10 @@
                     const title = this.pickGeneratedImageTitle([
                         asset.imageTitle,
                         asset.label,
+                        asset.promptText,
                         promptRecord?.fullLabel,
                         promptRecord?.label,
-                    ], `第 ${galleryOrder + 1} 张生成图像`);
+                    ], asset.promptText || promptRecord?.fullLabel || promptRecord?.label || '图片描述不可用');
                     items.push({
                         ...asset,
                         logicalIndex,
@@ -7907,6 +8234,21 @@
                     const holder = image.closest('figure, [data-testid*="image" i], [class*="image" i]');
                     const caption = holder?.querySelector?.('figcaption')?.textContent || '';
                     const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
+                    const nearbyTitles = [];
+                    let titleNode = image;
+                    for (let depth = 0; titleNode && depth < 7; depth += 1, titleNode = titleNode.parentElement) {
+                        for (const attribute of [
+                            'aria-label', 'title', 'data-title', 'data-image-title',
+                            'data-description', 'data-image-description', 'data-prompt',
+                        ]) {
+                            const value = titleNode.getAttribute?.(attribute);
+                            if (value) nearbyTitles.push(value);
+                        }
+                        if (titleNode === assistant) break;
+                    }
+                    const reactTitles = this.collectGeneratedImageTitleCandidates(
+                        this.getReactInternalPayloads(image, true),
+                    );
                     const explicitTitle = this.pickGeneratedImageTitle([
                         caption,
                         image.getAttribute('title'),
@@ -7914,12 +8256,14 @@
                         image.getAttribute('aria-label'),
                         holder?.getAttribute?.('title'),
                         holder?.getAttribute?.('aria-label'),
+                        ...nearbyTitles,
+                        ...reactTitles,
                     ], '');
                     const title = this.pickGeneratedImageTitle([
                         explicitTitle,
                         promptRecord?.fullLabel,
                         promptRecord?.label,
-                    ], `第 ${items.length + 1} 张生成图像`);
+                    ], promptRecord?.fullLabel || promptRecord?.label || '图片描述不可用');
                     const fileId = this.extractFileIdFromValue(sourceUrl);
                     const linkUrl = this.normalizeAssetCandidateUrl(image.closest('a[href]')?.getAttribute('href') || '');
                     items.push({
@@ -8151,7 +8495,6 @@
         openGeneratedImageLightbox(index) {
             if (!this.generatedImages.length || !this.imageLightbox) return;
             this.activeGeneratedImageIndex = Math.min(this.generatedImages.length - 1, Math.max(0, index));
-            this.updateGeneratedImageLightbox();
             if (!this.imageLightbox.open) {
                 try {
                     this.imageLightbox.showModal();
@@ -8159,15 +8502,285 @@
                     this.imageLightbox.setAttribute('open', '');
                 }
             }
+            this.updateGeneratedImageLightbox();
+            window.requestAnimationFrame(() => {
+                this.fitGeneratedImageToViewport();
+                try { this.imageLightboxMedia?.focus({ preventScroll: true }); } catch { }
+            });
         }
 
         closeGeneratedImageLightbox() {
             if (!this.imageLightbox?.open) return;
+            this.cancelGeneratedImagePointerInteraction();
+            if (this.isGeneratedImageFullscreen() && typeof document.exitFullscreen === 'function') {
+                document.exitFullscreen().catch(() => { });
+            }
             try {
                 this.imageLightbox.close();
             } catch {
                 this.imageLightbox.removeAttribute('open');
             }
+        }
+
+        getGeneratedImageZoomLimits() {
+            const configuredMin = Number(this.config.generatedImageMinZoom);
+            const configuredMax = Number(this.config.generatedImageMaxZoom);
+            const min = Number.isFinite(configuredMin) ? Math.max(0.05, Math.min(1, configuredMin)) : 0.25;
+            const max = Number.isFinite(configuredMax) ? Math.max(1, Math.min(32, configuredMax)) : 8;
+            return { min, max: Math.max(min, max) };
+        }
+
+        getGeneratedImageFitRatio() {
+            const image = this.imageLightboxImage;
+            if (!(image instanceof HTMLImageElement) || !image.naturalWidth || !image.naturalHeight) return 1;
+            const renderedWidth = image.offsetWidth;
+            const renderedHeight = image.offsetHeight;
+            if (!renderedWidth || !renderedHeight) return 1;
+            return Math.min(renderedWidth / image.naturalWidth, renderedHeight / image.naturalHeight) || 1;
+        }
+
+        getGeneratedImagePanBounds(zoom = this.generatedImageZoom) {
+            const media = this.imageLightboxMedia;
+            const image = this.imageLightboxImage;
+            if (!(media instanceof HTMLElement) || !(image instanceof HTMLImageElement)) return { x: 0, y: 0 };
+            const baseWidth = image.offsetWidth || 0;
+            const baseHeight = image.offsetHeight || 0;
+            return {
+                x: Math.max(0, (baseWidth * zoom - media.clientWidth) / 2),
+                y: Math.max(0, (baseHeight * zoom - media.clientHeight) / 2),
+            };
+        }
+
+        clampGeneratedImagePan() {
+            const bounds = this.getGeneratedImagePanBounds();
+            this.generatedImagePanX = Math.min(bounds.x, Math.max(-bounds.x, Number(this.generatedImagePanX) || 0));
+            this.generatedImagePanY = Math.min(bounds.y, Math.max(-bounds.y, Number(this.generatedImagePanY) || 0));
+            return bounds;
+        }
+
+        applyGeneratedImageTransform() {
+            const image = this.imageLightboxImage;
+            if (!(image instanceof HTMLImageElement)) return;
+            const { min, max } = this.getGeneratedImageZoomLimits();
+            this.generatedImageZoom = Math.min(max, Math.max(min, Number(this.generatedImageZoom) || 1));
+            const bounds = this.clampGeneratedImagePan();
+            image.style.transform = `translate3d(${this.generatedImagePanX}px, ${this.generatedImagePanY}px, 0) scale(${this.generatedImageZoom})`;
+            if (this.imageLightboxMedia) {
+                this.imageLightboxMedia.dataset.canPan = String(bounds.x > 0.5 || bounds.y > 0.5);
+            }
+            const actualZoom = this.getGeneratedImageFitRatio() * this.generatedImageZoom * 100;
+            const percentage = actualZoom < 10 ? actualZoom.toFixed(1) : String(Math.round(actualZoom));
+            if (this.imageLightboxZoomValue) {
+                this.imageLightboxZoomValue.textContent = `${percentage}%`;
+                this.imageLightboxZoomValue.title = `相对于原始像素的缩放级别：${percentage}%`;
+            }
+            if (this.imageLightboxZoomOutButton) this.imageLightboxZoomOutButton.disabled = this.generatedImageZoom <= min + 0.001;
+            if (this.imageLightboxZoomInButton) this.imageLightboxZoomInButton.disabled = this.generatedImageZoom >= max - 0.001;
+            if (this.imageLightboxFitButton) this.imageLightboxFitButton.setAttribute('aria-pressed', String(Math.abs(this.generatedImageZoom - 1) < 0.001));
+            if (this.imageLightboxActualSizeButton) {
+                this.imageLightboxActualSizeButton.disabled = !image.naturalWidth || !image.naturalHeight;
+            }
+        }
+
+        setGeneratedImageZoom(nextZoom, anchor = null) {
+            const { min, max } = this.getGeneratedImageZoomLimits();
+            const current = Math.min(max, Math.max(min, Number(this.generatedImageZoom) || 1));
+            const next = Math.min(max, Math.max(min, Number(nextZoom) || 1));
+            if (anchor && this.imageLightboxMedia && Math.abs(next - current) > 0.0001) {
+                const rect = this.imageLightboxMedia.getBoundingClientRect();
+                const offsetX = Number(anchor.clientX) - (rect.left + rect.width / 2);
+                const offsetY = Number(anchor.clientY) - (rect.top + rect.height / 2);
+                const ratio = next / current;
+                this.generatedImagePanX = offsetX - (offsetX - this.generatedImagePanX) * ratio;
+                this.generatedImagePanY = offsetY - (offsetY - this.generatedImagePanY) * ratio;
+            }
+            this.generatedImageZoom = next;
+            this.applyGeneratedImageTransform();
+        }
+
+        zoomGeneratedImageBy(factor, anchor = null) {
+            this.setGeneratedImageZoom(this.generatedImageZoom * Number(factor || 1), anchor);
+        }
+
+        fitGeneratedImageToViewport() {
+            this.generatedImageZoom = 1;
+            this.generatedImagePanX = 0;
+            this.generatedImagePanY = 0;
+            this.cancelGeneratedImagePointerInteraction();
+            this.applyGeneratedImageTransform();
+        }
+
+        showGeneratedImageAtActualSize(anchor = null) {
+            const fitRatio = this.getGeneratedImageFitRatio();
+            const actualSizeZoom = fitRatio > 0 ? 1 / fitRatio : 1;
+            this.setGeneratedImageZoom(actualSizeZoom, anchor);
+        }
+
+        toggleGeneratedImageActualSize(event = null) {
+            if (Math.abs(this.generatedImageZoom - 1) > 0.02) {
+                this.fitGeneratedImageToViewport();
+            } else {
+                this.showGeneratedImageAtActualSize(event);
+            }
+        }
+
+        onGeneratedImageWheel(event) {
+            if (!this.imageLightbox?.open) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const modeMultiplier = event.deltaMode === 1
+                ? 16
+                : event.deltaMode === 2
+                    ? Math.max(1, this.imageLightboxMedia?.clientHeight || 600)
+                    : 1;
+            const sensitivity = Math.max(0.0002, Number(this.config.generatedImageWheelZoomSensitivity) || 0.0015);
+            const factor = Math.exp(-event.deltaY * modeMultiplier * sensitivity);
+            this.zoomGeneratedImageBy(factor, event);
+        }
+
+        getGeneratedImagePointerPair() {
+            return [...this.generatedImagePointers.values()].slice(0, 2);
+        }
+
+        beginGeneratedImagePan(event) {
+            if (!this.imageLightbox?.open || event.button > 0) return;
+            const bounds = this.getGeneratedImagePanBounds();
+            const canPan = bounds.x > 0.5 || bounds.y > 0.5;
+            if (event.pointerType === 'mouse' && !canPan) return;
+            event.preventDefault();
+            try { this.imageLightboxMedia?.setPointerCapture?.(event.pointerId); } catch { }
+            this.generatedImagePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+            if (this.generatedImagePointers.size >= 2) {
+                const [first, second] = this.getGeneratedImagePointerPair();
+                const centerX = (first.x + second.x) / 2;
+                const centerY = (first.y + second.y) / 2;
+                this.generatedImagePinchState = {
+                    distance: Math.max(1, Math.hypot(second.x - first.x, second.y - first.y)),
+                    zoom: this.generatedImageZoom,
+                    panX: this.generatedImagePanX,
+                    panY: this.generatedImagePanY,
+                    centerX,
+                    centerY,
+                };
+                this.generatedImagePanState = null;
+            } else if (canPan) {
+                this.generatedImagePanState = {
+                    pointerId: event.pointerId,
+                    startX: event.clientX,
+                    startY: event.clientY,
+                    panX: this.generatedImagePanX,
+                    panY: this.generatedImagePanY,
+                };
+            }
+            if (this.imageLightboxMedia) this.imageLightboxMedia.dataset.panning = 'true';
+        }
+
+        moveGeneratedImagePan(event) {
+            if (!this.generatedImagePointers.has(event.pointerId)) return;
+            event.preventDefault();
+            this.generatedImagePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+            if (this.generatedImagePinchState && this.generatedImagePointers.size >= 2 && this.imageLightboxMedia) {
+                const [first, second] = this.getGeneratedImagePointerPair();
+                const distance = Math.max(1, Math.hypot(second.x - first.x, second.y - first.y));
+                const centerX = (first.x + second.x) / 2;
+                const centerY = (first.y + second.y) / 2;
+                const rect = this.imageLightboxMedia.getBoundingClientRect();
+                const startOffsetX = this.generatedImagePinchState.centerX - (rect.left + rect.width / 2);
+                const startOffsetY = this.generatedImagePinchState.centerY - (rect.top + rect.height / 2);
+                const currentOffsetX = centerX - (rect.left + rect.width / 2);
+                const currentOffsetY = centerY - (rect.top + rect.height / 2);
+                const { min, max } = this.getGeneratedImageZoomLimits();
+                const nextZoom = Math.min(max, Math.max(min,
+                    this.generatedImagePinchState.zoom * distance / this.generatedImagePinchState.distance));
+                const ratio = nextZoom / this.generatedImagePinchState.zoom;
+                this.generatedImageZoom = nextZoom;
+                this.generatedImagePanX = currentOffsetX - (startOffsetX - this.generatedImagePinchState.panX) * ratio;
+                this.generatedImagePanY = currentOffsetY - (startOffsetY - this.generatedImagePinchState.panY) * ratio;
+                this.applyGeneratedImageTransform();
+                return;
+            }
+            const state = this.generatedImagePanState;
+            if (!state || state.pointerId !== event.pointerId) return;
+            this.generatedImagePanX = state.panX + event.clientX - state.startX;
+            this.generatedImagePanY = state.panY + event.clientY - state.startY;
+            this.applyGeneratedImageTransform();
+        }
+
+        endGeneratedImagePan(event) {
+            if (!this.generatedImagePointers.has(event.pointerId) && this.generatedImagePanState?.pointerId !== event.pointerId) return;
+            this.generatedImagePointers.delete(event.pointerId);
+            try {
+                if (this.imageLightboxMedia?.hasPointerCapture?.(event.pointerId)) {
+                    this.imageLightboxMedia.releasePointerCapture(event.pointerId);
+                }
+            } catch { }
+            this.generatedImagePinchState = null;
+            const remaining = [...this.generatedImagePointers.entries()][0];
+            const bounds = this.getGeneratedImagePanBounds();
+            if (remaining && (bounds.x > 0.5 || bounds.y > 0.5)) {
+                this.generatedImagePanState = {
+                    pointerId: remaining[0],
+                    startX: remaining[1].x,
+                    startY: remaining[1].y,
+                    panX: this.generatedImagePanX,
+                    panY: this.generatedImagePanY,
+                };
+            } else {
+                this.generatedImagePanState = null;
+                if (this.imageLightboxMedia) delete this.imageLightboxMedia.dataset.panning;
+            }
+        }
+
+        cancelGeneratedImagePointerInteraction() {
+            for (const pointerId of this.generatedImagePointers.keys()) {
+                try {
+                    if (this.imageLightboxMedia?.hasPointerCapture?.(pointerId)) {
+                        this.imageLightboxMedia.releasePointerCapture(pointerId);
+                    }
+                } catch { }
+            }
+            this.generatedImagePointers.clear();
+            this.generatedImagePanState = null;
+            this.generatedImagePinchState = null;
+            if (this.imageLightboxMedia) delete this.imageLightboxMedia.dataset.panning;
+        }
+
+        isGeneratedImageFullscreen() {
+            const fullscreenElement = this.shadow?.fullscreenElement || document.fullscreenElement;
+            return Boolean(
+                fullscreenElement && (
+                    fullscreenElement === this.imageLightboxShell ||
+                    fullscreenElement === this.imageLightbox ||
+                    fullscreenElement === this.host
+                )
+            );
+        }
+
+        async toggleGeneratedImageFullscreen() {
+            if (!this.imageLightboxShell) return;
+            try {
+                if (this.isGeneratedImageFullscreen()) {
+                    await document.exitFullscreen?.();
+                } else if (typeof this.imageLightboxShell.requestFullscreen === 'function') {
+                    await this.imageLightboxShell.requestFullscreen({ navigationUI: 'hide' });
+                }
+            } catch (error) {
+                console.debug('[ChatGPT 图片画廊] 浏览器未允许进入全屏：', error);
+            }
+            this.onGeneratedImageFullscreenChange();
+        }
+
+        onGeneratedImageFullscreenChange() {
+            const active = this.isGeneratedImageFullscreen();
+            if (this.imageLightboxFullscreenButton) {
+                this.imageLightboxFullscreenButton.setAttribute('aria-pressed', String(active));
+                this.imageLightboxFullscreenButton.setAttribute('aria-label', active ? '退出全屏浏览' : '全屏浏览图片');
+                this.imageLightboxFullscreenButton.title = active ? '退出全屏（F 或 Esc）' : '全屏浏览（F）';
+            }
+            window.requestAnimationFrame(() => {
+                this.clampGeneratedImagePan();
+                this.applyGeneratedImageTransform();
+            });
         }
 
         updateGeneratedImageLightbox() {
@@ -8184,10 +8797,14 @@
                 this.imageLightboxCounter.textContent = `${this.activeGeneratedImageIndex + 1} / ${this.generatedImages.length}`;
             }
             const previewUrl = this.getGeneratedImagePreviewUrl(item);
+            this.fitGeneratedImageToViewport();
             if (this.imageLightboxImage) {
                 this.imageLightboxImage.alt = item.title;
                 if (previewUrl) this.imageLightboxImage.src = previewUrl;
                 else this.imageLightboxImage.removeAttribute('src');
+            }
+            if (this.imageLightboxMedia) {
+                this.imageLightboxMedia.setAttribute('aria-label', `${item.title}；滚轮或加减按钮缩放，放大后拖动平移，双击切换原始大小与适应窗口`);
             }
             const onlyOne = this.generatedImages.length < 2;
             if (this.imageLightboxPreviousButton) this.imageLightboxPreviousButton.disabled = onlyOne;
@@ -8452,6 +9069,7 @@
             if ((!existing.imageTitle || this.isGenericGeneratedImageTitle(existing.imageTitle)) && incoming.imageTitle) {
                 existing.imageTitle = incoming.imageTitle;
             }
+            if (!existing.promptText && incoming.promptText) existing.promptText = incoming.promptText;
             if (!existing.width && Number(incoming.width) > 0) existing.width = Number(incoming.width);
             if (!existing.height && Number(incoming.height) > 0) existing.height = Number(incoming.height);
             if (!existing.messageId && incoming.messageId) existing.messageId = incoming.messageId;
@@ -8891,8 +9509,8 @@
             return new Map(this.queryAllDeep(selector).map((node) => [node, this.getArtifactNodeState(node)]));
         }
 
-        getReactInternalPayloads(element) {
-            if (this.config.conversationExportProbeReactProperties === false || !(element instanceof Element)) return [];
+        getReactInternalPayloads(element, force = false) {
+            if ((!force && this.config.conversationExportProbeReactProperties === false) || !(element instanceof Element)) return [];
             const payloads = [];
             const seen = new Set();
             let node = element;
