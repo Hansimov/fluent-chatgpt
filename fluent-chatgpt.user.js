@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.5.0
+// @version      4.6.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -69,6 +69,14 @@
         generatedImageTitleNoiseTokens: Object.freeze(['天天彩票']),
         generatedImageFilenameMaxLength: 96,
         generatedImagePreviewConcurrency: 3,
+        generatedImageLoadTimeoutMs: 45000,
+        enableGeneratedImagePersistentCache: true,
+        generatedImagePersistentCacheMaxItemBytes: 32 * 1024 * 1024,
+        generatedImagePersistentCacheMaxBytes: 384 * 1024 * 1024,
+        generatedImagePersistentCacheMaxEntries: 160,
+        generatedImagePersistentCacheMaxAgeMs: 45 * 24 * 60 * 60 * 1000,
+        generatedImagePersistentCacheWarmConcurrency: 2,
+        generatedImagePersistentCacheWarmDelayMs: 700,
         generatedImageMinZoom: 0.25,
         generatedImageMaxZoom: 8,
         generatedImageZoomStep: 1.1,
@@ -585,8 +593,13 @@
             this.imageDownloadAllButton = null;
             this.imageLightbox = null;
             this.imageLightboxShell = null;
+            this.imageLightboxHeader = null;
+            this.imageLightboxToolbarToggle = null;
             this.imageLightboxMedia = null;
             this.imageLightboxImage = null;
+            this.imageLightboxState = null;
+            this.imageLightboxStateText = null;
+            this.imageLightboxRetryButton = null;
             this.imageLightboxTitle = null;
             this.imageLightboxPromptDetails = null;
             this.imageLightboxPromptText = null;
@@ -594,6 +607,7 @@
             this.imageLightboxZoomOutButton = null;
             this.imageLightboxZoomValue = null;
             this.imageLightboxZoomInButton = null;
+            this.imageLightboxRestoreZoomButton = null;
             this.imageLightboxActualSizeButton = null;
             this.imageLightboxFitButton = null;
             this.imageLightboxFitWidthButton = null;
@@ -719,6 +733,14 @@
             this.generatedImagePanX = 0;
             this.generatedImagePanY = 0;
             this.generatedImageFitMode = 'viewport';
+            this.generatedImagePreviousViewState = null;
+            this.generatedImageToolbarVisible = true;
+            this.generatedImageLightboxLoadToken = 0;
+            this.generatedImagePersistentCacheDbPromise = null;
+            this.generatedImagePersistentCacheReadPromises = new Map();
+            this.generatedImagePersistentCachePrunePromise = null;
+            this.generatedImagePersistentCacheWarmTimer = 0;
+            this.generatedImagePersistentCacheWarmController = null;
             this.generatedImagePanState = null;
             this.generatedImagePointers = new Map();
             this.generatedImagePinchState = null;
@@ -998,8 +1020,11 @@
               </nav>
             </section>
             <dialog id="image-lightbox" class="image-lightbox" aria-label="生成图片预览">
-              <div class="image-lightbox-shell">
-                <header class="image-lightbox-header">
+              <div class="image-lightbox-shell" data-controls-hidden="false">
+                <button id="image-lightbox-toolbar-toggle" class="image-lightbox-icon image-lightbox-toolbar-toggle" type="button" aria-label="隐藏顶部控件栏" aria-controls="image-lightbox-header" aria-expanded="true" title="隐藏顶部控件栏">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 12s3.1-5 8.5-5 8.5 5 8.5 5-3.1 5-8.5 5-8.5-5-8.5-5Z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path class="image-lightbox-toolbar-toggle-slash" d="m5 5 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                </button>
+                <header id="image-lightbox-header" class="image-lightbox-header">
                   <div class="image-lightbox-identity">
                     <strong id="image-lightbox-title" class="image-lightbox-title" aria-live="polite"></strong>
                     <details id="image-lightbox-prompt-details" class="image-lightbox-prompt-details">
@@ -1014,27 +1039,31 @@
                     <span id="image-lightbox-counter" class="image-lightbox-counter"></span>
                   </div>
                   <div class="image-lightbox-zoom-tools" role="toolbar" aria-label="图片切换、缩放与全屏工具">
-                    <button id="image-lightbox-previous" class="image-lightbox-icon" type="button" aria-label="上一张" title="上一张（Page Up）">
+                    <button id="image-lightbox-previous" class="image-lightbox-icon" type="button" aria-label="上一张" title="上一张（Q / Page Up）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
                     </button>
-                    <button id="image-lightbox-next" class="image-lightbox-icon" type="button" aria-label="下一张" title="下一张（Page Down）">
+                    <button id="image-lightbox-next" class="image-lightbox-icon" type="button" aria-label="下一张" title="下一张（W / Page Down）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
                     </button>
                     <span class="image-lightbox-tool-separator" aria-hidden="true"></span>
-                    <button id="image-lightbox-zoom-out" class="image-lightbox-icon" type="button" aria-label="缩小图片" title="缩小（-）">
+                    <button id="image-lightbox-fit" class="image-lightbox-icon" type="button" aria-label="使图片适应窗口" aria-pressed="true" title="适应窗口（A）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 5 5M9.5 6v3.5H6m13.5-5-5 5M18 9.5h-3.5V6m-10 13.5 5-5M6 14.5h3.5V18m10 1.5-5-5M14.5 18v-3.5H18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <button id="image-lightbox-fit-width" class="image-lightbox-icon" type="button" aria-label="使图片适应宽度" aria-pressed="false" title="适应宽度（S）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5v14M20 5v14M7 12h10m-7-3-3 3 3 3m4-6 3 3-3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <button id="image-lightbox-actual-size" class="image-lightbox-icon image-lightbox-text-icon" type="button" aria-label="按原始像素显示图片" aria-pressed="false" title="原始大小（Z）">1:1</button>
+                    <span class="image-lightbox-tool-separator" aria-hidden="true"></span>
+                    <button id="image-lightbox-zoom-out" class="image-lightbox-icon" type="button" aria-label="缩小图片" title="缩小（X / -）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7.5 10.5h6M15.5 15.5 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
                     </button>
                     <output id="image-lightbox-zoom-value" class="image-lightbox-zoom-value" aria-live="polite">100%</output>
-                    <button id="image-lightbox-zoom-in" class="image-lightbox-icon" type="button" aria-label="放大图片" title="放大（+）">
+                    <button id="image-lightbox-zoom-in" class="image-lightbox-icon" type="button" aria-label="放大图片" title="放大（C / +）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7.5 10.5h6M10.5 7.5v6M15.5 15.5 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
                     </button>
-                    <button id="image-lightbox-fit-width" class="image-lightbox-icon" type="button" aria-label="使图片适应宽度" aria-pressed="false" title="适应宽度（Q）">
-                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5v14M20 5v14M7 12h10m-7-3-3 3 3 3m4-6 3 3-3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    <button id="image-lightbox-restore-zoom" class="image-lightbox-icon" type="button" aria-label="切换到上一次缩放状态" title="切换当前与上一次缩放模式或比例（R）" disabled>
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 8H4V4.5M4.5 8a8 8 0 1 1-.2 7.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
                     </button>
-                    <button id="image-lightbox-fit" class="image-lightbox-icon" type="button" aria-label="使图片适应窗口" aria-pressed="true" title="适应窗口（W）">
-                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 5 5M9.5 6v3.5H6m13.5-5-5 5M18 9.5h-3.5V6m-10 13.5 5-5M6 14.5h3.5V18m10 1.5-5-5M14.5 18v-3.5H18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                    </button>
-                    <button id="image-lightbox-actual-size" class="image-lightbox-icon image-lightbox-text-icon" type="button" aria-label="按原始像素显示图片" title="原始大小（E）">1:1</button>
                     <span class="image-lightbox-tool-separator" aria-hidden="true"></span>
                     <button id="image-lightbox-locate" class="image-lightbox-icon" type="button" aria-label="定位到网页中的图片" title="定位到网页">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
@@ -1051,8 +1080,13 @@
                   </div>
                 </header>
                 <div class="image-lightbox-stage">
-                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Ctrl 加滚轮缩放，Q 适应宽度，W 适应窗口，E 原始大小">
+                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Q/W 切图，A 适应窗口，S 适应宽度，Z 原始大小，X/C 缩放，R 切换上一次缩放状态">
                     <img id="image-lightbox-image" alt="" draggable="false"/>
+                    <div id="image-lightbox-state" class="image-lightbox-state" role="status" aria-live="polite">
+                      <svg class="image-lightbox-state-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-dasharray="34 18" stroke-linecap="round"/></svg>
+                      <span id="image-lightbox-state-text">正在加载图片…</span>
+                      <button id="image-lightbox-retry" class="image-lightbox-state-retry" type="button" hidden>重新加载</button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1894,6 +1928,14 @@
             color: #ffffff;
           }
 
+          .image-lightbox-shell[data-controls-hidden="true"] {
+            grid-template-rows: minmax(0, 1fr);
+          }
+
+          .image-lightbox-shell[data-controls-hidden="true"] .image-lightbox-header {
+            display: none;
+          }
+
           .image-lightbox-shell:fullscreen {
             width: 100vw;
             height: 100vh;
@@ -1913,7 +1955,7 @@
             align-items: center;
             justify-content: space-between;
             gap: 10px;
-            padding: 6px 8px;
+            padding: 6px 8px 6px 50px;
             border: 0;
             border-bottom: 1px solid rgba(255, 255, 255, 0.11);
             background: #111111;
@@ -1925,7 +1967,7 @@
             position: absolute;
             top: 10px;
             right: 10px;
-            left: 10px;
+            left: 52px;
             min-height: 0;
             padding: 0;
             border: 0;
@@ -1940,6 +1982,22 @@
             align-items: center;
             gap: 6px;
             pointer-events: none;
+          }
+
+          .image-lightbox-toolbar-toggle {
+            position: absolute;
+            z-index: 5;
+            top: 6px;
+            left: 8px;
+          }
+
+          .image-lightbox-shell:fullscreen .image-lightbox-toolbar-toggle {
+            top: 10px;
+            left: 10px;
+          }
+
+          .image-lightbox-toolbar-toggle[aria-expanded="true"] .image-lightbox-toolbar-toggle-slash {
+            display: none;
           }
 
           .image-lightbox-title {
@@ -2170,6 +2228,65 @@
             will-change: transform;
           }
 
+          .image-lightbox-media[data-image-state="loading"] > img,
+          .image-lightbox-media[data-image-state="error"] > img {
+            visibility: hidden;
+          }
+
+          .image-lightbox-state {
+            position: absolute;
+            z-index: 1;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 24px;
+            background: radial-gradient(circle, rgba(255, 255, 255, 0.035), transparent 48%);
+            color: rgba(255, 255, 255, 0.78);
+            font-size: 12px;
+            text-align: center;
+            pointer-events: none;
+          }
+
+          .image-lightbox-state[hidden],
+          .image-lightbox-state-retry[hidden] {
+            display: none;
+          }
+
+          .image-lightbox-state-spinner {
+            width: 30px;
+            height: 30px;
+            animation: image-lightbox-spin 0.9s linear infinite;
+          }
+
+          .image-lightbox-media[data-image-state="error"] .image-lightbox-state-spinner {
+            animation: none;
+            opacity: 0.45;
+          }
+
+          .image-lightbox-state-retry {
+            min-height: 30px;
+            padding: 4px 11px;
+            border: 1px solid rgba(255, 255, 255, 0.24);
+            border-radius: 8px;
+            background: rgba(8, 8, 8, 0.5);
+            color: #ffffff;
+            cursor: pointer;
+            pointer-events: auto;
+          }
+
+          .image-lightbox-state-retry:hover,
+          .image-lightbox-state-retry:focus-visible {
+            background: rgba(255, 255, 255, 0.14);
+            outline: none;
+          }
+
+          @keyframes image-lightbox-spin {
+            to { transform: rotate(360deg); }
+          }
+
           .image-lightbox-media[data-panning="true"] > img {
             transition: none;
           }
@@ -2192,7 +2309,10 @@
             }
 
             .image-lightbox-zoom-tools .image-lightbox-text-icon {
-              display: none;
+              width: 31px;
+              min-width: 31px;
+              padding: 0 2px;
+              font-size: 9px;
             }
 
             .image-lightbox-zoom-value {
@@ -2201,14 +2321,24 @@
 
             .image-lightbox-header {
               gap: 4px;
-              padding: 4px 5px;
+              padding: 4px 5px 4px 43px;
+            }
+
+            .image-lightbox-toolbar-toggle {
+              top: 4px;
+              left: 5px;
             }
 
             .image-lightbox-shell:fullscreen .image-lightbox-header {
               top: 6px;
               right: 6px;
-              left: 6px;
+              left: 44px;
               padding: 0;
+            }
+
+            .image-lightbox-shell:fullscreen .image-lightbox-toolbar-toggle {
+              top: 6px;
+              left: 6px;
             }
 
             .image-lightbox-identity {
@@ -2465,6 +2595,10 @@
               scroll-behavior: auto !important;
               transition: none !important;
             }
+
+            .image-lightbox-state-spinner {
+              animation: none !important;
+            }
           }
         </style>
 
@@ -2564,8 +2698,13 @@
             this.imageDownloadAllButton = shadow.getElementById('image-download-all');
             this.imageLightbox = shadow.getElementById('image-lightbox');
             this.imageLightboxShell = shadow.querySelector('.image-lightbox-shell');
+            this.imageLightboxHeader = shadow.getElementById('image-lightbox-header');
+            this.imageLightboxToolbarToggle = shadow.getElementById('image-lightbox-toolbar-toggle');
             this.imageLightboxMedia = shadow.getElementById('image-lightbox-media');
             this.imageLightboxImage = shadow.getElementById('image-lightbox-image');
+            this.imageLightboxState = shadow.getElementById('image-lightbox-state');
+            this.imageLightboxStateText = shadow.getElementById('image-lightbox-state-text');
+            this.imageLightboxRetryButton = shadow.getElementById('image-lightbox-retry');
             this.imageLightboxTitle = shadow.getElementById('image-lightbox-title');
             this.imageLightboxPromptDetails = shadow.getElementById('image-lightbox-prompt-details');
             this.imageLightboxPromptText = shadow.getElementById('image-lightbox-prompt-text');
@@ -2573,6 +2712,7 @@
             this.imageLightboxZoomOutButton = shadow.getElementById('image-lightbox-zoom-out');
             this.imageLightboxZoomValue = shadow.getElementById('image-lightbox-zoom-value');
             this.imageLightboxZoomInButton = shadow.getElementById('image-lightbox-zoom-in');
+            this.imageLightboxRestoreZoomButton = shadow.getElementById('image-lightbox-restore-zoom');
             this.imageLightboxActualSizeButton = shadow.getElementById('image-lightbox-actual-size');
             this.imageLightboxFitButton = shadow.getElementById('image-lightbox-fit');
             this.imageLightboxFitWidthButton = shadow.getElementById('image-lightbox-fit-width');
@@ -2699,11 +2839,20 @@
             shadow.getElementById('image-lightbox-close')?.addEventListener('click', () => {
                 this.closeGeneratedImageLightbox();
             });
+            this.imageLightboxToolbarToggle?.addEventListener('click', () => {
+                this.setGeneratedImageToolbarVisible(!this.generatedImageToolbarVisible);
+            });
+            this.imageLightboxRetryButton?.addEventListener('click', () => {
+                this.loadGeneratedImageIntoLightbox(this.activeGeneratedImageIndex, true);
+            });
             this.imageLightboxZoomOutButton?.addEventListener('click', () => {
                 this.zoomGeneratedImageBy(1 / this.getGeneratedImageZoomStep());
             });
             this.imageLightboxZoomInButton?.addEventListener('click', () => {
                 this.zoomGeneratedImageBy(this.getGeneratedImageZoomStep());
+            });
+            this.imageLightboxRestoreZoomButton?.addEventListener('click', () => {
+                this.togglePreviousGeneratedImageViewState();
             });
             this.imageLightboxActualSizeButton?.addEventListener('click', () => {
                 this.showGeneratedImageAtActualSize();
@@ -2756,9 +2905,6 @@
             });
             this.imageLightboxMedia?.addEventListener('dblclick', (event) => {
                 this.toggleGeneratedImageActualSize(event);
-            });
-            this.imageLightboxImage?.addEventListener('load', () => {
-                this.fitGeneratedImageToViewport();
             });
             this.imageLightboxImage?.addEventListener('dragstart', (event) => event.preventDefault());
             if (typeof ResizeObserver === 'function' && this.imageLightboxMedia && this.imageLightboxImage) {
@@ -4122,38 +4268,57 @@
             if (this.imageLightbox?.open) {
                 const target = event.target;
                 const isEditing = target instanceof Element && Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
-                if (!isEditing && (event.key === '+' || event.key === '=')) {
+                const plainShortcut = !event.ctrlKey && !event.metaKey && !event.altKey;
+                const shortcutKey = String(event.key || '').toLowerCase();
+                if (!isEditing && plainShortcut && (event.key === '+' || event.key === '=' || shortcutKey === 'c')) {
                     event.preventDefault();
                     event.stopPropagation();
                     this.zoomGeneratedImageBy(this.getGeneratedImageZoomStep());
                     return;
                 }
-                if (!isEditing && event.key === '-') {
+                if (!isEditing && plainShortcut && (event.key === '-' || shortcutKey === 'x')) {
                     event.preventDefault();
                     event.stopPropagation();
                     this.zoomGeneratedImageBy(1 / this.getGeneratedImageZoomStep());
                     return;
                 }
-                const plainShortcut = !event.ctrlKey && !event.metaKey && !event.altKey;
-                if (!isEditing && plainShortcut && event.key.toLowerCase() === 'q') {
+                if (!isEditing && plainShortcut && shortcutKey === 'q') {
                     event.preventDefault();
                     event.stopPropagation();
-                    this.fitGeneratedImageToWidth();
+                    this.stepGeneratedImageLightbox(-1);
                     return;
                 }
-                if (!isEditing && plainShortcut && event.key.toLowerCase() === 'w') {
+                if (!isEditing && plainShortcut && shortcutKey === 'w') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.stepGeneratedImageLightbox(1);
+                    return;
+                }
+                if (!isEditing && plainShortcut && shortcutKey === 'a') {
                     event.preventDefault();
                     event.stopPropagation();
                     this.fitGeneratedImageToViewport();
                     return;
                 }
-                if (!isEditing && plainShortcut && event.key.toLowerCase() === 'e') {
+                if (!isEditing && plainShortcut && shortcutKey === 's') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.fitGeneratedImageToWidth();
+                    return;
+                }
+                if (!isEditing && plainShortcut && shortcutKey === 'z') {
                     event.preventDefault();
                     event.stopPropagation();
                     this.showGeneratedImageAtActualSize();
                     return;
                 }
-                if (!isEditing && event.key.toLowerCase() === 'f') {
+                if (!isEditing && plainShortcut && shortcutKey === 'r') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.togglePreviousGeneratedImageViewState();
+                    return;
+                }
+                if (!isEditing && plainShortcut && shortcutKey === 'f') {
                     event.preventDefault();
                     event.stopPropagation();
                     this.toggleGeneratedImageFullscreen();
@@ -8383,7 +8548,12 @@
         resetGeneratedImageGallery() {
             window.clearTimeout(this.generatedImageRefreshTimer);
             this.generatedImageRefreshTimer = 0;
+            window.clearTimeout(this.generatedImagePersistentCacheWarmTimer);
+            this.generatedImagePersistentCacheWarmTimer = 0;
+            this.generatedImagePersistentCacheWarmController?.abort();
+            this.generatedImagePersistentCacheWarmController = null;
             this.generatedImageRefreshToken += 1;
+            this.generatedImageLightboxLoadToken += 1;
             this.generatedImageDownloadAbortController?.abort();
             this.generatedImageDownloadAbortController = null;
             this.generatedImageDownloadInProgress = false;
@@ -8419,8 +8589,10 @@
             return /(?:dall[-_. ]?e|image[_ -]?(?:gen|generation)|gpt[_ -]?image|text2im|generated[_ -]?image)/i.test(signal);
         }
 
-        getGeneratedImagePreviewUrl(asset) {
+        getGeneratedImagePreviewUrl(asset, excludedUrls = null) {
+            const excluded = excludedUrls instanceof Set ? excludedUrls : new Set(excludedUrls || []);
             const values = [
+                asset?.persistentPreviewUrl,
                 asset?.previewUrl,
                 ...(asset?.previewUrls || []),
                 asset?.sourceUrl,
@@ -8429,9 +8601,330 @@
             ];
             for (const value of values) {
                 const url = this.normalizeAssetCandidateUrl(value);
-                if (/^(?:https?:|blob:|data:)/i.test(url)) return url;
+                if (/^(?:https?:|blob:|data:)/i.test(url) && !excluded.has(url)) return url;
             }
             return '';
+        }
+
+        getGeneratedImagePersistentCacheKey(asset) {
+            if (!this.config.enableGeneratedImagePersistentCache || !asset) return '';
+            const fileId = [...this.getAssetStrongFileIds(asset)][0] || '';
+            if (fileId) return `file:${fileId}`;
+            const candidates = [
+                ...(asset.originalUrls || []),
+                asset.sourceUrl,
+                ...(asset.alternateUrls || []),
+                ...(asset.previewUrls || []),
+                asset.previewUrl,
+            ];
+            for (const candidate of candidates) {
+                const url = this.normalizeAssetCandidateUrl(candidate || '');
+                if (!/^https?:/i.test(url)) continue;
+                const stable = this.getStableAssetUrlKey(url);
+                if (stable) {
+                    // 没有 file_id 时将 URL 后备键限定在当前会话，避免不同会话恰好复用
+                    // 相同 CDN 路径（但签名参数不同）时错误命中另一张图片。
+                    const conversationId = this.getCurrentConversationId() || '';
+                    return `url:${conversationId ? `${conversationId}:` : ''}${stable}`;
+                }
+            }
+            return '';
+        }
+
+        isGeneratedImagePersistentCacheRecordCompatible(record, asset) {
+            if (!record?.blob || !(record.blob instanceof Blob) || !record.blob.size || !asset) return false;
+            const expectedIds = this.getAssetStrongFileIds(asset);
+            const resolvedId = String(record.resolvedFileId || '').trim();
+            if (resolvedId && expectedIds.size && !expectedIds.has(resolvedId)) return false;
+            const expectedSize = Number(asset.expectedSize) || 0;
+            if (expectedSize) {
+                const tolerance = Math.max(
+                    Number(this.config.conversationExportOriginalSizeToleranceBytes) || 16384,
+                    expectedSize * (Number(this.config.conversationExportOriginalSizeToleranceRatio) || 0.015),
+                );
+                if (Math.abs(record.blob.size - expectedSize) > tolerance) return false;
+            }
+            const type = String(record.contentType || record.blob.type || '');
+            return !type || /^image\//i.test(type);
+        }
+
+        openGeneratedImagePersistentCache() {
+            if (!this.config.enableGeneratedImagePersistentCache) return Promise.resolve(null);
+            if (this.generatedImagePersistentCacheDbPromise) return this.generatedImagePersistentCacheDbPromise;
+            this.generatedImagePersistentCacheDbPromise = new Promise((resolve) => {
+                // IndexedDB 会随浏览器配置持久保存；优先留在当前脚本 realm，必要时再回退
+                // 到页面 realm，以兼容不同油猴管理器的隔离策略。
+                let factory = null;
+                try { factory = globalThis.indexedDB || null; } catch { }
+                if (!factory) {
+                    try { factory = this.getPageRealmWindow()?.indexedDB || null; } catch { }
+                }
+                if (!factory) {
+                    resolve(null);
+                    return;
+                }
+                let request;
+                try {
+                    request = factory.open('fluent-chatgpt-generated-images', 1);
+                } catch {
+                    resolve(null);
+                    return;
+                }
+                request.onupgradeneeded = () => {
+                    const database = request.result;
+                    if (!database.objectStoreNames.contains('images')) {
+                        const store = database.createObjectStore('images', { keyPath: 'key' });
+                        store.createIndex('accessedAt', 'accessedAt');
+                    }
+                };
+                request.onsuccess = () => {
+                    const database = request.result;
+                    database.onversionchange = () => database.close();
+                    resolve(database);
+                };
+                request.onerror = () => resolve(null);
+                request.onblocked = () => resolve(null);
+            });
+            return this.generatedImagePersistentCacheDbPromise;
+        }
+
+        async readGeneratedImagePersistentCache(asset) {
+            const key = this.getGeneratedImagePersistentCacheKey(asset);
+            if (!key) return null;
+            const pending = this.generatedImagePersistentCacheReadPromises.get(key);
+            if (pending) return pending;
+            const task = (async () => {
+                const database = await this.openGeneratedImagePersistentCache();
+                if (!database) return null;
+                const record = await new Promise((resolve) => {
+                    try {
+                        const request = database.transaction('images', 'readonly').objectStore('images').get(key);
+                        request.onsuccess = () => resolve(request.result || null);
+                        request.onerror = () => resolve(null);
+                    } catch {
+                        resolve(null);
+                    }
+                });
+                const maxAge = Math.max(0, Number(this.config.generatedImagePersistentCacheMaxAgeMs) || 0);
+                const normalizedBlob = await this.normalizeBlobLike(record?.blob, record?.contentType || '');
+                if (!normalizedBlob?.size ||
+                    (maxAge && Date.now() - Number(record.accessedAt || record.createdAt || 0) > maxAge)) {
+                    if (record) this.deleteGeneratedImagePersistentCache(asset).catch(() => { });
+                    return null;
+                }
+                record.blob = normalizedBlob;
+                record.accessedAt = Date.now();
+                try {
+                    database.transaction('images', 'readwrite').objectStore('images').put(record);
+                } catch { }
+                return record;
+            })();
+            this.generatedImagePersistentCacheReadPromises.set(key, task);
+            try {
+                return await task;
+            } finally {
+                if (this.generatedImagePersistentCacheReadPromises.get(key) === task) {
+                    this.generatedImagePersistentCacheReadPromises.delete(key);
+                }
+            }
+        }
+
+        async writeGeneratedImagePersistentCache(asset, blob, metadata = {}) {
+            const key = this.getGeneratedImagePersistentCacheKey(asset);
+            const size = Number(blob?.size) || 0;
+            const itemLimit = Math.max(0, Number(this.config.generatedImagePersistentCacheMaxItemBytes) || 0);
+            if (!key || !(blob instanceof Blob) || !size || (itemLimit && size > itemLimit)) return false;
+            const contentType = String(metadata.contentType || metadata.mimeType || blob.type || asset?.mimeType || '');
+            if (contentType && !/^image\//i.test(contentType)) return false;
+            const database = await this.openGeneratedImagePersistentCache();
+            if (!database) return false;
+            const now = Date.now();
+            const record = {
+                key,
+                blob,
+                size,
+                contentType: contentType || 'image/png',
+                resolvedFilename: metadata.resolvedFilename || metadata.filename || asset?.originalFilename || asset?.filenameHint || '',
+                contentDisposition: metadata.contentDisposition || '',
+                finalUrl: metadata.finalUrl || metadata.downloadUrl || '',
+                resolvedFileId: metadata.resolvedFileId || [...this.getAssetStrongFileIds(asset)][0] || '',
+                conversationId: this.getCurrentConversationId() || '',
+                createdAt: now,
+                accessedAt: now,
+            };
+            const stored = await new Promise((resolve) => {
+                try {
+                    const transaction = database.transaction('images', 'readwrite');
+                    transaction.objectStore('images').put(record);
+                    transaction.oncomplete = () => resolve(true);
+                    transaction.onerror = () => resolve(false);
+                    transaction.onabort = () => resolve(false);
+                } catch {
+                    resolve(false);
+                }
+            });
+            if (stored) this.pruneGeneratedImagePersistentCache().catch(() => { });
+            return stored;
+        }
+
+        async deleteGeneratedImagePersistentCache(asset) {
+            const key = this.getGeneratedImagePersistentCacheKey(asset);
+            const database = key ? await this.openGeneratedImagePersistentCache() : null;
+            if (!database) return false;
+            return new Promise((resolve) => {
+                try {
+                    const transaction = database.transaction('images', 'readwrite');
+                    transaction.objectStore('images').delete(key);
+                    transaction.oncomplete = () => resolve(true);
+                    transaction.onerror = () => resolve(false);
+                    transaction.onabort = () => resolve(false);
+                } catch {
+                    resolve(false);
+                }
+            });
+        }
+
+        async pruneGeneratedImagePersistentCache() {
+            if (this.generatedImagePersistentCachePrunePromise) return this.generatedImagePersistentCachePrunePromise;
+            const task = (async () => {
+                const database = await this.openGeneratedImagePersistentCache();
+                if (!database) return;
+                const records = await new Promise((resolve) => {
+                    try {
+                        const request = database.transaction('images', 'readonly').objectStore('images').getAll();
+                        request.onsuccess = () => resolve(request.result || []);
+                        request.onerror = () => resolve([]);
+                    } catch {
+                        resolve([]);
+                    }
+                });
+                const maxBytes = Math.max(0, Number(this.config.generatedImagePersistentCacheMaxBytes) || 0);
+                const maxEntries = Math.max(1, Number(this.config.generatedImagePersistentCacheMaxEntries) || 160);
+                const maxAge = Math.max(0, Number(this.config.generatedImagePersistentCacheMaxAgeMs) || 0);
+                const now = Date.now();
+                const ordered = records.sort((first, second) => Number(second.accessedAt || 0) - Number(first.accessedAt || 0));
+                const removals = [];
+                let keptBytes = 0;
+                let keptEntries = 0;
+                for (const record of ordered) {
+                    const size = Number(record.size || record.blob?.size) || 0;
+                    const expired = maxAge && now - Number(record.accessedAt || record.createdAt || 0) > maxAge;
+                    const exceedsEntries = keptEntries >= maxEntries;
+                    const exceedsBytes = maxBytes && keptBytes + size > maxBytes;
+                    if (!size || expired || exceedsEntries || exceedsBytes) {
+                        removals.push(record.key);
+                    } else {
+                        keptEntries += 1;
+                        keptBytes += size;
+                    }
+                }
+                if (!removals.length) return;
+                await new Promise((resolve) => {
+                    try {
+                        const transaction = database.transaction('images', 'readwrite');
+                        const store = transaction.objectStore('images');
+                        for (const key of removals) store.delete(key);
+                        transaction.oncomplete = () => resolve();
+                        transaction.onerror = () => resolve();
+                        transaction.onabort = () => resolve();
+                    } catch {
+                        resolve();
+                    }
+                });
+            })();
+            this.generatedImagePersistentCachePrunePromise = task;
+            try {
+                await task;
+            } finally {
+                if (this.generatedImagePersistentCachePrunePromise === task) {
+                    this.generatedImagePersistentCachePrunePromise = null;
+                }
+            }
+        }
+
+        useGeneratedImagePersistentBlob(asset, blob) {
+            if (!asset || !(blob instanceof Blob) || !blob.size) return '';
+            if (asset.persistentPreviewUrl && this.generatedImagePreviewObjectUrls.has(asset.persistentPreviewUrl)) {
+                return asset.persistentPreviewUrl;
+            }
+            const url = URL.createObjectURL(blob);
+            asset.persistentPreviewUrl = url;
+            this.generatedImagePreviewObjectUrls.add(url);
+            return url;
+        }
+
+        releaseGeneratedImagePersistentPreview(asset) {
+            const url = asset?.persistentPreviewUrl || '';
+            if (url && this.generatedImagePreviewObjectUrls.has(url)) {
+                URL.revokeObjectURL(url);
+                this.generatedImagePreviewObjectUrls.delete(url);
+            }
+            if (asset) asset.persistentPreviewUrl = '';
+        }
+
+        async restoreGeneratedImagePersistentPreview(index) {
+            const item = this.generatedImages[index];
+            if (!item) return '';
+            if (item.persistentPreviewUrl && this.generatedImagePreviewObjectUrls.has(item.persistentPreviewUrl)) {
+                return item.persistentPreviewUrl;
+            }
+            const token = this.generatedImageRefreshToken;
+            const record = await this.readGeneratedImagePersistentCache(item);
+            if (!record || token !== this.generatedImageRefreshToken || item !== this.generatedImages[index]) return '';
+            if (!this.isGeneratedImagePersistentCacheRecordCompatible(record, item)) {
+                await this.deleteGeneratedImagePersistentCache(item);
+                return '';
+            }
+            return this.useGeneratedImagePersistentBlob(item, record.blob);
+        }
+
+        scheduleGeneratedImagePersistentCacheWarmup(delay = this.config.generatedImagePersistentCacheWarmDelayMs) {
+            if (!this.config.enableGeneratedImagePersistentCache || !this.generatedImages.length) return;
+            window.clearTimeout(this.generatedImagePersistentCacheWarmTimer);
+            this.generatedImagePersistentCacheWarmTimer = window.setTimeout(() => {
+                this.generatedImagePersistentCacheWarmTimer = 0;
+                this.warmGeneratedImagePersistentCache().catch((error) => {
+                    if (error?.name !== 'AbortError') console.debug('[ChatGPT 图片画廊] 后台图片缓存未完成：', error);
+                });
+            }, Math.max(0, Number(delay) || 0));
+        }
+
+        async warmGeneratedImagePersistentCache() {
+            this.generatedImagePersistentCacheWarmController?.abort();
+            const controller = new AbortController();
+            this.generatedImagePersistentCacheWarmController = controller;
+            const token = this.generatedImageRefreshToken;
+            const entries = this.generatedImages
+                .map((item, index) => ({ item, index }))
+                .filter(({ item }) => this.isGeneratedImageAsset(item) && this.getGeneratedImagePersistentCacheKey(item));
+            const concurrency = Math.max(1, Math.min(4,
+                Number(this.config.generatedImagePersistentCacheWarmConcurrency) || 2));
+            try {
+                await this.runBoundedAssetWorkers(entries, concurrency, async ({ item, index }) => {
+                    if (controller.signal.aborted || token !== this.generatedImageRefreshToken) return;
+                    try {
+                        let url = await this.restoreGeneratedImagePersistentPreview(index);
+                        if (!url) {
+                            const result = await this.fetchArchiveAsset(item, controller.signal);
+                            if (controller.signal.aborted || token !== this.generatedImageRefreshToken || item !== this.generatedImages[index]) return;
+                            url = this.useGeneratedImagePersistentBlob(item, result.blob);
+                        }
+                        if (url) this.updateGeneratedImagePreviewElements(index, url);
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                    }
+                }, controller.signal);
+                // 并发写入可能合并前面的清理任务；所有 worker 完成后再做一次最终收敛。
+                if (this.generatedImagePersistentCachePrunePromise) {
+                    await this.generatedImagePersistentCachePrunePromise.catch(() => { });
+                    await Promise.resolve();
+                }
+                await this.pruneGeneratedImagePersistentCache();
+            } finally {
+                if (this.generatedImagePersistentCacheWarmController === controller) {
+                    this.generatedImagePersistentCacheWarmController = null;
+                }
+            }
         }
 
         getGeneratedImageApiItems() {
@@ -8696,6 +9189,8 @@
                     imageTitleSource,
                     title: imageTitle || '未命名生成图像',
                     promptText,
+                    persistentPreviewUrl: item.persistentPreviewUrl || previous.persistentPreviewUrl || '',
+                    previewLoadFailures: item.previewLoadFailures || previous.previewLoadFailures || [],
                 };
             });
         }
@@ -8704,6 +9199,8 @@
             if (!this.config.enableGeneratedImageGallery) return [];
             const token = ++this.generatedImageRefreshToken;
             const routeEpoch = this.routeEpoch;
+            const previousImages = this.generatedImages;
+            const previousActiveItem = previousImages[this.activeGeneratedImageIndex] || null;
             let apiItems = this.getGeneratedImageApiItems();
             if (includeApi && this.getCurrentConversationId()) {
                 try {
@@ -8718,11 +9215,30 @@
             // 在对应节点卸载后仍按 file_id / 原图 URL 强身份保留。
             apiItems = this.carryForwardGeneratedImageDetails(apiItems);
             const domItems = this.collectGeneratedImageDomItems(apiItems.length > 0);
-            this.generatedImages = this.mergeGeneratedImageItems(apiItems, domItems);
+            this.generatedImages = this.mergeGeneratedImageItems(apiItems, domItems).map((item) => {
+                const previous = previousImages.find((candidate) => this.assetsShareStrongIdentity(candidate, item));
+                if (!previous) return item;
+                return {
+                    ...item,
+                    persistentPreviewUrl: item.persistentPreviewUrl || previous.persistentPreviewUrl || '',
+                    previewLoadFailures: item.previewLoadFailures || previous.previewLoadFailures || [],
+                };
+            });
             this.activeGeneratedImageIndex = this.generatedImages.length
                 ? Math.min(Math.max(0, this.activeGeneratedImageIndex), this.generatedImages.length - 1)
                 : -1;
             this.renderGeneratedImageGallery();
+            if (this.imageLightbox?.open) {
+                const activeItem = this.generatedImages[this.activeGeneratedImageIndex] || null;
+                if (!activeItem) {
+                    this.closeGeneratedImageLightbox();
+                } else if (this.imageLightboxMedia?.dataset.imageState !== 'ready' ||
+                    !this.assetsShareStrongIdentity(previousActiveItem, activeItem)) {
+                    this.updateGeneratedImageLightbox();
+                } else {
+                    this.syncGeneratedImageLightboxDetails(activeItem);
+                }
+            }
             this.updateViewMeta();
             this.syncVisibility();
             if (!this.generatedImages.length && this.activeView === 'images') {
@@ -8745,6 +9261,24 @@
                 item?.imageTitle,
                 item?.title,
             ]);
+        }
+
+        async prepareGeneratedImageCardPreview(index, image, fallbackUrl = '') {
+            const item = this.generatedImages[index];
+            if (!item || !(image instanceof HTMLImageElement)) return '';
+            const token = this.generatedImageRefreshToken;
+            const normalizedFallback = this.normalizeAssetCandidateUrl(fallbackUrl || '');
+            const cacheKey = this.getGeneratedImagePersistentCacheKey(item);
+            let url = '';
+            if (cacheKey) url = await this.restoreGeneratedImagePersistentPreview(index);
+            if (token !== this.generatedImageRefreshToken || item !== this.generatedImages[index] ||
+                !this.generatedImageCards[index]?.contains(image)) return '';
+            url ||= normalizedFallback;
+            if (!url) url = await this.ensureGeneratedImagePreview(index);
+            if (token !== this.generatedImageRefreshToken || item !== this.generatedImages[index] ||
+                !this.generatedImageCards[index]?.contains(image)) return '';
+            if (url) image.src = url;
+            return url;
         }
 
         renderGeneratedImageGallery() {
@@ -8776,13 +9310,20 @@
                 image.loading = 'lazy';
                 image.decoding = 'async';
                 const previewUrl = this.getGeneratedImagePreviewUrl(item);
-                if (previewUrl) image.src = previewUrl;
                 image.addEventListener('error', () => {
                     image.dataset.loadFailed = 'true';
-                    item.previewUrl = '';
+                    const failedUrl = this.normalizeAssetCandidateUrl(image.currentSrc || image.src || '');
+                    item.previewLoadFailures = [...new Set([...(item.previewLoadFailures || []), failedUrl].filter(Boolean))];
+                    if (item.persistentPreviewUrl === failedUrl) {
+                        this.releaseGeneratedImagePersistentPreview(item);
+                        this.deleteGeneratedImagePersistentCache(item).catch(() => { });
+                    }
                     item.previewResolutionFailed = false;
-                    this.ensureGeneratedImagePreview(index, true);
+                    this.ensureGeneratedImagePreview(index, true, new Set(item.previewLoadFailures)).then((url) => {
+                        if (url && image.isConnected && item === this.generatedImages[index]) image.src = url;
+                    });
                 }, { once: true });
+                image.addEventListener('load', () => image.removeAttribute('data-load-failed'));
                 const placeholder = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
                 placeholder.setAttribute('class', 'image-card-placeholder');
                 placeholder.setAttribute('viewBox', '0 0 24 24');
@@ -8801,6 +9342,7 @@
                 listItem.appendChild(button);
                 fragment.appendChild(listItem);
                 this.generatedImageCards.push(button);
+                this.prepareGeneratedImageCardPreview(index, image, previewUrl);
             });
             this.imageGalleryList.replaceChildren(fragment);
             if (this.imageGalleryEmptyState) this.imageGalleryEmptyState.hidden = this.generatedImages.length > 0;
@@ -8818,15 +9360,12 @@
                 cardImage.removeAttribute('data-load-failed');
                 if (cardImage.src !== url) cardImage.src = url;
             }
-            if (this.imageLightbox?.open && index === this.activeGeneratedImageIndex && this.imageLightboxImage && url) {
-                this.imageLightboxImage.src = url;
-            }
         }
 
-        async ensureGeneratedImagePreview(index, force = false) {
+        async ensureGeneratedImagePreview(index, force = false, excludedUrls = null) {
             const item = this.generatedImages[index];
             if (!item) return '';
-            const existing = this.getGeneratedImagePreviewUrl(item);
+            const existing = this.getGeneratedImagePreviewUrl(item, excludedUrls);
             if (existing && !force) return existing;
             if (item.previewResolutionPromise) return item.previewResolutionPromise;
             if (item.previewResolutionFailed && !force) return '';
@@ -8840,11 +9379,11 @@
                 if (token !== this.generatedImageRefreshToken || !metadata) return '';
                 let url = '';
                 if (metadata.blob instanceof Blob) {
-                    url = URL.createObjectURL(metadata.blob);
-                    this.generatedImagePreviewObjectUrls.add(url);
+                    url = this.useGeneratedImagePersistentBlob(item, metadata.blob);
                 } else {
                     url = this.normalizeAssetCandidateUrl(metadata.downloadUrl || '');
                 }
+                if (excludedUrls instanceof Set && excludedUrls.has(url)) url = '';
                 if (url) {
                     item.previewUrl = url;
                     item.previewResolutionFailed = false;
@@ -8868,12 +9407,133 @@
             const indices = this.generatedImages
                 .map((item, index) => ({ item, index }))
                 .filter(({ item }) => !this.getGeneratedImagePreviewUrl(item) && !item.previewResolutionFailed);
-            if (!indices.length) return;
             const concurrency = Math.max(1, Number(this.config.generatedImagePreviewConcurrency) || 3);
-            try {
-                await this.runBoundedAssetWorkers(indices, concurrency, ({ index }) => this.ensureGeneratedImagePreview(index));
-            } catch {
-                // 单个预览失败只显示占位图，不影响其余图片与原图下载。
+            if (indices.length) {
+                try {
+                    await this.runBoundedAssetWorkers(indices, concurrency, ({ index }) => this.ensureGeneratedImagePreview(index));
+                } catch {
+                    // 单个预览失败只显示占位图，不影响其余图片与原图下载。
+                }
+            }
+            this.scheduleGeneratedImagePersistentCacheWarmup();
+        }
+
+        setGeneratedImageLightboxState(state, message = '') {
+            const normalized = state === 'ready' ? 'ready' : state === 'error' ? 'error' : 'loading';
+            if (this.imageLightboxMedia) this.imageLightboxMedia.dataset.imageState = normalized;
+            if (this.imageLightboxState) this.imageLightboxState.hidden = normalized === 'ready';
+            if (this.imageLightboxStateText) {
+                this.imageLightboxStateText.textContent = message || (normalized === 'error'
+                    ? '图片暂时无法加载'
+                    : '正在加载图片…');
+            }
+            if (this.imageLightboxRetryButton) this.imageLightboxRetryButton.hidden = normalized !== 'error';
+        }
+
+        waitForGeneratedImageUrl(url) {
+            return new Promise((resolve, reject) => {
+                const probe = new Image();
+                const timeoutMs = Math.max(3000, Number(this.config.generatedImageLoadTimeoutMs) || 45000);
+                let settled = false;
+                const finish = (error = null) => {
+                    if (settled) return;
+                    settled = true;
+                    window.clearTimeout(timer);
+                    probe.onload = null;
+                    probe.onerror = null;
+                    if (error) reject(error);
+                    else resolve(probe);
+                };
+                const timer = window.setTimeout(() => finish(new Error('图片加载超时')), timeoutMs);
+                probe.decoding = 'async';
+                probe.onload = () => finish();
+                probe.onerror = () => finish(new Error('图片数据不可用'));
+                probe.src = url;
+                if (probe.complete) {
+                    if (probe.naturalWidth) finish();
+                    else if (probe.src) window.queueMicrotask(() => {
+                        if (probe.complete && !probe.naturalWidth) finish(new Error('图片数据不可用'));
+                    });
+                }
+            });
+        }
+
+        async resolveGeneratedImageDisplayUrl(index, excludedUrls = null) {
+            const item = this.generatedImages[index];
+            if (!item) return '';
+            const cachedUrl = await this.restoreGeneratedImagePersistentPreview(index);
+            if (cachedUrl && !(excludedUrls instanceof Set && excludedUrls.has(cachedUrl))) return cachedUrl;
+            const existing = this.getGeneratedImagePreviewUrl(item, excludedUrls);
+            if (existing) return existing;
+            return this.ensureGeneratedImagePreview(index, true, excludedUrls);
+        }
+
+        async loadGeneratedImageIntoLightbox(index, force = false) {
+            const item = this.generatedImages[index];
+            const image = this.imageLightboxImage;
+            if (!item || !(image instanceof HTMLImageElement) || !this.imageLightbox?.open) return false;
+            const loadToken = ++this.generatedImageLightboxLoadToken;
+            if (force) item.previewLoadFailures = [];
+            const failedUrls = new Set(item.previewLoadFailures || []);
+            image.removeAttribute('src');
+            image.alt = this.getGeneratedImageDisplayTitle(item);
+            this.setGeneratedImageLightboxState('loading');
+
+            for (let attempt = 0; attempt < 4; attempt += 1) {
+                let url = '';
+                try {
+                    url = await this.resolveGeneratedImageDisplayUrl(index, failedUrls);
+                    if (loadToken !== this.generatedImageLightboxLoadToken ||
+                        index !== this.activeGeneratedImageIndex || item !== this.generatedImages[index]) return false;
+                    if (!url) break;
+                    await this.waitForGeneratedImageUrl(url);
+                    if (loadToken !== this.generatedImageLightboxLoadToken || index !== this.activeGeneratedImageIndex) return false;
+                    image.src = url;
+                    try { await image.decode?.(); } catch { }
+                    if (loadToken !== this.generatedImageLightboxLoadToken || index !== this.activeGeneratedImageIndex) return false;
+                    if (!image.naturalWidth || !image.naturalHeight) throw new Error('图片解码失败');
+                    this.setGeneratedImageLightboxState('ready');
+                    this.fitGeneratedImageToViewport(false);
+                    return true;
+                } catch (error) {
+                    if (url) {
+                        failedUrls.add(url);
+                        item.previewLoadFailures = [...failedUrls];
+                        if (item.persistentPreviewUrl === url) {
+                            this.releaseGeneratedImagePersistentPreview(item);
+                            // 先删除损坏记录再尝试下一个候选，避免立刻从 IndexedDB 恢复成
+                            // 另一个 object URL，连续四次都重试同一份坏数据。
+                            await this.deleteGeneratedImagePersistentCache(item).catch(() => false);
+                        }
+                    }
+                    if (loadToken !== this.generatedImageLightboxLoadToken || index !== this.activeGeneratedImageIndex) return false;
+                    if (attempt >= 3) console.debug('[ChatGPT 图片画廊] 图片预览加载失败：', error);
+                }
+            }
+
+            if (loadToken === this.generatedImageLightboxLoadToken && index === this.activeGeneratedImageIndex) {
+                image.removeAttribute('src');
+                this.setGeneratedImageLightboxState('error', '图片暂时无法加载，可重试或切换其他图片');
+            }
+            return false;
+        }
+
+        setGeneratedImageToolbarVisible(visible) {
+            this.generatedImageToolbarVisible = Boolean(visible);
+            if (this.imageLightboxShell) {
+                this.imageLightboxShell.dataset.controlsHidden = String(!this.generatedImageToolbarVisible);
+            }
+            if (this.imageLightboxToolbarToggle) {
+                this.imageLightboxToolbarToggle.setAttribute('aria-expanded', String(this.generatedImageToolbarVisible));
+                this.imageLightboxToolbarToggle.setAttribute('aria-label', this.generatedImageToolbarVisible
+                    ? '隐藏顶部控件栏'
+                    : '显示顶部控件栏');
+                this.imageLightboxToolbarToggle.title = this.generatedImageToolbarVisible
+                    ? '隐藏顶部控件栏'
+                    : '显示顶部控件栏';
+            }
+            if (this.imageLightbox?.open) {
+                window.requestAnimationFrame(() => this.refreshGeneratedImageViewportSizing());
             }
         }
 
@@ -8889,13 +9549,13 @@
             }
             this.updateGeneratedImageLightbox();
             window.requestAnimationFrame(() => {
-                this.fitGeneratedImageToViewport();
                 try { this.imageLightboxMedia?.focus({ preventScroll: true }); } catch { }
             });
         }
 
         closeGeneratedImageLightbox() {
             if (!this.imageLightbox?.open) return;
+            this.generatedImageLightboxLoadToken += 1;
             this.cancelGeneratedImagePointerInteraction();
             if (this.isGeneratedImageFullscreen() && typeof document.exitFullscreen === 'function') {
                 document.exitFullscreen().catch(() => { });
@@ -8905,6 +9565,70 @@
             } catch {
                 this.imageLightbox.removeAttribute('open');
             }
+        }
+
+        getGeneratedImageViewState() {
+            return {
+                mode: this.generatedImageFitMode || 'custom',
+                zoom: Number(this.generatedImageZoom) || 1,
+                panX: Number(this.generatedImagePanX) || 0,
+                panY: Number(this.generatedImagePanY) || 0,
+            };
+        }
+
+        generatedImageViewStatesEqual(first, second) {
+            return Boolean(first && second && first.mode === second.mode &&
+                Math.abs(first.zoom - second.zoom) < 0.0001 &&
+                Math.abs(first.panX - second.panX) < 0.01 &&
+                Math.abs(first.panY - second.panY) < 0.01);
+        }
+
+        syncGeneratedImageRestoreZoomButton() {
+            if (this.imageLightboxRestoreZoomButton) {
+                this.imageLightboxRestoreZoomButton.disabled = !this.generatedImagePreviousViewState;
+            }
+        }
+
+        rememberGeneratedImageViewState() {
+            const current = this.getGeneratedImageViewState();
+            if (!this.generatedImageViewStatesEqual(current, this.generatedImagePreviousViewState)) {
+                this.generatedImagePreviousViewState = current;
+            }
+            this.syncGeneratedImageRestoreZoomButton();
+        }
+
+        applyGeneratedImageViewState(state) {
+            if (!state) return false;
+            this.updateGeneratedImageBaseSize();
+            this.generatedImageFitMode = state.mode || 'custom';
+            this.generatedImagePanX = Number(state.panX) || 0;
+            this.generatedImagePanY = Number(state.panY) || 0;
+            if (this.generatedImageFitMode === 'viewport') {
+                this.generatedImageZoom = 1;
+                this.generatedImagePanX = 0;
+                this.generatedImagePanY = 0;
+            } else if (this.generatedImageFitMode === 'width') {
+                this.generatedImageZoom = this.getGeneratedImageFitWidthZoom();
+                this.generatedImagePanX = 0;
+            } else if (this.generatedImageFitMode === 'actual') {
+                const fitRatio = this.getGeneratedImageFitRatio();
+                this.generatedImageZoom = fitRatio > 0 ? 1 / fitRatio : 1;
+            } else {
+                this.generatedImageZoom = Number(state.zoom) || 1;
+            }
+            this.cancelGeneratedImagePointerInteraction();
+            this.applyGeneratedImageTransform();
+            return true;
+        }
+
+        togglePreviousGeneratedImageViewState() {
+            const previous = this.generatedImagePreviousViewState;
+            if (!previous) return false;
+            const current = this.getGeneratedImageViewState();
+            this.generatedImagePreviousViewState = current;
+            const applied = this.applyGeneratedImageViewState(previous);
+            this.syncGeneratedImageRestoreZoomButton();
+            return applied;
         }
 
         getGeneratedImageFitWidthZoom() {
@@ -8974,6 +9698,9 @@
             } else if (this.generatedImageFitMode === 'width') {
                 this.generatedImageZoom = this.getGeneratedImageFitWidthZoom();
                 this.generatedImagePanX = 0;
+            } else if (this.generatedImageFitMode === 'actual') {
+                const fitRatio = this.getGeneratedImageFitRatio();
+                this.generatedImageZoom = fitRatio > 0 ? 1 / fitRatio : 1;
             }
             this.clampGeneratedImagePan();
             this.applyGeneratedImageTransform();
@@ -9041,13 +9768,18 @@
             }
             if (this.imageLightboxActualSizeButton) {
                 this.imageLightboxActualSizeButton.disabled = !image.naturalWidth || !image.naturalHeight;
+                this.imageLightboxActualSizeButton.setAttribute('aria-pressed', String(this.generatedImageFitMode === 'actual'));
             }
+            this.syncGeneratedImageRestoreZoomButton();
         }
 
-        setGeneratedImageZoom(nextZoom, anchor = null) {
+        setGeneratedImageZoom(nextZoom, anchor = null, mode = 'custom', remember = true) {
             const { min, max } = this.getGeneratedImageZoomLimits();
             const current = Math.min(max, Math.max(min, Number(this.generatedImageZoom) || 1));
             const next = Math.min(max, Math.max(min, Number(nextZoom) || 1));
+            if (remember && (Math.abs(next - current) > 0.0001 || this.generatedImageFitMode !== mode)) {
+                this.rememberGeneratedImageViewState();
+            }
             if (anchor && this.imageLightboxMedia && Math.abs(next - current) > 0.0001) {
                 const rect = this.imageLightboxMedia.getBoundingClientRect();
                 const offsetX = Number(anchor.clientX) - (rect.left + rect.width / 2);
@@ -9056,7 +9788,7 @@
                 this.generatedImagePanX = offsetX - (offsetX - this.generatedImagePanX) * ratio;
                 this.generatedImagePanY = offsetY - (offsetY - this.generatedImagePanY) * ratio;
             }
-            this.generatedImageFitMode = 'custom';
+            this.generatedImageFitMode = mode;
             this.generatedImageZoom = next;
             this.applyGeneratedImageTransform();
         }
@@ -9075,7 +9807,12 @@
                 Math.abs(this.generatedImagePanY - beforeY) > 0.01;
         }
 
-        fitGeneratedImageToViewport() {
+        fitGeneratedImageToViewport(remember = true) {
+            if (remember && (this.generatedImageFitMode !== 'viewport' ||
+                Math.abs(this.generatedImageZoom - 1) > 0.0001 ||
+                Math.abs(this.generatedImagePanX) > 0.01 || Math.abs(this.generatedImagePanY) > 0.01)) {
+                this.rememberGeneratedImageViewState();
+            }
             this.updateGeneratedImageBaseSize();
             this.generatedImageFitMode = 'viewport';
             this.generatedImageZoom = 1;
@@ -9085,26 +9822,34 @@
             this.applyGeneratedImageTransform();
         }
 
-        fitGeneratedImageToWidth() {
+        fitGeneratedImageToWidth(remember = true) {
             this.updateGeneratedImageBaseSize();
+            const widthZoom = this.getGeneratedImageFitWidthZoom();
+            const widthTop = this.getGeneratedImagePanBounds(widthZoom).y;
+            if (remember && (this.generatedImageFitMode !== 'width' ||
+                Math.abs(this.generatedImageZoom - widthZoom) > 0.0001 ||
+                Math.abs(this.generatedImagePanX) > 0.01 ||
+                Math.abs(this.generatedImagePanY - widthTop) > 0.01)) {
+                this.rememberGeneratedImageViewState();
+            }
             this.generatedImageFitMode = 'width';
-            this.generatedImageZoom = this.getGeneratedImageFitWidthZoom();
+            this.generatedImageZoom = widthZoom;
             this.generatedImagePanX = 0;
             this.generatedImagePanY = 0;
             this.cancelGeneratedImagePointerInteraction();
             // 长图从顶部开始展示，随后可直接用滚轮或方向键向下浏览。
-            this.generatedImagePanY = this.getGeneratedImagePanBounds(this.generatedImageZoom).y;
+            this.generatedImagePanY = widthTop;
             this.applyGeneratedImageTransform();
         }
 
         showGeneratedImageAtActualSize(anchor = null) {
             const fitRatio = this.getGeneratedImageFitRatio();
             const actualSizeZoom = fitRatio > 0 ? 1 / fitRatio : 1;
-            this.setGeneratedImageZoom(actualSizeZoom, anchor);
+            this.setGeneratedImageZoom(actualSizeZoom, anchor, 'actual');
         }
 
         toggleGeneratedImageActualSize(event = null) {
-            if (Math.abs(this.generatedImageZoom - 1) > 0.02) {
+            if (this.generatedImageFitMode === 'actual') {
                 this.fitGeneratedImageToViewport();
             } else {
                 this.showGeneratedImageAtActualSize(event);
@@ -9151,6 +9896,7 @@
             try { this.imageLightboxMedia?.setPointerCapture?.(event.pointerId); } catch { }
             this.generatedImagePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
             if (this.generatedImagePointers.size >= 2) {
+                this.rememberGeneratedImageViewState();
                 const [first, second] = this.getGeneratedImagePointerPair();
                 const centerX = (first.x + second.x) / 2;
                 const centerY = (first.y + second.y) / 2;
@@ -9287,12 +10033,8 @@
             }, 120);
         }
 
-        updateGeneratedImageLightbox() {
-            const item = this.generatedImages[this.activeGeneratedImageIndex];
-            if (!item) {
-                this.closeGeneratedImageLightbox();
-                return;
-            }
+        syncGeneratedImageLightboxDetails(item = this.generatedImages[this.activeGeneratedImageIndex]) {
+            if (!item) return false;
             const displayTitle = this.getGeneratedImageDisplayTitle(item);
             if (this.imageLightboxTitle) {
                 this.imageLightboxTitle.textContent = displayTitle;
@@ -9308,16 +10050,12 @@
             if (this.imageLightboxCounter) {
                 this.imageLightboxCounter.textContent = `${this.activeGeneratedImageIndex + 1} / ${this.generatedImages.length}`;
             }
-            const previewUrl = this.getGeneratedImagePreviewUrl(item);
-            this.fitGeneratedImageToViewport();
             if (this.imageLightboxImage) {
                 this.imageLightboxImage.alt = displayTitle;
-                if (previewUrl) this.imageLightboxImage.src = previewUrl;
-                else this.imageLightboxImage.removeAttribute('src');
             }
             if (this.imageLightboxMedia) {
                 const accessibleTitle = displayTitle || `第 ${this.activeGeneratedImageIndex + 1} 张未命名生成图片`;
-                this.imageLightboxMedia.setAttribute('aria-label', `${accessibleTitle}；滚轮或上下方向键纵向平移，Shift 加滚轮或左右方向键横向平移，Ctrl 加滚轮或加减按钮缩放，Q 适应宽度，W 适应窗口，E 原始大小，Page Up 和 Page Down 切换图片`);
+                this.imageLightboxMedia.setAttribute('aria-label', `${accessibleTitle}；Q 或 Page Up 上一张，W 或 Page Down 下一张，A 适应窗口，S 适应宽度，F 全屏，Z 原始大小，X 或减号缩小，C 或加号放大，R 切换上一次缩放状态；滚轮与方向键用于平移`);
             }
             const onlyOne = this.generatedImages.length < 2;
             if (this.imageLightboxPreviousButton) this.imageLightboxPreviousButton.disabled = onlyOne;
@@ -9325,7 +10063,21 @@
             this.generatedImageCards.forEach((card, index) => {
                 card.dataset.active = String(index === this.activeGeneratedImageIndex);
             });
-            if (!previewUrl) this.ensureGeneratedImagePreview(this.activeGeneratedImageIndex);
+            return true;
+        }
+
+        updateGeneratedImageLightbox() {
+            const item = this.generatedImages[this.activeGeneratedImageIndex];
+            if (!item) {
+                this.closeGeneratedImageLightbox();
+                return;
+            }
+            this.syncGeneratedImageLightboxDetails(item);
+            this.generatedImagePreviousViewState = null;
+            this.syncGeneratedImageRestoreZoomButton();
+            if (this.imageLightboxImage) this.imageLightboxImage.removeAttribute('src');
+            this.setGeneratedImageLightboxState('loading');
+            this.loadGeneratedImageIntoLightbox(this.activeGeneratedImageIndex);
         }
 
         stepGeneratedImageLightbox(delta) {
@@ -13347,7 +14099,34 @@
             }
             if (failure) this.assetFailureCache.delete(key);
 
-            const task = this.fetchArchiveAssetUncached(asset, signal);
+            const persistentCacheKey = this.isGeneratedImageAsset(asset)
+                ? this.getGeneratedImagePersistentCacheKey(asset)
+                : '';
+            const task = (async () => {
+                if (persistentCacheKey) {
+                    const record = await this.readGeneratedImagePersistentCache(asset);
+                    if (this.isGeneratedImagePersistentCacheRecordCompatible(record, asset)) {
+                        return {
+                            blob: record.blob,
+                            finalUrl: record.finalUrl || '',
+                            contentType: record.contentType || record.blob.type || '',
+                            contentDisposition: record.contentDisposition || '',
+                            resolvedFilename: record.resolvedFilename || asset.originalFilename || asset.filenameHint || '',
+                            resolvedFileId: record.resolvedFileId || [...this.getAssetStrongFileIds(asset)][0] || '',
+                            attemptCount: 0,
+                            fetchDurationMs: 0,
+                            resolvedVia: 'persistent-image-cache',
+                            persistentCacheHit: true,
+                        };
+                    }
+                    if (record) await this.deleteGeneratedImagePersistentCache(asset);
+                }
+                const value = await this.fetchArchiveAssetUncached(asset, signal);
+                if (persistentCacheKey && value?.blob instanceof Blob) {
+                    await this.writeGeneratedImagePersistentCache(asset, value.blob, value).catch(() => false);
+                }
+                return value;
+            })();
             this.assetBinaryCache.set(key, task);
             try {
                 const value = await task;
