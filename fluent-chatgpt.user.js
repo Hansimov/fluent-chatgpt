@@ -7505,7 +7505,7 @@
             return true;
         }
 
-        collectGeneratedImageTitleCandidates(root) {
+        collectGeneratedImageTitleCandidates(root, minimumScore = 0) {
             const candidates = [];
             const visited = new WeakSet();
             const seenTitles = new Map();
@@ -7575,6 +7575,7 @@
             };
             walk(root);
             return candidates
+                .filter((candidate) => candidate.score >= Math.max(0, Number(minimumScore) || 0))
                 .sort((first, second) => second.score - first.score || first.order - second.order)
                 .map((candidate) => candidate.title);
         }
@@ -7613,11 +7614,14 @@
         getGeneratedImageTitleFromPart(part, message, logicalIndex, apiPromptText = '') {
             const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
             const messageText = this.extractApiMessagePromptText(message);
+            const roots = [part, message?.content || null, message?.metadata || null];
+            const explicitCandidates = roots.flatMap((root) => this.collectGeneratedImageTitleCandidates(root, 185));
+            const fallbackCandidates = roots.flatMap((root) => this.collectGeneratedImageTitleCandidates(root));
             return this.pickGeneratedImageTitle([
-                ...this.collectGeneratedImageTitleCandidates(part),
-                ...this.collectGeneratedImageTitleCandidates(message?.content || null),
-                ...this.collectGeneratedImageTitleCandidates(message?.metadata || null),
+                ...explicitCandidates,
+                // multimodal_text 中与图片指针并列的文本就是网页版查看器使用的图片描述。
                 this.isUsableGeneratedImageTitleCandidate(messageText) ? messageText : '',
+                ...fallbackCandidates,
                 apiPromptText,
                 promptRecord?.fullLabel,
                 promptRecord?.label,
