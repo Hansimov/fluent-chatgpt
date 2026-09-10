@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.6.0
+// @version      4.6.1
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -1021,7 +1021,7 @@
             </section>
             <dialog id="image-lightbox" class="image-lightbox" aria-label="生成图片预览">
               <div class="image-lightbox-shell" data-controls-hidden="false">
-                <button id="image-lightbox-toolbar-toggle" class="image-lightbox-icon image-lightbox-toolbar-toggle" type="button" aria-label="隐藏顶部控件栏" aria-controls="image-lightbox-header" aria-expanded="true" title="隐藏顶部控件栏">
+                <button id="image-lightbox-toolbar-toggle" class="image-lightbox-icon image-lightbox-toolbar-toggle" type="button" aria-label="隐藏顶部控件栏（快捷键 V）" aria-controls="image-lightbox-header" aria-expanded="true" title="隐藏顶部控件栏（V）">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 12s3.1-5 8.5-5 8.5 5 8.5 5-3.1 5-8.5 5-8.5-5-8.5-5Z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path class="image-lightbox-toolbar-toggle-slash" d="m5 5 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
                 </button>
                 <header id="image-lightbox-header" class="image-lightbox-header">
@@ -1080,7 +1080,7 @@
                   </div>
                 </header>
                 <div class="image-lightbox-stage">
-                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Q/W 切图，A 适应窗口，S 适应宽度，Z 原始大小，X/C 缩放，R 切换上一次缩放状态">
+                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Q/W 切图，A 适应窗口，S 适应宽度，Z 原始大小，X/C 缩放，R 切换上一次缩放状态，V 显示或隐藏顶部控件栏">
                     <img id="image-lightbox-image" alt="" draggable="false"/>
                     <div id="image-lightbox-state" class="image-lightbox-state" role="status" aria-live="polite">
                       <svg class="image-lightbox-state-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-dasharray="34 18" stroke-linecap="round"/></svg>
@@ -4316,6 +4316,12 @@
                     event.preventDefault();
                     event.stopPropagation();
                     this.togglePreviousGeneratedImageViewState();
+                    return;
+                }
+                if (!isEditing && plainShortcut && shortcutKey === 'v') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.setGeneratedImageToolbarVisible(!this.generatedImageToolbarVisible);
                     return;
                 }
                 if (!isEditing && plainShortcut && shortcutKey === 'f') {
@@ -9526,11 +9532,11 @@
             if (this.imageLightboxToolbarToggle) {
                 this.imageLightboxToolbarToggle.setAttribute('aria-expanded', String(this.generatedImageToolbarVisible));
                 this.imageLightboxToolbarToggle.setAttribute('aria-label', this.generatedImageToolbarVisible
-                    ? '隐藏顶部控件栏'
-                    : '显示顶部控件栏');
+                    ? '隐藏顶部控件栏（快捷键 V）'
+                    : '显示顶部控件栏（快捷键 V）');
                 this.imageLightboxToolbarToggle.title = this.generatedImageToolbarVisible
-                    ? '隐藏顶部控件栏'
-                    : '显示顶部控件栏';
+                    ? '隐藏顶部控件栏（V）'
+                    : '显示顶部控件栏（V）';
             }
             if (this.imageLightbox?.open) {
                 window.requestAnimationFrame(() => this.refreshGeneratedImageViewportSizing());
@@ -10055,7 +10061,7 @@
             }
             if (this.imageLightboxMedia) {
                 const accessibleTitle = displayTitle || `第 ${this.activeGeneratedImageIndex + 1} 张未命名生成图片`;
-                this.imageLightboxMedia.setAttribute('aria-label', `${accessibleTitle}；Q 或 Page Up 上一张，W 或 Page Down 下一张，A 适应窗口，S 适应宽度，F 全屏，Z 原始大小，X 或减号缩小，C 或加号放大，R 切换上一次缩放状态；滚轮与方向键用于平移`);
+                this.imageLightboxMedia.setAttribute('aria-label', `${accessibleTitle}；Q 或 Page Up 上一张，W 或 Page Down 下一张，A 适应窗口，S 适应宽度，F 全屏，Z 原始大小，X 或减号缩小，C 或加号放大，R 切换上一次缩放状态，V 显示或隐藏顶部控件栏；滚轮与方向键用于平移`);
             }
             const onlyOne = this.generatedImages.length < 2;
             if (this.imageLightboxPreviousButton) this.imageLightboxPreviousButton.disabled = onlyOne;
