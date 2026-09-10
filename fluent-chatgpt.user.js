@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.4.1
+// @version      4.5.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -66,6 +66,7 @@
         // Image 2.0/2.5（以及兼容的 DALL·E / image_gen）生成图画廊与原图 ZIP。
         enableGeneratedImageGallery: true,
         generatedImageTitleMaxLength: 240,
+        generatedImageTitleNoiseTokens: Object.freeze(['天天彩票']),
         generatedImageFilenameMaxLength: 96,
         generatedImagePreviewConcurrency: 3,
         generatedImageMinZoom: 0.25,
@@ -595,6 +596,7 @@
             this.imageLightboxZoomInButton = null;
             this.imageLightboxActualSizeButton = null;
             this.imageLightboxFitButton = null;
+            this.imageLightboxFitWidthButton = null;
             this.imageLightboxFullscreenButton = null;
             this.imageLightboxPreviousButton = null;
             this.imageLightboxNextButton = null;
@@ -716,6 +718,7 @@
             this.generatedImageZoom = 1;
             this.generatedImagePanX = 0;
             this.generatedImagePanY = 0;
+            this.generatedImageFitMode = 'viewport';
             this.generatedImagePanState = null;
             this.generatedImagePointers = new Map();
             this.generatedImagePinchState = null;
@@ -1025,10 +1028,13 @@
                     <button id="image-lightbox-zoom-in" class="image-lightbox-icon" type="button" aria-label="放大图片" title="放大（+）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7.5 10.5h6M10.5 7.5v6M15.5 15.5 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
                     </button>
-                    <button id="image-lightbox-actual-size" class="image-lightbox-icon image-lightbox-text-icon" type="button" aria-label="按原始像素显示图片" title="原始大小（1）">1:1</button>
-                    <button id="image-lightbox-fit" class="image-lightbox-icon" type="button" aria-label="使图片适应窗口" title="适应窗口（0）">
+                    <button id="image-lightbox-fit-width" class="image-lightbox-icon" type="button" aria-label="使图片适应宽度" aria-pressed="false" title="适应宽度（Q）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5v14M20 5v14M7 12h10m-7-3-3 3 3 3m4-6 3 3-3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <button id="image-lightbox-fit" class="image-lightbox-icon" type="button" aria-label="使图片适应窗口" aria-pressed="true" title="适应窗口（W）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 5 5M9.5 6v3.5H6m13.5-5-5 5M18 9.5h-3.5V6m-10 13.5 5-5M6 14.5h3.5V18m10 1.5-5-5M14.5 18v-3.5H18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
                     </button>
+                    <button id="image-lightbox-actual-size" class="image-lightbox-icon image-lightbox-text-icon" type="button" aria-label="按原始像素显示图片" title="原始大小（E）">1:1</button>
                     <span class="image-lightbox-tool-separator" aria-hidden="true"></span>
                     <button id="image-lightbox-locate" class="image-lightbox-icon" type="button" aria-label="定位到网页中的图片" title="定位到网页">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
@@ -1045,7 +1051,7 @@
                   </div>
                 </header>
                 <div class="image-lightbox-stage">
-                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Ctrl 加滚轮缩放，双击切换原始大小与适应窗口">
+                  <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Ctrl 加滚轮缩放，Q 适应宽度，W 适应窗口，E 原始大小">
                     <img id="image-lightbox-image" alt="" draggable="false"/>
                   </div>
                 </div>
@@ -2569,6 +2575,7 @@
             this.imageLightboxZoomInButton = shadow.getElementById('image-lightbox-zoom-in');
             this.imageLightboxActualSizeButton = shadow.getElementById('image-lightbox-actual-size');
             this.imageLightboxFitButton = shadow.getElementById('image-lightbox-fit');
+            this.imageLightboxFitWidthButton = shadow.getElementById('image-lightbox-fit-width');
             this.imageLightboxFullscreenButton = shadow.getElementById('image-lightbox-fullscreen');
             this.imageLightboxPreviousButton = shadow.getElementById('image-lightbox-previous');
             this.imageLightboxNextButton = shadow.getElementById('image-lightbox-next');
@@ -2704,6 +2711,9 @@
             this.imageLightboxFitButton?.addEventListener('click', () => {
                 this.fitGeneratedImageToViewport();
             });
+            this.imageLightboxFitWidthButton?.addEventListener('click', () => {
+                this.fitGeneratedImageToWidth();
+            });
             this.imageLightboxFullscreenButton?.addEventListener('click', () => {
                 this.toggleGeneratedImageFullscreen();
             });
@@ -2756,8 +2766,7 @@
                     if (!this.imageLightbox?.open || this.generatedImageViewportFrame) return;
                     this.generatedImageViewportFrame = window.requestAnimationFrame(() => {
                         this.generatedImageViewportFrame = 0;
-                        this.updateGeneratedImageBaseSize();
-                        this.applyGeneratedImageTransform();
+                        this.refreshGeneratedImageViewportSizing();
                     });
                 });
                 this.generatedImageViewportResizeObserver.observe(this.imageLightboxMedia);
@@ -4093,9 +4102,7 @@
                     this.updateInlineEndOffset();
                 }
                 if (this.imageLightbox?.open) {
-                    this.updateGeneratedImageBaseSize();
-                    this.clampGeneratedImagePan();
-                    this.applyGeneratedImageTransform();
+                    this.refreshGeneratedImageViewportSizing();
                 }
             });
 
@@ -4127,13 +4134,20 @@
                     this.zoomGeneratedImageBy(1 / this.getGeneratedImageZoomStep());
                     return;
                 }
-                if (!isEditing && event.key === '0') {
+                const plainShortcut = !event.ctrlKey && !event.metaKey && !event.altKey;
+                if (!isEditing && plainShortcut && event.key.toLowerCase() === 'q') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.fitGeneratedImageToWidth();
+                    return;
+                }
+                if (!isEditing && plainShortcut && event.key.toLowerCase() === 'w') {
                     event.preventDefault();
                     event.stopPropagation();
                     this.fitGeneratedImageToViewport();
                     return;
                 }
-                if (!isEditing && event.key === '1') {
+                if (!isEditing && plainShortcut && event.key.toLowerCase() === 'e') {
                     event.preventDefault();
                     event.stopPropagation();
                     this.showGeneratedImageAtActualSize();
@@ -7565,6 +7579,13 @@
         normalizeGeneratedImageTitle(value) {
             let text = String(value || '').trim();
             if (!text) return '';
+            const noiseTokens = Array.isArray(this.config.generatedImageTitleNoiseTokens)
+                ? this.config.generatedImageTitleNoiseTokens
+                : [];
+            for (const valueToRemove of noiseTokens) {
+                const token = String(valueToRemove || '').trim();
+                if (token) text = text.split(token).join('');
+            }
             text = text
                 .replace(/^\s*(?:title|image title|标题|图片标题)\s*[:：]\s*/i, '')
                 .replace(/^\s*(?:已生成(?:的)?(?:图片|图像)|generated image)\s*[:：-]\s*/i, '')
@@ -8886,12 +8907,35 @@
             }
         }
 
+        getGeneratedImageFitWidthZoom() {
+            const media = this.imageLightboxMedia;
+            const image = this.imageLightboxImage;
+            if (!(media instanceof HTMLElement) || !(image instanceof HTMLImageElement) ||
+                !image.naturalWidth || !image.naturalHeight) return 1;
+            const mediaWidth = media.getBoundingClientRect().width;
+            const baseWidth = Number.parseFloat(getComputedStyle(image).width) || image.offsetWidth;
+            if (!(mediaWidth > 0) || !(baseWidth > 0)) return 1;
+            return Math.max(1, mediaWidth / baseWidth);
+        }
+
         getGeneratedImageZoomLimits() {
             const configuredMin = Number(this.config.generatedImageMinZoom);
             const configuredMax = Number(this.config.generatedImageMaxZoom);
             const min = Number.isFinite(configuredMin) ? Math.max(0.05, Math.min(1, configuredMin)) : 0.25;
             const max = Number.isFinite(configuredMax) ? Math.max(1, Math.min(32, configuredMax)) : 8;
-            return { min, max: Math.max(min, max) };
+            // 超长竖图的“适应宽度”和“原始大小”都可能需要超过常规手动缩放上限。
+            const fitWidthZoom = this.getGeneratedImageFitWidthZoom();
+            const fitRatio = this.getGeneratedImageFitRatio();
+            const actualSizeZoom = fitRatio > 0 ? 1 / fitRatio : 1;
+            return {
+                min,
+                max: Math.max(
+                    min,
+                    max,
+                    Number.isFinite(fitWidthZoom) ? fitWidthZoom : 1,
+                    Number.isFinite(actualSizeZoom) ? actualSizeZoom : 1,
+                ),
+            };
         }
 
         getGeneratedImageZoomStep() {
@@ -8921,6 +8965,18 @@
                 image.style.height = nextHeight;
             }
             return changed;
+        }
+
+        refreshGeneratedImageViewportSizing() {
+            this.updateGeneratedImageBaseSize();
+            if (this.generatedImageFitMode === 'viewport') {
+                this.generatedImageZoom = 1;
+            } else if (this.generatedImageFitMode === 'width') {
+                this.generatedImageZoom = this.getGeneratedImageFitWidthZoom();
+                this.generatedImagePanX = 0;
+            }
+            this.clampGeneratedImagePan();
+            this.applyGeneratedImageTransform();
         }
 
         getGeneratedImageFitRatio() {
@@ -8977,7 +9033,12 @@
             }
             if (this.imageLightboxZoomOutButton) this.imageLightboxZoomOutButton.disabled = this.generatedImageZoom <= min + 0.001;
             if (this.imageLightboxZoomInButton) this.imageLightboxZoomInButton.disabled = this.generatedImageZoom >= max - 0.001;
-            if (this.imageLightboxFitButton) this.imageLightboxFitButton.setAttribute('aria-pressed', String(Math.abs(this.generatedImageZoom - 1) < 0.001));
+            if (this.imageLightboxFitButton) {
+                this.imageLightboxFitButton.setAttribute('aria-pressed', String(this.generatedImageFitMode === 'viewport'));
+            }
+            if (this.imageLightboxFitWidthButton) {
+                this.imageLightboxFitWidthButton.setAttribute('aria-pressed', String(this.generatedImageFitMode === 'width'));
+            }
             if (this.imageLightboxActualSizeButton) {
                 this.imageLightboxActualSizeButton.disabled = !image.naturalWidth || !image.naturalHeight;
             }
@@ -8995,6 +9056,7 @@
                 this.generatedImagePanX = offsetX - (offsetX - this.generatedImagePanX) * ratio;
                 this.generatedImagePanY = offsetY - (offsetY - this.generatedImagePanY) * ratio;
             }
+            this.generatedImageFitMode = 'custom';
             this.generatedImageZoom = next;
             this.applyGeneratedImageTransform();
         }
@@ -9015,10 +9077,23 @@
 
         fitGeneratedImageToViewport() {
             this.updateGeneratedImageBaseSize();
+            this.generatedImageFitMode = 'viewport';
             this.generatedImageZoom = 1;
             this.generatedImagePanX = 0;
             this.generatedImagePanY = 0;
             this.cancelGeneratedImagePointerInteraction();
+            this.applyGeneratedImageTransform();
+        }
+
+        fitGeneratedImageToWidth() {
+            this.updateGeneratedImageBaseSize();
+            this.generatedImageFitMode = 'width';
+            this.generatedImageZoom = this.getGeneratedImageFitWidthZoom();
+            this.generatedImagePanX = 0;
+            this.generatedImagePanY = 0;
+            this.cancelGeneratedImagePointerInteraction();
+            // 长图从顶部开始展示，随后可直接用滚轮或方向键向下浏览。
+            this.generatedImagePanY = this.getGeneratedImagePanBounds(this.generatedImageZoom).y;
             this.applyGeneratedImageTransform();
         }
 
@@ -9118,6 +9193,7 @@
                 const nextZoom = Math.min(max, Math.max(min,
                     this.generatedImagePinchState.zoom * distance / this.generatedImagePinchState.distance));
                 const ratio = nextZoom / this.generatedImagePinchState.zoom;
+                this.generatedImageFitMode = 'custom';
                 this.generatedImageZoom = nextZoom;
                 this.generatedImagePanX = currentOffsetX - (startOffsetX - this.generatedImagePinchState.panX) * ratio;
                 this.generatedImagePanY = currentOffsetY - (startOffsetY - this.generatedImagePinchState.panY) * ratio;
@@ -9203,14 +9279,11 @@
                 this.imageLightboxFullscreenButton.title = active ? '退出全屏（F 或 Esc）' : '全屏浏览（F）';
             }
             window.requestAnimationFrame(() => {
-                this.updateGeneratedImageBaseSize();
-                this.clampGeneratedImagePan();
-                this.applyGeneratedImageTransform();
+                this.refreshGeneratedImageViewportSizing();
             });
             window.setTimeout(() => {
                 if (!this.imageLightbox?.open) return;
-                this.updateGeneratedImageBaseSize();
-                this.applyGeneratedImageTransform();
+                this.refreshGeneratedImageViewportSizing();
             }, 120);
         }
 
@@ -9244,7 +9317,7 @@
             }
             if (this.imageLightboxMedia) {
                 const accessibleTitle = displayTitle || `第 ${this.activeGeneratedImageIndex + 1} 张未命名生成图片`;
-                this.imageLightboxMedia.setAttribute('aria-label', `${accessibleTitle}；滚轮或上下方向键纵向平移，Shift 加滚轮或左右方向键横向平移，Ctrl 加滚轮或加减按钮缩放，Page Up 和 Page Down 切换图片`);
+                this.imageLightboxMedia.setAttribute('aria-label', `${accessibleTitle}；滚轮或上下方向键纵向平移，Shift 加滚轮或左右方向键横向平移，Ctrl 加滚轮或加减按钮缩放，Q 适应宽度，W 适应窗口，E 原始大小，Page Up 和 Page Down 切换图片`);
             }
             const onlyOne = this.generatedImages.length < 2;
             if (this.imageLightboxPreviousButton) this.imageLightboxPreviousButton.disabled = onlyOne;
