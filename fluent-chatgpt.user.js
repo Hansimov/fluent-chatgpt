@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.2.0
+// @version      4.3.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -588,6 +588,8 @@
             this.imageLightboxMedia = null;
             this.imageLightboxImage = null;
             this.imageLightboxTitle = null;
+            this.imageLightboxPromptDetails = null;
+            this.imageLightboxPromptText = null;
             this.imageLightboxCounter = null;
             this.imageLightboxZoomOutButton = null;
             this.imageLightboxZoomValue = null;
@@ -718,6 +720,8 @@
             this.generatedImagePanState = null;
             this.generatedImagePointers = new Map();
             this.generatedImagePinchState = null;
+            this.generatedImageViewportResizeObserver = null;
+            this.generatedImageViewportFrame = 0;
 
             // ZIP 附件获取缓存。成功结果在当前对话页面内复用；失败只短期缓存，
             // 避免重复点击“全部 ZIP”时再次等待同一失效端点。
@@ -995,7 +999,19 @@
             <dialog id="image-lightbox" class="image-lightbox" aria-label="生成图片预览">
               <div class="image-lightbox-shell">
                 <header class="image-lightbox-header">
-                  <span id="image-lightbox-counter" class="image-lightbox-counter"></span>
+                  <div class="image-lightbox-identity">
+                    <strong id="image-lightbox-title" class="image-lightbox-title" aria-live="polite"></strong>
+                    <details id="image-lightbox-prompt-details" class="image-lightbox-prompt-details">
+                      <summary class="image-lightbox-icon" aria-label="查看生成这张图片时的用户输入" title="用户输入（悬浮或点击查看）">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.25" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 10.5v5M12 7.5h.01" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+                      </summary>
+                      <div class="image-lightbox-prompt-popover" role="tooltip">
+                        <span>对应的用户输入</span>
+                        <p id="image-lightbox-prompt-text"></p>
+                      </div>
+                    </details>
+                    <span id="image-lightbox-counter" class="image-lightbox-counter"></span>
+                  </div>
                   <div class="image-lightbox-zoom-tools" role="toolbar" aria-label="图片切换、缩放与全屏工具">
                     <button id="image-lightbox-previous" class="image-lightbox-icon" type="button" aria-label="上一张" title="上一张（Page Up）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -1015,26 +1031,26 @@
                     <button id="image-lightbox-fit" class="image-lightbox-icon" type="button" aria-label="使图片适应窗口" title="适应窗口（0）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 5 5M9.5 6v3.5H6m13.5-5-5 5M18 9.5h-3.5V6m-10 13.5 5-5M6 14.5h3.5V18m10 1.5-5-5M14.5 18v-3.5H18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
                     </button>
+                    <span class="image-lightbox-tool-separator" aria-hidden="true"></span>
+                    <button id="image-lightbox-locate" class="image-lightbox-icon" type="button" aria-label="定位到网页中的图片" title="定位到网页">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                    </button>
+                    <button id="image-lightbox-download" class="image-lightbox-icon" type="button" aria-label="下载这张原图" title="下载这张原图">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m-4-4 4 4 4-4M5 19h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
                     <button id="image-lightbox-fullscreen" class="image-lightbox-icon" type="button" aria-label="全屏浏览图片" aria-pressed="false" title="全屏浏览（F）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
                     </button>
+                    <button id="image-lightbox-close" class="image-lightbox-icon" type="button" aria-label="关闭图片预览" title="关闭（Esc）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                    </button>
                   </div>
-                  <button id="image-lightbox-close" class="image-lightbox-icon" type="button" aria-label="关闭图片预览" title="关闭（Esc）">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-                  </button>
                 </header>
                 <div class="image-lightbox-stage">
                   <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Ctrl 加滚轮缩放，双击切换原始大小与适应窗口">
                     <img id="image-lightbox-image" alt="" draggable="false"/>
                   </div>
                 </div>
-                <footer class="image-lightbox-footer">
-                  <strong id="image-lightbox-title" class="image-lightbox-title" aria-live="polite"></strong>
-                  <div class="image-lightbox-actions">
-                    <button id="image-lightbox-locate" class="tool-button" type="button">定位到网页</button>
-                    <button id="image-lightbox-download" class="tool-button" data-primary="true" type="button">下载这张原图</button>
-                  </div>
-                </footer>
               </div>
             </dialog>`
                 : '';
@@ -1849,8 +1865,8 @@
             padding: 0;
             border: 1px solid rgba(127, 127, 127, 0.28);
             border-radius: 16px;
-            background: color-mix(in srgb, var(--main-surface-primary, #ffffff) 96%, transparent);
-            color: var(--text-primary, #161616);
+            background: #050505;
+            color: #ffffff;
             box-shadow: 0 24px 90px rgba(0, 0, 0, 0.42);
           }
 
@@ -1861,11 +1877,12 @@
           .image-lightbox-shell {
             width: 100%;
             height: 100%;
-            display: grid;
-            grid-template-rows: auto minmax(0, 1fr) auto;
+            position: relative;
+            display: block;
             overflow: hidden;
             border-radius: inherit;
-            background: color-mix(in srgb, var(--main-surface-primary, #ffffff) 96%, transparent);
+            background: #050505;
+            color: #ffffff;
           }
 
           .image-lightbox-shell:fullscreen {
@@ -1878,64 +1895,127 @@
             color: #ffffff;
           }
 
-          .image-lightbox-shell:fullscreen .image-lightbox-stage {
-            position: absolute;
-            z-index: 0;
-            inset: 0;
-          }
-
-          .image-lightbox-shell:fullscreen .image-lightbox-header,
-          .image-lightbox-shell:fullscreen .image-lightbox-footer {
+          .image-lightbox-header {
             position: absolute;
             z-index: 3;
-            left: 12px;
-            right: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            border-radius: 13px;
-            background: rgba(18, 18, 18, 0.72);
-            color: #ffffff;
-            box-shadow: 0 8px 34px rgba(0, 0, 0, 0.32);
-            backdrop-filter: blur(12px);
-          }
-
-          .image-lightbox-shell:fullscreen .image-lightbox-header {
-            top: 12px;
-            border-bottom-color: rgba(255, 255, 255, 0.16);
-          }
-
-          .image-lightbox-shell:fullscreen .image-lightbox-footer {
-            bottom: 12px;
-            border-top-color: rgba(255, 255, 255, 0.16);
-          }
-
-          .image-lightbox-shell:fullscreen .image-lightbox-counter,
-          .image-lightbox-shell:fullscreen .image-lightbox-zoom-value {
-            color: rgba(255, 255, 255, 0.82);
-          }
-
-          .image-lightbox-header {
+            top: 10px;
+            right: 10px;
+            left: 10px;
             min-width: 0;
             display: flex;
             align-items: center;
+            justify-content: space-between;
             gap: 10px;
-            padding: 8px 10px;
-            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: #ffffff;
+            pointer-events: none;
+          }
+
+          .image-lightbox-identity {
+            min-width: 0;
+            max-width: min(52%, 620px);
+            display: flex;
+            flex: 1 1 auto;
+            align-items: center;
+            gap: 6px;
+            pointer-events: none;
+          }
+
+          .image-lightbox-title {
+            min-width: 0;
+            display: block;
+            overflow: hidden;
+            color: #ffffff;
+            font-size: 13px;
+            font-weight: 650;
+            line-height: 1.4;
+            text-overflow: ellipsis;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.96), 0 0 9px rgba(0, 0, 0, 0.78);
+            white-space: nowrap;
+          }
+
+          .image-lightbox-prompt-details {
+            position: relative;
+            flex: none;
+            pointer-events: auto;
+          }
+
+          .image-lightbox-prompt-details > summary {
+            list-style: none;
+          }
+
+          .image-lightbox-prompt-details > summary::-webkit-details-marker {
+            display: none;
+          }
+
+          .image-lightbox-prompt-popover {
+            position: absolute;
+            z-index: 5;
+            top: calc(100% + 7px);
+            left: 0;
+            width: min(420px, calc(100vw - 64px));
+            max-height: min(42vh, 280px);
+            display: none;
+            overflow: auto;
+            padding: 10px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 11px;
+            background: rgba(12, 12, 12, 0.84);
+            color: #ffffff;
+            box-shadow: 0 10px 34px rgba(0, 0, 0, 0.42);
+            backdrop-filter: blur(10px);
+            pointer-events: auto;
+          }
+
+          .image-lightbox-prompt-popover::before {
+            content: "";
+            position: absolute;
+            right: 0;
+            bottom: 100%;
+            left: 0;
+            height: 8px;
+          }
+
+          .image-lightbox-prompt-details[open] .image-lightbox-prompt-popover,
+          .image-lightbox-prompt-details:hover .image-lightbox-prompt-popover,
+          .image-lightbox-prompt-details:focus-within .image-lightbox-prompt-popover {
+            display: block;
+          }
+
+          .image-lightbox-prompt-popover > span {
+            display: block;
+            margin-bottom: 4px;
+            color: rgba(255, 255, 255, 0.65);
+            font-size: 10px;
+            font-weight: 650;
+          }
+
+          .image-lightbox-prompt-popover > p {
+            margin: 0;
+            font-size: 12px;
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+            white-space: pre-wrap;
           }
 
           .image-lightbox-counter {
             flex: none;
-            color: var(--text-tertiary, #777777);
+            color: rgba(255, 255, 255, 0.78);
             font-size: 11px;
             font-variant-numeric: tabular-nums;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.96), 0 0 7px rgba(0, 0, 0, 0.74);
           }
 
           .image-lightbox-zoom-tools {
             min-width: 0;
             display: flex;
-            flex: 1;
+            flex: 0 1 auto;
             align-items: center;
             justify-content: flex-end;
             gap: 3px;
+            pointer-events: none;
           }
 
           .image-lightbox-tool-separator {
@@ -1950,19 +2030,11 @@
           .image-lightbox-zoom-value {
             min-width: 46px;
             padding-inline: 3px;
-            color: var(--text-secondary, #444444);
+            color: rgba(255, 255, 255, 0.86);
             font-size: 11px;
             font-variant-numeric: tabular-nums;
             text-align: center;
-          }
-
-          .image-lightbox-title {
-            min-width: 0;
-            display: block;
-            overflow-wrap: anywhere;
-            font-size: 12.5px;
-            font-weight: 600;
-            line-height: 1.45;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.96), 0 0 7px rgba(0, 0, 0, 0.74);
           }
 
           .image-lightbox-icon {
@@ -1972,8 +2044,10 @@
             padding: 0;
             border: 0;
             background: transparent;
-            color: inherit;
+            color: #ffffff;
             cursor: pointer;
+            filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.9));
+            pointer-events: auto;
           }
 
           .image-lightbox-icon {
@@ -1991,11 +2065,19 @@
           }
 
           .image-lightbox-icon:hover:not(:disabled) {
-            background: color-mix(in srgb, currentColor 10%, transparent);
+            background: rgba(8, 8, 8, 0.58);
+            backdrop-filter: blur(7px);
+          }
+
+          .image-lightbox-icon:focus-visible {
+            background: rgba(8, 8, 8, 0.58);
+            outline: 2px solid rgba(255, 255, 255, 0.72);
+            outline-offset: 1px;
+            backdrop-filter: blur(7px);
           }
 
           .image-lightbox-icon[aria-pressed="true"] {
-            background: color-mix(in srgb, currentColor 13%, transparent);
+            color: #ffffff;
           }
 
           .image-lightbox-icon:disabled {
@@ -2009,6 +2091,9 @@
           }
 
           .image-lightbox-stage {
+            position: absolute;
+            z-index: 0;
+            inset: 0;
             min-width: 0;
             min-height: 0;
             display: grid;
@@ -2044,8 +2129,8 @@
           .image-lightbox-media img {
             width: auto;
             height: auto;
-            max-width: 100%;
-            max-height: 100%;
+            max-width: none;
+            max-height: none;
             display: block;
             object-fit: contain;
             pointer-events: none;
@@ -2059,22 +2144,6 @@
             transition: none;
           }
 
-          .image-lightbox-footer {
-            min-width: 0;
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) auto;
-            align-items: center;
-            gap: 12px;
-            padding: 9px 12px;
-            border-top: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
-          }
-
-          .image-lightbox-actions {
-            display: flex;
-            justify-content: flex-end;
-            gap: 7px;
-          }
-
           @media (max-width: 640px) {
             .image-lightbox {
               width: calc(100vw - 12px);
@@ -2084,6 +2153,13 @@
 
             .image-lightbox-zoom-tools {
               gap: 0;
+              max-width: calc(100% - 82px);
+              overflow-x: auto;
+              scrollbar-width: none;
+            }
+
+            .image-lightbox-zoom-tools::-webkit-scrollbar {
+              display: none;
             }
 
             .image-lightbox-zoom-tools .image-lightbox-icon {
@@ -2099,23 +2175,19 @@
               min-width: 40px;
             }
 
-            .image-lightbox-footer {
-              grid-template-columns: 1fr;
-              gap: 8px;
-            }
-
-            .image-lightbox-shell:fullscreen .image-lightbox-header,
-            .image-lightbox-shell:fullscreen .image-lightbox-footer {
-              left: 6px;
-              right: 6px;
-            }
-
-            .image-lightbox-shell:fullscreen .image-lightbox-header {
+            .image-lightbox-header {
               top: 6px;
+              right: 6px;
+              left: 6px;
+              gap: 4px;
             }
 
-            .image-lightbox-shell:fullscreen .image-lightbox-footer {
-              bottom: 6px;
+            .image-lightbox-identity {
+              max-width: 78px;
+            }
+
+            .image-lightbox-title {
+              font-size: 11px;
             }
           }
 
@@ -2354,8 +2426,6 @@
             .view-tabs,
             .search-toolbar,
             .image-toolbar,
-            .image-lightbox-header,
-            .image-lightbox-actions,
             .conversation-tools {
               border-bottom-color: rgba(255, 255, 255, 0.11);
             }
@@ -2468,6 +2538,8 @@
             this.imageLightboxMedia = shadow.getElementById('image-lightbox-media');
             this.imageLightboxImage = shadow.getElementById('image-lightbox-image');
             this.imageLightboxTitle = shadow.getElementById('image-lightbox-title');
+            this.imageLightboxPromptDetails = shadow.getElementById('image-lightbox-prompt-details');
+            this.imageLightboxPromptText = shadow.getElementById('image-lightbox-prompt-text');
             this.imageLightboxCounter = shadow.getElementById('image-lightbox-counter');
             this.imageLightboxZoomOutButton = shadow.getElementById('image-lightbox-zoom-out');
             this.imageLightboxZoomValue = shadow.getElementById('image-lightbox-zoom-value');
@@ -2656,6 +2728,18 @@
                 this.fitGeneratedImageToViewport();
             });
             this.imageLightboxImage?.addEventListener('dragstart', (event) => event.preventDefault());
+            if (typeof ResizeObserver === 'function' && this.imageLightboxMedia && this.imageLightboxImage) {
+                this.generatedImageViewportResizeObserver = new ResizeObserver(() => {
+                    if (!this.imageLightbox?.open || this.generatedImageViewportFrame) return;
+                    this.generatedImageViewportFrame = window.requestAnimationFrame(() => {
+                        this.generatedImageViewportFrame = 0;
+                        this.updateGeneratedImageBaseSize();
+                        this.applyGeneratedImageTransform();
+                    });
+                });
+                this.generatedImageViewportResizeObserver.observe(this.imageLightboxMedia);
+                this.generatedImageViewportResizeObserver.observe(this.imageLightboxImage);
+            }
             document.addEventListener('fullscreenchange', this.onGeneratedImageFullscreenChange);
             this.searchList?.addEventListener('click', (event) => {
                 const button = event.target instanceof Element
@@ -3986,6 +4070,7 @@
                     this.updateInlineEndOffset();
                 }
                 if (this.imageLightbox?.open) {
+                    this.updateGeneratedImageBaseSize();
                     this.clampGeneratedImagePan();
                     this.applyGeneratedImageTransform();
                 }
@@ -7479,6 +7564,8 @@
             if (/^(?:(?:open|view|preview|download|zoom)(?: the)?|打开|查看|预览|下载|放大)?\s*(?:image|picture|图片|图像)(?:\s*\d+)?$/i.test(stem)) return true;
             if (/^第\s*\d+\s*(?:轮|张)(?:生成(?:的)?)?(?:图片|图像)$/i.test(stem)) return true;
             if (/^(?:image|picture|图片|图像)\s*\d+$/i.test(stem)) return true;
+            if (/^(?:未命名|无标题|未提供标题的?)(?:生成(?:的)?)?(?:图片|图像)(?:\s*\d+)?$/i.test(stem)) return true;
+            if (/^(?:图片|图像)描述不可用(?:\s*\d+)?$/i.test(stem)) return true;
             if (/^(?:file[-_])?[a-z0-9_-]{24,}$/i.test(stem)) return true;
             if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(stem)) return true;
             return false;
@@ -7490,6 +7577,14 @@
                 if (title && !this.isGenericGeneratedImageTitle(title)) return title;
             }
             return this.normalizeGeneratedImageTitle(fallback) || '生成图像';
+        }
+
+        pickExplicitGeneratedImageTitle(values) {
+            for (const value of values || []) {
+                const title = this.normalizeGeneratedImageTitle(value);
+                if (title && !this.isGenericGeneratedImageTitle(title)) return title;
+            }
+            return '';
         }
 
         isUsableGeneratedImageTitleCandidate(value) {
@@ -7516,17 +7611,18 @@
                 const normalized = normalizeKey(key);
                 const signal = `${normalized} ${String(path || '').toLowerCase()}`;
                 if (!normalized) return 0;
-                if (/(?:url|uri|href|src|path|pointer|mime|mediatype|contenttype|filename|fileid|assetid|generationid|promptid|seed|hash|slug|status|token)$/.test(normalized)) return 0;
+                if (/(?:url|uri|href|src|path|pointer|mime|mediatype|contenttype|filename|fileid|assetid|generationid|promptid|seed|hash|slug|status|token)$/.test(normalized)) return -1;
                 // ChatGPT 的 image_asset_pointer 使用 serialization_title 标识元数据结构；它不是图片标题。
-                if (/^(?:serializationtitle|serializationname|metadatatitle|metadataname)$/.test(normalized)) return 0;
+                if (/^(?:serializationtitle|serializationname|metadatatitle|metadataname)$/.test(normalized)) return -1;
                 if (/^(?:imagetitle|generatedimagetitle|displaytitle|displayname|标题|图片标题|图像标题)$/.test(normalized)) return 240;
                 if (normalized === 'name' && /(?:image|generation|dalle|gpt|asset|result|output|metadata|图片|图像)/i.test(signal)) return 130;
                 if (/(?:imagecaption|caption|figcaption|图注|说明文字)$/.test(normalized)) return 225;
                 if (/(?:imagedescription|visualdescription|description|descriptivealt|alttext|aria-label|arialabel|图片描述|图像描述)$/.test(normalized)) return 215;
                 if (normalized === 'alt') return 210;
                 if (normalized === 'title') return 195;
-                if (/(?:revisedprompt|finalprompt|visualprompt|generationprompt|生成提示词)$/.test(normalized)) return 180;
-                if (/^(?:prompt|prompttext|originalprompt|instruction|instructions|提示词)$/.test(normalized)) return 160;
+                // prompt / revised_prompt 是绘图指令，不是网页版图片查看器显示的标题。
+                if (/(?:revisedprompt|finalprompt|visualprompt|generationprompt|生成提示词)$/.test(normalized)) return -1;
+                if (/^(?:prompt|prompttext|originalprompt|userprompt|input|inputtext|userinput|instruction|instructions|request|query|提示词|用户输入)$/.test(normalized)) return -1;
                 if (normalized === 'label' && /(?:image|generation|asset|result|output|图片|图像)/i.test(signal)) return 145;
                 return 0;
             };
@@ -7570,7 +7666,8 @@
                 try { entries = Object.entries(value); } catch { return; }
                 for (const [key, child] of entries) {
                     const priority = getPriority(key, path);
-                    walk(child, path ? `${path}.${key}` : key, depth + 1, priority || inheritedPriority);
+                    const nextPriority = priority < 0 ? 0 : (priority || inheritedPriority);
+                    walk(child, path ? `${path}.${key}` : key, depth + 1, nextPriority);
                 }
             };
             walk(root);
@@ -7611,21 +7708,98 @@
             return values.join('\n');
         }
 
+        getGeneratedImageMessagePartIndex(part, message) {
+            const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+            if (!parts.length) return -1;
+            const directIndex = parts.indexOf(part);
+            if (directIndex >= 0) return directIndex;
+            const getFileIds = (value) => new Set([
+                value?.asset_pointer,
+                value?.file_id,
+                value?.fileId,
+                value?.original_file_id,
+                value?.originalFileId,
+                value?.source_file_id,
+                value?.sourceFileId,
+            ].map((candidate) => this.extractFileIdFromValue(candidate, 'file_id')).filter(Boolean));
+            const targetIds = getFileIds(part);
+            if (!targetIds.size) return -1;
+            return parts.findIndex((candidate) => {
+                if (!candidate || typeof candidate !== 'object') return false;
+                const candidateIds = getFileIds(candidate);
+                return [...targetIds].some((fileId) => candidateIds.has(fileId));
+            });
+        }
+
+        extractGeneratedImageDisplayText(part, message) {
+            if (String(message?.author?.role || '').toLowerCase() === 'user') return '';
+            const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+            if (!parts.length) return '';
+            const pointerIndex = this.getGeneratedImageMessagePartIndex(part, message);
+            if (pointerIndex < 0) return '';
+            const isImagePart = (value) => Boolean(
+                value && typeof value === 'object' && (
+                    value.content_type === 'image_asset_pointer' ||
+                    value.asset_pointer ||
+                    /^image\//i.test(String(value.mime_type || value.media_type || ''))
+                )
+            );
+            const readText = (value) => {
+                if (typeof value === 'string') return value;
+                if (!value || typeof value !== 'object' || value.content_type === 'image_asset_pointer') return '';
+                for (const key of ['image_title', 'image_description', 'caption', 'alt_text', 'text', 'content']) {
+                    if (typeof value[key] === 'string') return value[key];
+                }
+                return '';
+            };
+            // 网页端可能把图片查看器标题保存为紧邻 image_asset_pointer 的短文本。
+            // 每个方向遇到下一张图片就停止，避免把同一消息里另一版本的标题串过来。
+            for (const direction of [1, -1]) {
+                for (let index = pointerIndex + direction; index >= 0 && index < parts.length; index += direction) {
+                    if (isImagePart(parts[index])) break;
+                    const raw = this.normalizeConversationText(readText(parts[index]));
+                    if (!raw || raw.length > Math.max(80, Number(this.config.generatedImageTitleMaxLength) || 240)) continue;
+                    if (this.isUsableGeneratedImageTitleCandidate(raw)) return this.normalizeGeneratedImageTitle(raw);
+                }
+            }
+            return '';
+        }
+
+        isGeneratedImageTitleSameAsPrompt(title, promptText) {
+            const canonical = (value) => this.normalizeConversationText(value)
+                .toLocaleLowerCase()
+                .replace(/[\s\p{P}\p{S}]+/gu, '');
+            const first = canonical(title);
+            const second = canonical(promptText);
+            return Boolean(first && second && first === second);
+        }
+
         getGeneratedImageTitleFromPart(part, message, logicalIndex, apiPromptText = '') {
             const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
-            const messageText = this.extractApiMessagePromptText(message);
-            const roots = [part, message?.content || null, message?.metadata || null];
-            const explicitCandidates = roots.flatMap((root) => this.collectGeneratedImageTitleCandidates(root, 185));
-            const fallbackCandidates = roots.flatMap((root) => this.collectGeneratedImageTitleCandidates(root));
-            return this.pickGeneratedImageTitle([
-                ...explicitCandidates,
-                // multimodal_text 中与图片指针并列的文本就是网页版查看器使用的图片描述。
-                this.isUsableGeneratedImageTitleCandidate(messageText) ? messageText : '',
-                ...fallbackCandidates,
-                apiPromptText,
-                promptRecord?.fullLabel,
-                promptRecord?.label,
-            ], apiPromptText || promptRecord?.fullLabel || promptRecord?.label || '图片描述不可用');
+            const promptText = this.normalizeConversationText(
+                apiPromptText || promptRecord?.fullLabel || promptRecord?.label || '',
+            );
+            const messagePartIndex = this.getGeneratedImageMessagePartIndex(part, message);
+            const messageParts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+            const imagePartCount = messageParts.filter((candidate) => Boolean(
+                candidate && typeof candidate === 'object' && (
+                    candidate.content_type === 'image_asset_pointer' || candidate.asset_pointer
+                )
+            )).length;
+            const allowMessageLevelFallback = messagePartIndex >= 0 && imagePartCount === 1;
+            const candidates = [
+                ...this.collectGeneratedImageTitleCandidates(part, 185),
+                // 消息级字段无法可靠区分同一轮里的多张历史版本，只能用于单图消息。
+                ...(allowMessageLevelFallback
+                    ? this.collectGeneratedImageTitleCandidates(message?.content || null, 205)
+                    : []),
+                ...(allowMessageLevelFallback
+                    ? this.collectGeneratedImageTitleCandidates(message?.metadata || null, 205)
+                    : []),
+                // multimodal_text 中紧邻图片指针的短文本，是网页版查看器可能使用的图片描述。
+                this.extractGeneratedImageDisplayText(part, message),
+            ].filter((title) => !this.isGeneratedImageTitleSameAsPrompt(title, promptText));
+            return this.pickExplicitGeneratedImageTitle(candidates);
         }
 
         isImageGenerationMessage(message, part = null) {
@@ -8224,25 +8398,35 @@
             for (const [logicalIndex, assets] of entries) {
                 for (const asset of assets || []) {
                     if (!this.isGeneratedImageAsset(asset)) continue;
+                    const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
+                    const promptText = this.normalizeConversationText(
+                        asset.promptText || promptRecord?.fullLabel || promptRecord?.label || '',
+                    );
+                    const candidateTitle = this.pickExplicitGeneratedImageTitle([asset.imageTitle]);
+                    const explicitTitle = !this.isGeneratedImageTitleSameAsPrompt(candidateTitle, promptText)
+                        ? candidateTitle
+                        : '';
                     const duplicate = items.find((item) => this.assetsShareStrongIdentity(item, asset));
                     if (duplicate) {
                         this.mergeArchiveAsset(duplicate, asset);
+                        const mergedExplicitTitle = this.pickExplicitGeneratedImageTitle([
+                            duplicate.imageTitle,
+                            explicitTitle,
+                        ]);
+                        duplicate.imageTitle = mergedExplicitTitle;
+                        duplicate.title = mergedExplicitTitle || '未命名生成图像';
+                        if (mergedExplicitTitle) duplicate.imageTitleSource ||= 'api-metadata';
+                        duplicate.promptText ||= promptText;
                         continue;
                     }
-                    const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
-                    const title = this.pickGeneratedImageTitle([
-                        asset.imageTitle,
-                        asset.label,
-                        asset.promptText,
-                        promptRecord?.fullLabel,
-                        promptRecord?.label,
-                    ], asset.promptText || promptRecord?.fullLabel || promptRecord?.label || '图片描述不可用');
                     items.push({
                         ...asset,
                         logicalIndex,
                         generatedImage: true,
-                        title,
-                        imageTitle: title,
+                        title: explicitTitle || '未命名生成图像',
+                        imageTitle: explicitTitle,
+                        imageTitleSource: explicitTitle ? 'api-metadata' : '',
+                        promptText,
                         previewUrl: this.getGeneratedImagePreviewUrl(asset),
                         galleryOrder,
                         apiDerived: true,
@@ -8282,79 +8466,85 @@
             const large = width >= 160 && height >= 120;
             const explicit = /(?:generated[_ -]?(?:image|picture)|image[_ -]?(?:generation|output|asset)|dall[-_. ]?e|gpt[_ -]?image|生成(?:的)?(?:图片|图像)|创建的?(?:图片|图像))/i.test(signal);
             const openAiImage = /(?:oaiusercontent\.com|oaistatic\.com|file-service|sediment|\/backend-api\/files?\/)/i.test(source);
-            return large && (explicit || allowLargeContentImages || openAiImage);
+            const generatedContainer = image.closest('[id^="image-"], [class*="imagegen-image" i], [data-testid*="imagegen" i]');
+            const allowedByContext = allowLargeContentImages && Boolean(
+                generatedContainer || image.closest(ASSISTANT_SELECTOR),
+            );
+            return large && (explicit || allowedByContext || openAiImage);
         }
 
         collectGeneratedImageDomItems(allowLargeContentImages = false) {
             const items = [];
-            const assistants = this.getAssistantMessageElements();
-            const contextMap = this.buildSearchAssistantContextMap(assistants);
-            const seenElements = new Set();
-            for (const assistant of assistants) {
-                const logicalIndex = contextMap.get(assistant) ?? -1;
-                for (const image of assistant.querySelectorAll('img')) {
-                    if (seenElements.has(image) || !this.isLikelyGeneratedImageElement(image, allowLargeContentImages)) continue;
-                    seenElements.add(image);
-                    const sourceUrl = this.getLargestImageCandidate(image);
-                    const holder = image.closest('figure, [data-testid*="image" i], [class*="image" i]');
-                    const caption = holder?.querySelector?.('figcaption')?.textContent || '';
-                    const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
-                    const nearbyTitles = [];
-                    let titleNode = image;
-                    for (let depth = 0; titleNode && depth < 7; depth += 1, titleNode = titleNode.parentElement) {
-                        for (const attribute of [
-                            'aria-label', 'title', 'data-title', 'data-image-title',
-                            'data-description', 'data-image-description', 'data-prompt',
-                        ]) {
-                            const value = titleNode.getAttribute?.(attribute);
-                            if (value) nearbyTitles.push(value);
-                        }
-                        if (titleNode === assistant) break;
+            // Image 2.5 的 imagegen-image 与文字回答是同一 turn 的兄弟节点，不一定带 assistant role。
+            // 因而必须从 main 全局收集，再按最近的用户消息映射逻辑轮次。
+            const images = [...document.querySelectorAll('main img')]
+                .filter((image) => this.isLikelyGeneratedImageElement(image, allowLargeContentImages));
+            const contextMap = this.buildSearchAssistantContextMap(images);
+            for (const image of images) {
+                const logicalIndex = contextMap.get(image) ?? -1;
+                const sourceUrl = this.getLargestImageCandidate(image);
+                const holder = image.closest(
+                    '[id^="image-"], [class*="imagegen-image" i], figure, [data-testid*="image" i], [class*="image" i]',
+                );
+                const caption = holder?.querySelector?.('figcaption')?.textContent || '';
+                const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
+                const promptText = this.normalizeConversationText(
+                    promptRecord?.fullLabel || promptRecord?.label || '',
+                );
+                const nearbyTitles = [];
+                let titleNode = image;
+                for (let depth = 0; titleNode && depth < 10; depth += 1, titleNode = titleNode.parentElement) {
+                    for (const attribute of [
+                        'aria-label', 'title', 'data-title', 'data-image-title',
+                        'data-description', 'data-image-description',
+                    ]) {
+                        const value = titleNode.getAttribute?.(attribute);
+                        if (value) nearbyTitles.push(value);
                     }
-                    const reactTitles = this.collectGeneratedImageTitleCandidates(
-                        this.getReactInternalPayloads(image, true),
-                    );
-                    const explicitTitle = this.pickGeneratedImageTitle([
-                        caption,
-                        image.getAttribute('title'),
-                        image.getAttribute('alt'),
-                        image.getAttribute('aria-label'),
-                        holder?.getAttribute?.('title'),
-                        holder?.getAttribute?.('aria-label'),
-                        ...nearbyTitles,
-                        ...reactTitles,
-                    ], '');
-                    const title = this.pickGeneratedImageTitle([
-                        explicitTitle,
-                        promptRecord?.fullLabel,
-                        promptRecord?.label,
-                    ], promptRecord?.fullLabel || promptRecord?.label || '图片描述不可用');
-                    const fileId = this.extractFileIdFromValue(sourceUrl);
-                    const linkUrl = this.normalizeAssetCandidateUrl(image.closest('a[href]')?.getAttribute('href') || '');
-                    items.push({
-                        id: `dom-generated-image-${items.length + 1}`,
-                        logicalIndex,
-                        role: 'assistant',
-                        kind: 'image',
-                        label: title,
-                        title,
-                        imageTitle: title,
-                        generatedImage: true,
-                        sourceUrl,
-                        previewUrl: sourceUrl,
-                        previewUrls: [sourceUrl],
-                        originalUrls: linkUrl && this.isExplicitOriginalAssetUrl(linkUrl) ? [linkUrl] : [],
-                        alternateUrls: linkUrl && linkUrl !== sourceUrl ? [linkUrl] : this.getElementUrlAlternates(image, sourceUrl),
-                        fileId,
-                        fileIdCandidates: fileId ? [fileId] : [],
-                        filenameHint: 'generated-image.png',
-                        mimeType: /^data:([^;,]+)/i.exec(sourceUrl)?.[1] || 'image/png',
-                        element: image,
-                        explicitTitle,
-                        galleryOrder: items.length,
-                        captureMethod: 'dom-generated-image',
-                    });
+                    if (titleNode === holder || titleNode.matches?.('main, [data-testid^="conversation-turn-"]')) break;
                 }
+                const reactTitles = this.collectGeneratedImageTitleCandidates(
+                    this.getReactInternalPayloads(image, true),
+                    185,
+                ).filter((candidate) => !this.isGeneratedImageTitleSameAsPrompt(candidate, promptText));
+                const explicitTitle = this.pickExplicitGeneratedImageTitle([
+                    caption,
+                    image.getAttribute('title'),
+                    image.getAttribute('alt'),
+                    image.getAttribute('aria-label'),
+                    holder?.getAttribute?.('title'),
+                    holder?.getAttribute?.('aria-label'),
+                    ...nearbyTitles,
+                    ...reactTitles,
+                ].filter((candidate) => !this.isGeneratedImageTitleSameAsPrompt(candidate, promptText)));
+                const title = explicitTitle || '未命名生成图像';
+                const fileId = this.extractFileIdFromValue(sourceUrl);
+                const linkUrl = this.normalizeAssetCandidateUrl(image.closest('a[href]')?.getAttribute('href') || '');
+                items.push({
+                    id: `dom-generated-image-${items.length + 1}`,
+                    logicalIndex,
+                    role: 'assistant',
+                    kind: 'image',
+                    label: title,
+                    title,
+                    imageTitle: explicitTitle,
+                    imageTitleSource: explicitTitle ? 'dom-native' : '',
+                    promptText,
+                    generatedImage: true,
+                    sourceUrl,
+                    previewUrl: sourceUrl,
+                    previewUrls: [sourceUrl],
+                    originalUrls: linkUrl && this.isExplicitOriginalAssetUrl(linkUrl) ? [linkUrl] : [],
+                    alternateUrls: linkUrl && linkUrl !== sourceUrl ? [linkUrl] : this.getElementUrlAlternates(image, sourceUrl),
+                    fileId,
+                    fileIdCandidates: fileId ? [fileId] : [],
+                    filenameHint: 'generated-image.png',
+                    mimeType: /^data:([^;,]+)/i.exec(sourceUrl)?.[1] || 'image/png',
+                    element: image,
+                    explicitTitle,
+                    galleryOrder: items.length,
+                    captureMethod: 'dom-generated-image',
+                });
             }
             return items;
         }
@@ -8415,22 +8605,55 @@
                     continue;
                 }
                 const apiItem = merged[index];
-                const domTitle = this.isGenericGeneratedImageTitle(domItem.explicitTitle) ? '' : domItem.explicitTitle;
-                const mergedTitle = this.pickGeneratedImageTitle(
-                    [domTitle, apiItem.imageTitle, apiItem.title, apiItem.label],
-                    apiItem.title,
-                );
+                const domTitle = this.pickExplicitGeneratedImageTitle([
+                    domItem.explicitTitle,
+                    domItem.imageTitle,
+                ]);
+                const apiTitle = this.pickExplicitGeneratedImageTitle([apiItem.imageTitle]);
+                const mergedTitle = domTitle || apiTitle;
                 merged[index] = {
                     ...apiItem,
                     element: domItem.element,
                     previewUrl: domItem.previewUrl || apiItem.previewUrl,
                     previewUrls: [...new Set([...(domItem.previewUrls || []), ...(apiItem.previewUrls || [])])],
                     alternateUrls: [...new Set([...(apiItem.alternateUrls || []), ...(domItem.alternateUrls || [])])],
-                    title: mergedTitle,
+                    title: mergedTitle || '未命名生成图像',
                     imageTitle: mergedTitle,
+                    imageTitleSource: domTitle ? 'dom-native' : (apiItem.imageTitleSource || (apiTitle ? 'api-metadata' : '')),
+                    promptText: apiItem.promptText || domItem.promptText || '',
                 };
             }
             return merged.map((item, index) => ({ ...item, galleryOrder: index }));
+        }
+
+        carryForwardGeneratedImageDetails(apiItems, previousItems = this.generatedImages) {
+            if (!apiItems.length || !previousItems?.length) return apiItems;
+            return apiItems.map((item) => {
+                const previous = previousItems.find((candidate) =>
+                    this.assetsShareStrongIdentity(candidate, item)
+                );
+                if (!previous) return item;
+                const promptText = this.normalizeConversationText(item.promptText || previous.promptText || '');
+                const previousTitle = this.pickExplicitGeneratedImageTitle([previous.imageTitle]);
+                const retainedTitle = !this.isGeneratedImageTitleSameAsPrompt(previousTitle, promptText)
+                    ? previousTitle
+                    : '';
+                const apiTitle = this.pickExplicitGeneratedImageTitle([item.imageTitle]);
+                const retainNativeTitle = previous.imageTitleSource === 'dom-native';
+                const imageTitle = this.pickExplicitGeneratedImageTitle(
+                    retainNativeTitle ? [retainedTitle, apiTitle] : [apiTitle, retainedTitle],
+                );
+                const imageTitleSource = imageTitle === retainedTitle && retainedTitle
+                    ? previous.imageTitleSource
+                    : (item.imageTitleSource || (imageTitle ? 'api-metadata' : ''));
+                return {
+                    ...item,
+                    imageTitle,
+                    imageTitleSource,
+                    title: imageTitle || '未命名生成图像',
+                    promptText,
+                };
+            });
         }
 
         async refreshGeneratedImageGallery(includeApi = true) {
@@ -8447,6 +8670,9 @@
                 }
             }
             if (token !== this.generatedImageRefreshToken || routeEpoch !== this.routeEpoch) return this.generatedImages;
+            // ChatGPT 会虚拟化较远的消息。已从原生 imagegen-image 的 alt/aria-label 捕获到的标题，
+            // 在对应节点卸载后仍按 file_id / 原图 URL 强身份保留。
+            apiItems = this.carryForwardGeneratedImageDetails(apiItems);
             const domItems = this.collectGeneratedImageDomItems(apiItems.length > 0);
             this.generatedImages = this.mergeGeneratedImageItems(apiItems, domItems);
             this.activeGeneratedImageIndex = this.generatedImages.length
@@ -8483,7 +8709,8 @@
                 button.className = 'image-card-button';
                 button.dataset.imageIndex = String(index);
                 button.dataset.active = String(index === this.activeGeneratedImageIndex);
-                button.title = item.title;
+                const promptText = this.normalizeConversationText(item.promptText || '');
+                button.title = promptText ? `${item.title}\n\n对应的用户输入：${promptText}` : item.title;
                 button.setAttribute('aria-label', `查看第 ${index + 1} 张图片：${item.title}`);
 
                 const media = document.createElement('span');
@@ -8636,11 +8863,36 @@
             return Number.isFinite(configured) ? Math.max(1.01, Math.min(1.5, configured)) : 1.1;
         }
 
+        updateGeneratedImageBaseSize() {
+            const media = this.imageLightboxMedia;
+            const image = this.imageLightboxImage;
+            if (!(media instanceof HTMLElement) || !(image instanceof HTMLImageElement) ||
+                !image.naturalWidth || !image.naturalHeight) return false;
+            const mediaRect = media.getBoundingClientRect();
+            if (mediaRect.width <= 0 || mediaRect.height <= 0) return false;
+            const fitRatio = Math.min(
+                1,
+                mediaRect.width / image.naturalWidth,
+                mediaRect.height / image.naturalHeight,
+            );
+            const width = Math.max(1, image.naturalWidth * fitRatio);
+            const height = Math.max(1, image.naturalHeight * fitRatio);
+            const nextWidth = `${width.toFixed(3)}px`;
+            const nextHeight = `${height.toFixed(3)}px`;
+            const changed = image.style.width !== nextWidth || image.style.height !== nextHeight;
+            if (changed) {
+                image.style.width = nextWidth;
+                image.style.height = nextHeight;
+            }
+            return changed;
+        }
+
         getGeneratedImageFitRatio() {
             const image = this.imageLightboxImage;
             if (!(image instanceof HTMLImageElement) || !image.naturalWidth || !image.naturalHeight) return 1;
-            const renderedWidth = image.offsetWidth;
-            const renderedHeight = image.offsetHeight;
+            const style = getComputedStyle(image);
+            const renderedWidth = Number.parseFloat(style.width) || image.offsetWidth;
+            const renderedHeight = Number.parseFloat(style.height) || image.offsetHeight;
             if (!renderedWidth || !renderedHeight) return 1;
             return Math.min(renderedWidth / image.naturalWidth, renderedHeight / image.naturalHeight) || 1;
         }
@@ -8649,14 +8901,18 @@
             const media = this.imageLightboxMedia;
             const image = this.imageLightboxImage;
             if (!(media instanceof HTMLElement) || !(image instanceof HTMLImageElement)) return { x: 0, y: 0 };
-            const baseWidth = image.offsetWidth || 0;
-            const baseHeight = image.offsetHeight || 0;
-            const overflowX = Math.max(0, baseWidth * zoom - media.clientWidth);
-            const overflowY = Math.max(0, baseHeight * zoom - media.clientHeight);
-            // 半像素安全余量确保到达极限时图片仍覆盖画布，不会因亚像素取整露出黑边。
+            const imageStyle = getComputedStyle(image);
+            const mediaRect = media.getBoundingClientRect();
+            const baseWidth = Number.parseFloat(imageStyle.width) || image.offsetWidth || 0;
+            const baseHeight = Number.parseFloat(imageStyle.height) || image.offsetHeight || 0;
+            const normalizedZoom = Math.max(0, Number(zoom) || 1);
+            const overflowX = Math.max(0, baseWidth * normalizedZoom - mediaRect.width);
+            const overflowY = Math.max(0, baseHeight * normalizedZoom - mediaRect.height);
+            // 极限位置仍让图片覆盖至少一个物理像素，避免缩放取整和抗锯齿露出黑边。
+            const edgeGuard = 1 / Math.max(1, Number(window.devicePixelRatio) || 1);
             return {
-                x: Math.max(0, overflowX / 2 - Math.min(0.5, overflowX / 2)),
-                y: Math.max(0, overflowY / 2 - Math.min(0.5, overflowY / 2)),
+                x: Math.max(0, overflowX / 2 - Math.min(edgeGuard, overflowX / 2)),
+                y: Math.max(0, overflowY / 2 - Math.min(edgeGuard, overflowY / 2)),
             };
         }
 
@@ -8722,6 +8978,7 @@
         }
 
         fitGeneratedImageToViewport() {
+            this.updateGeneratedImageBaseSize();
             this.generatedImageZoom = 1;
             this.generatedImagePanX = 0;
             this.generatedImagePanY = 0;
@@ -8910,9 +9167,15 @@
                 this.imageLightboxFullscreenButton.title = active ? '退出全屏（F 或 Esc）' : '全屏浏览（F）';
             }
             window.requestAnimationFrame(() => {
+                this.updateGeneratedImageBaseSize();
                 this.clampGeneratedImagePan();
                 this.applyGeneratedImageTransform();
             });
+            window.setTimeout(() => {
+                if (!this.imageLightbox?.open) return;
+                this.updateGeneratedImageBaseSize();
+                this.applyGeneratedImageTransform();
+            }, 120);
         }
 
         updateGeneratedImageLightbox() {
@@ -8924,6 +9187,12 @@
             if (this.imageLightboxTitle) {
                 this.imageLightboxTitle.textContent = item.title;
                 this.imageLightboxTitle.title = item.title;
+            }
+            const promptText = this.normalizeConversationText(item.promptText || '');
+            if (this.imageLightboxPromptText) this.imageLightboxPromptText.textContent = promptText;
+            if (this.imageLightboxPromptDetails) {
+                this.imageLightboxPromptDetails.hidden = !promptText;
+                this.imageLightboxPromptDetails.removeAttribute('open');
             }
             if (this.imageLightboxCounter) {
                 this.imageLightboxCounter.textContent = `${this.activeGeneratedImageIndex + 1} / ${this.generatedImages.length}`;
@@ -8994,7 +9263,9 @@
             const button = this.imageLightboxDownloadButton;
             if (button) {
                 button.disabled = true;
-                button.textContent = '正在获取原图…';
+                button.dataset.loading = 'true';
+                button.setAttribute('aria-label', '正在获取这张原图');
+                button.title = '正在获取原图…';
             }
             this.setGeneratedImageStatus(`正在获取第 ${index + 1} 张原图…`);
             const controller = new AbortController();
@@ -9008,7 +9279,9 @@
             } finally {
                 if (button) {
                     button.disabled = false;
-                    button.textContent = '下载这张原图';
+                    delete button.dataset.loading;
+                    button.setAttribute('aria-label', '下载这张原图');
+                    button.title = '下载这张原图';
                 }
             }
         }
