@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.3.0
+// @version      4.4.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -73,6 +73,9 @@
         generatedImageZoomStep: 1.1,
         generatedImageWheelZoomSensitivity: 0.0008,
         generatedImageKeyboardPanStepPx: 72,
+        generatedImageMagnifierSizePx: 184,
+        generatedImageMagnifierZoom: 3,
+        generatedImageMagnifierMaxZoom: 12,
 
         // 一级目录：整段对话中的用户提问；二级目录：当前回答里的 H1/H2。
         enableConversationToc: true,
@@ -590,6 +593,9 @@
             this.imageLightboxTitle = null;
             this.imageLightboxPromptDetails = null;
             this.imageLightboxPromptText = null;
+            this.imageLightboxMagnifierButton = null;
+            this.imageLightboxMagnifier = null;
+            this.imageLightboxMagnifierImage = null;
             this.imageLightboxCounter = null;
             this.imageLightboxZoomOutButton = null;
             this.imageLightboxZoomValue = null;
@@ -722,6 +728,8 @@
             this.generatedImagePinchState = null;
             this.generatedImageViewportResizeObserver = null;
             this.generatedImageViewportFrame = 0;
+            this.generatedImageMagnifierEnabled = false;
+            this.generatedImageMagnifierPointer = null;
 
             // ZIP 附件获取缓存。成功结果在当前对话页面内复用；失败只短期缓存，
             // 避免重复点击“全部 ZIP”时再次等待同一失效端点。
@@ -1031,6 +1039,9 @@
                     <button id="image-lightbox-fit" class="image-lightbox-icon" type="button" aria-label="使图片适应窗口" title="适应窗口（0）">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4.5 4.5 5 5M9.5 6v3.5H6m13.5-5-5 5M18 9.5h-3.5V6m-10 13.5 5-5M6 14.5h3.5V18m10 1.5-5-5M14.5 18v-3.5H18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
                     </button>
+                    <button id="image-lightbox-magnifier-toggle" class="image-lightbox-icon image-lightbox-magnifier-toggle" type="button" aria-label="启用局部放大镜" aria-pressed="false" title="局部放大镜（M）">
+                      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="10.5" cy="10.5" r="2.15" fill="currentColor"/><path d="M15.5 15.5 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                    </button>
                     <span class="image-lightbox-tool-separator" aria-hidden="true"></span>
                     <button id="image-lightbox-locate" class="image-lightbox-icon" type="button" aria-label="定位到网页中的图片" title="定位到网页">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
@@ -1049,6 +1060,9 @@
                 <div class="image-lightbox-stage">
                   <div id="image-lightbox-media" class="image-lightbox-media" tabindex="0" aria-label="图片画布；滚轮与方向键平移，Ctrl 加滚轮缩放，双击切换原始大小与适应窗口">
                     <img id="image-lightbox-image" alt="" draggable="false"/>
+                    <div id="image-lightbox-magnifier" class="image-lightbox-magnifier" aria-hidden="true" hidden>
+                      <img id="image-lightbox-magnifier-image" alt="" draggable="false"/>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1857,6 +1871,10 @@
             overflow-wrap: anywhere;
           }
 
+          .image-card-title[hidden] {
+            display: none;
+          }
+
           .image-lightbox {
             width: min(94vw, 1120px);
             height: min(92vh, 920px);
@@ -1878,7 +1896,8 @@
             width: 100%;
             height: 100%;
             position: relative;
-            display: block;
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr);
             overflow: hidden;
             border-radius: inherit;
             background: #050505;
@@ -1896,21 +1915,31 @@
           }
 
           .image-lightbox-header {
-            position: absolute;
+            position: relative;
             z-index: 3;
-            top: 10px;
-            right: 10px;
-            left: 10px;
             min-width: 0;
+            min-height: 46px;
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 10px;
+            padding: 6px 8px;
+            border: 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.11);
+            background: #111111;
+            color: #ffffff;
+            pointer-events: none;
+          }
+
+          .image-lightbox-shell:fullscreen .image-lightbox-header {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            left: 10px;
+            min-height: 0;
             padding: 0;
             border: 0;
             background: transparent;
-            color: #ffffff;
-            pointer-events: none;
           }
 
           .image-lightbox-identity {
@@ -1934,6 +1963,10 @@
             text-overflow: ellipsis;
             text-shadow: 0 1px 3px rgba(0, 0, 0, 0.96), 0 0 9px rgba(0, 0, 0, 0.78);
             white-space: nowrap;
+          }
+
+          .image-lightbox-title[hidden] {
+            display: none;
           }
 
           .image-lightbox-prompt-details {
@@ -2015,7 +2048,13 @@
             align-items: center;
             justify-content: flex-end;
             gap: 3px;
+            overflow-x: auto;
+            scrollbar-width: none;
             pointer-events: none;
+          }
+
+          .image-lightbox-zoom-tools::-webkit-scrollbar {
+            display: none;
           }
 
           .image-lightbox-tool-separator {
@@ -2080,6 +2119,10 @@
             color: #ffffff;
           }
 
+          .image-lightbox-magnifier-toggle[aria-pressed="true"] {
+            color: #7dd3fc;
+          }
+
           .image-lightbox-icon:disabled {
             cursor: default;
             opacity: 0.35;
@@ -2091,9 +2134,8 @@
           }
 
           .image-lightbox-stage {
-            position: absolute;
+            position: relative;
             z-index: 0;
-            inset: 0;
             min-width: 0;
             min-height: 0;
             display: grid;
@@ -2102,14 +2144,20 @@
             background: rgba(0, 0, 0, 0.92);
           }
 
+          .image-lightbox-shell:fullscreen .image-lightbox-stage {
+            position: absolute;
+            inset: 0;
+          }
+
           .image-lightbox-media {
+            position: relative;
             min-width: 0;
             min-height: 0;
             display: grid;
             place-items: center;
             overflow: hidden;
             outline: 0;
-            cursor: zoom-in;
+            cursor: grab;
             touch-action: none;
             user-select: none;
           }
@@ -2118,15 +2166,15 @@
             box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.72);
           }
 
-          .image-lightbox-media[data-can-pan="true"] {
-            cursor: grab;
+          .image-lightbox-media[data-magnifier="true"] {
+            cursor: crosshair;
           }
 
           .image-lightbox-media[data-panning="true"] {
             cursor: grabbing;
           }
 
-          .image-lightbox-media img {
+          .image-lightbox-media > img {
             width: auto;
             height: auto;
             max-width: none;
@@ -2140,8 +2188,38 @@
             will-change: transform;
           }
 
-          .image-lightbox-media[data-panning="true"] img {
+          .image-lightbox-media[data-panning="true"] > img {
             transition: none;
+          }
+
+          .image-lightbox-magnifier {
+            position: absolute;
+            z-index: 2;
+            width: 184px;
+            height: 184px;
+            overflow: hidden;
+            border: 2px solid rgba(255, 255, 255, 0.88);
+            border-radius: 50%;
+            background: #050505;
+            box-shadow: 0 10px 36px rgba(0, 0, 0, 0.48), inset 0 0 0 1px rgba(0, 0, 0, 0.42);
+            pointer-events: none;
+            contain: layout paint;
+          }
+
+          .image-lightbox-magnifier[hidden] {
+            display: none;
+          }
+
+          .image-lightbox-magnifier > img {
+            position: absolute;
+            max-width: none;
+            max-height: none;
+            display: block;
+            pointer-events: none;
+            transform: none;
+            transform-origin: top left;
+            transition: none;
+            will-change: left, top, width, height;
           }
 
           @media (max-width: 640px) {
@@ -2154,12 +2232,6 @@
             .image-lightbox-zoom-tools {
               gap: 0;
               max-width: calc(100% - 82px);
-              overflow-x: auto;
-              scrollbar-width: none;
-            }
-
-            .image-lightbox-zoom-tools::-webkit-scrollbar {
-              display: none;
             }
 
             .image-lightbox-zoom-tools .image-lightbox-icon {
@@ -2176,10 +2248,15 @@
             }
 
             .image-lightbox-header {
+              gap: 4px;
+              padding: 4px 5px;
+            }
+
+            .image-lightbox-shell:fullscreen .image-lightbox-header {
               top: 6px;
               right: 6px;
               left: 6px;
-              gap: 4px;
+              padding: 0;
             }
 
             .image-lightbox-identity {
@@ -2540,6 +2617,9 @@
             this.imageLightboxTitle = shadow.getElementById('image-lightbox-title');
             this.imageLightboxPromptDetails = shadow.getElementById('image-lightbox-prompt-details');
             this.imageLightboxPromptText = shadow.getElementById('image-lightbox-prompt-text');
+            this.imageLightboxMagnifierButton = shadow.getElementById('image-lightbox-magnifier-toggle');
+            this.imageLightboxMagnifier = shadow.getElementById('image-lightbox-magnifier');
+            this.imageLightboxMagnifierImage = shadow.getElementById('image-lightbox-magnifier-image');
             this.imageLightboxCounter = shadow.getElementById('image-lightbox-counter');
             this.imageLightboxZoomOutButton = shadow.getElementById('image-lightbox-zoom-out');
             this.imageLightboxZoomValue = shadow.getElementById('image-lightbox-zoom-value');
@@ -2681,6 +2761,9 @@
             this.imageLightboxFitButton?.addEventListener('click', () => {
                 this.fitGeneratedImageToViewport();
             });
+            this.imageLightboxMagnifierButton?.addEventListener('click', () => {
+                this.setGeneratedImageMagnifierEnabled(!this.generatedImageMagnifierEnabled);
+            });
             this.imageLightboxFullscreenButton?.addEventListener('click', () => {
                 this.toggleGeneratedImageFullscreen();
             });
@@ -2711,6 +2794,10 @@
             });
             this.imageLightboxMedia?.addEventListener('pointermove', (event) => {
                 this.moveGeneratedImagePan(event);
+                this.trackGeneratedImageMagnifier(event);
+            });
+            this.imageLightboxMedia?.addEventListener('pointerleave', () => {
+                if (!this.generatedImagePointers.size) this.hideGeneratedImageMagnifier(false);
             });
             this.imageLightboxMedia?.addEventListener('pointerup', (event) => {
                 this.endGeneratedImagePan(event);
@@ -2726,6 +2813,7 @@
             });
             this.imageLightboxImage?.addEventListener('load', () => {
                 this.fitGeneratedImageToViewport();
+                this.syncGeneratedImageMagnifierSource();
             });
             this.imageLightboxImage?.addEventListener('dragstart', (event) => event.preventDefault());
             if (typeof ResizeObserver === 'function' && this.imageLightboxMedia && this.imageLightboxImage) {
@@ -4070,6 +4158,7 @@
                     this.updateInlineEndOffset();
                 }
                 if (this.imageLightbox?.open) {
+                    this.hideGeneratedImageMagnifier(true);
                     this.updateGeneratedImageBaseSize();
                     this.clampGeneratedImagePan();
                     this.applyGeneratedImageTransform();
@@ -4120,6 +4209,12 @@
                     event.preventDefault();
                     event.stopPropagation();
                     this.toggleGeneratedImageFullscreen();
+                    return;
+                }
+                if (!isEditing && event.key.toLowerCase() === 'm') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.setGeneratedImageMagnifierEnabled(!this.generatedImageMagnifierEnabled);
                     return;
                 }
                 if (!isEditing && (event.key === 'PageUp' || event.key === 'PageDown')) {
@@ -8696,6 +8791,13 @@
             }
         }
 
+        getGeneratedImageDisplayTitle(item) {
+            return this.pickExplicitGeneratedImageTitle([
+                item?.imageTitle,
+                item?.title,
+            ]);
+        }
+
         renderGeneratedImageGallery() {
             if (!this.imageGalleryList) return;
             const fragment = document.createDocumentFragment();
@@ -8709,14 +8811,19 @@
                 button.className = 'image-card-button';
                 button.dataset.imageIndex = String(index);
                 button.dataset.active = String(index === this.activeGeneratedImageIndex);
+                const displayTitle = this.getGeneratedImageDisplayTitle(item);
                 const promptText = this.normalizeConversationText(item.promptText || '');
-                button.title = promptText ? `${item.title}\n\n对应的用户输入：${promptText}` : item.title;
-                button.setAttribute('aria-label', `查看第 ${index + 1} 张图片：${item.title}`);
+                button.title = promptText
+                    ? `${displayTitle ? `${displayTitle}\n\n` : ''}对应的用户输入：${promptText}`
+                    : displayTitle || `查看第 ${index + 1} 张生成图片`;
+                button.setAttribute('aria-label', displayTitle
+                    ? `查看第 ${index + 1} 张图片：${displayTitle}`
+                    : `查看第 ${index + 1} 张未命名生成图片`);
 
                 const media = document.createElement('span');
                 media.className = 'image-card-media';
                 const image = document.createElement('img');
-                image.alt = item.title;
+                image.alt = displayTitle;
                 image.loading = 'lazy';
                 image.decoding = 'async';
                 const previewUrl = this.getGeneratedImagePreviewUrl(item);
@@ -8739,7 +8846,8 @@
 
                 const title = document.createElement('span');
                 title.className = 'image-card-title';
-                title.textContent = item.title;
+                title.textContent = displayTitle;
+                title.hidden = !displayTitle;
                 button.append(media, title);
                 listItem.appendChild(button);
                 fragment.appendChild(listItem);
@@ -8839,6 +8947,7 @@
 
         closeGeneratedImageLightbox() {
             if (!this.imageLightbox?.open) return;
+            this.setGeneratedImageMagnifierEnabled(false);
             this.cancelGeneratedImagePointerInteraction();
             if (this.isGeneratedImageFullscreen() && typeof document.exitFullscreen === 'function') {
                 document.exitFullscreen().catch(() => { });
@@ -8861,6 +8970,134 @@
         getGeneratedImageZoomStep() {
             const configured = Number(this.config.generatedImageZoomStep);
             return Number.isFinite(configured) ? Math.max(1.01, Math.min(1.5, configured)) : 1.1;
+        }
+
+        getGeneratedImageMagnifierSettings() {
+            const size = Math.max(112, Math.min(320,
+                Number(this.config.generatedImageMagnifierSizePx) || 184));
+            const zoom = Math.max(1.5, Math.min(8,
+                Number(this.config.generatedImageMagnifierZoom) || 3));
+            const maxZoom = Math.max(zoom, Math.min(24,
+                Number(this.config.generatedImageMagnifierMaxZoom) || 12));
+            return { size, zoom, maxZoom };
+        }
+
+        syncGeneratedImageMagnifierSource() {
+            const sourceImage = this.imageLightboxImage;
+            const magnifierImage = this.imageLightboxMagnifierImage;
+            if (!(sourceImage instanceof HTMLImageElement) || !(magnifierImage instanceof HTMLImageElement)) return false;
+            const source = sourceImage.currentSrc || sourceImage.src || '';
+            if (!source) {
+                magnifierImage.removeAttribute('src');
+                return false;
+            }
+            if (magnifierImage.src !== source) magnifierImage.src = source;
+            return true;
+        }
+
+        hideGeneratedImageMagnifier(clearPointer = true) {
+            if (this.imageLightboxMagnifier) this.imageLightboxMagnifier.hidden = true;
+            if (clearPointer) this.generatedImageMagnifierPointer = null;
+        }
+
+        setGeneratedImageMagnifierEnabled(enabled) {
+            this.generatedImageMagnifierEnabled = Boolean(enabled);
+            this.generatedImageMagnifierPointer = null;
+            this.hideGeneratedImageMagnifier(false);
+            if (this.imageLightboxMagnifierButton) {
+                this.imageLightboxMagnifierButton.setAttribute('aria-pressed', String(this.generatedImageMagnifierEnabled));
+                this.imageLightboxMagnifierButton.setAttribute('aria-label',
+                    this.generatedImageMagnifierEnabled ? '关闭局部放大镜' : '启用局部放大镜');
+                this.imageLightboxMagnifierButton.title = this.generatedImageMagnifierEnabled
+                    ? '关闭局部放大镜（M）'
+                    : '局部放大镜（M）';
+            }
+            if (this.imageLightboxMedia) {
+                if (this.generatedImageMagnifierEnabled) this.imageLightboxMedia.dataset.magnifier = 'true';
+                else delete this.imageLightboxMedia.dataset.magnifier;
+            }
+            if (this.generatedImageMagnifierEnabled) {
+                // 启用时恢复全图视图；局部镜片负责显示光标附近的高分辨率细节。
+                this.fitGeneratedImageToViewport();
+                this.syncGeneratedImageMagnifierSource();
+            }
+        }
+
+        trackGeneratedImageMagnifier(event) {
+            if (!this.generatedImageMagnifierEnabled || event?.pointerType === 'touch') return;
+            if (this.generatedImagePointers.size) {
+                this.hideGeneratedImageMagnifier(false);
+                return;
+            }
+            const clientX = Number(event?.clientX);
+            const clientY = Number(event?.clientY);
+            if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
+            this.generatedImageMagnifierPointer = { clientX, clientY };
+            this.updateGeneratedImageMagnifier(clientX, clientY);
+        }
+
+        updateGeneratedImageMagnifier(clientX, clientY) {
+            const media = this.imageLightboxMedia;
+            const sourceImage = this.imageLightboxImage;
+            const magnifier = this.imageLightboxMagnifier;
+            const magnifierImage = this.imageLightboxMagnifierImage;
+            if (!this.generatedImageMagnifierEnabled || !this.imageLightbox?.open ||
+                !(media instanceof HTMLElement) || !(sourceImage instanceof HTMLImageElement) ||
+                !(magnifier instanceof HTMLElement) || !(magnifierImage instanceof HTMLImageElement) ||
+                !sourceImage.naturalWidth || !sourceImage.naturalHeight || !this.syncGeneratedImageMagnifierSource()) {
+                this.hideGeneratedImageMagnifier(false);
+                return false;
+            }
+            const mediaRect = media.getBoundingClientRect();
+            const imageRect = sourceImage.getBoundingClientRect();
+            const x = Number(clientX);
+            const y = Number(clientY);
+            const insideMedia = x >= mediaRect.left && x <= mediaRect.right && y >= mediaRect.top && y <= mediaRect.bottom;
+            const insideImage = x >= imageRect.left && x <= imageRect.right && y >= imageRect.top && y <= imageRect.bottom;
+            if (!insideMedia || !insideImage) {
+                this.hideGeneratedImageMagnifier(false);
+                return false;
+            }
+
+            const settings = this.getGeneratedImageMagnifierSettings();
+            const availableWidth = Math.max(0, mediaRect.width - 16);
+            const availableHeight = Math.max(0, mediaRect.height - 16);
+            const size = Math.min(settings.size, availableWidth, availableHeight);
+            if (size < 72 || imageRect.width <= 0 || imageRect.height <= 0) {
+                this.hideGeneratedImageMagnifier(false);
+                return false;
+            }
+            const localX = x - mediaRect.left;
+            const localY = y - mediaRect.top;
+            const margin = 8;
+            const gap = 18;
+            let left = localX + gap;
+            if (left + size > mediaRect.width - margin) left = localX - size - gap;
+            left = Math.max(margin, Math.min(mediaRect.width - size - margin, left));
+            let top = localY - size / 2;
+            top = Math.max(margin, Math.min(mediaRect.height - size - margin, top));
+            magnifier.style.width = `${size}px`;
+            magnifier.style.height = `${size}px`;
+            magnifier.style.left = `${left}px`;
+            magnifier.style.top = `${top}px`;
+
+            // 至少使用配置倍率；图片被大幅缩小时，尽量提升到接近原始像素级别。
+            const nativePixelZoom = Math.max(
+                sourceImage.naturalWidth / imageRect.width,
+                sourceImage.naturalHeight / imageRect.height,
+            );
+            const scale = Math.min(settings.maxZoom, Math.max(settings.zoom, nativePixelZoom));
+            const contentWidth = Math.max(1, size - 4);
+            const contentHeight = Math.max(1, size - 4);
+            const sourceX = x - imageRect.left;
+            const sourceY = y - imageRect.top;
+            magnifierImage.style.width = `${imageRect.width * scale}px`;
+            magnifierImage.style.height = `${imageRect.height * scale}px`;
+            magnifierImage.style.left = `${contentWidth / 2 - sourceX * scale}px`;
+            magnifierImage.style.top = `${contentHeight / 2 - sourceY * scale}px`;
+            magnifier.dataset.zoom = scale.toFixed(2);
+            magnifier.hidden = false;
+            return true;
         }
 
         updateGeneratedImageBaseSize() {
@@ -8944,6 +9181,10 @@
             if (this.imageLightboxFitButton) this.imageLightboxFitButton.setAttribute('aria-pressed', String(Math.abs(this.generatedImageZoom - 1) < 0.001));
             if (this.imageLightboxActualSizeButton) {
                 this.imageLightboxActualSizeButton.disabled = !image.naturalWidth || !image.naturalHeight;
+            }
+            const pointer = this.generatedImageMagnifierPointer;
+            if (pointer && !this.generatedImagePointers.size) {
+                this.updateGeneratedImageMagnifier(pointer.clientX, pointer.clientY);
             }
         }
 
@@ -9037,6 +9278,7 @@
             const canPan = bounds.x > 0.5 || bounds.y > 0.5;
             if (event.pointerType === 'mouse' && !canPan) return;
             event.preventDefault();
+            this.hideGeneratedImageMagnifier(false);
             try { this.imageLightboxMedia?.setPointerCapture?.(event.pointerId); } catch { }
             this.generatedImagePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
             if (this.generatedImagePointers.size >= 2) {
@@ -9161,6 +9403,7 @@
 
         onGeneratedImageFullscreenChange() {
             const active = this.isGeneratedImageFullscreen();
+            this.hideGeneratedImageMagnifier(true);
             if (this.imageLightboxFullscreenButton) {
                 this.imageLightboxFullscreenButton.setAttribute('aria-pressed', String(active));
                 this.imageLightboxFullscreenButton.setAttribute('aria-label', active ? '退出全屏浏览' : '全屏浏览图片');
@@ -9184,9 +9427,11 @@
                 this.closeGeneratedImageLightbox();
                 return;
             }
+            const displayTitle = this.getGeneratedImageDisplayTitle(item);
             if (this.imageLightboxTitle) {
-                this.imageLightboxTitle.textContent = item.title;
-                this.imageLightboxTitle.title = item.title;
+                this.imageLightboxTitle.textContent = displayTitle;
+                this.imageLightboxTitle.title = displayTitle;
+                this.imageLightboxTitle.hidden = !displayTitle;
             }
             const promptText = this.normalizeConversationText(item.promptText || '');
             if (this.imageLightboxPromptText) this.imageLightboxPromptText.textContent = promptText;
@@ -9198,14 +9443,17 @@
                 this.imageLightboxCounter.textContent = `${this.activeGeneratedImageIndex + 1} / ${this.generatedImages.length}`;
             }
             const previewUrl = this.getGeneratedImagePreviewUrl(item);
+            this.hideGeneratedImageMagnifier(true);
             this.fitGeneratedImageToViewport();
             if (this.imageLightboxImage) {
-                this.imageLightboxImage.alt = item.title;
+                this.imageLightboxImage.alt = displayTitle;
                 if (previewUrl) this.imageLightboxImage.src = previewUrl;
                 else this.imageLightboxImage.removeAttribute('src');
             }
+            this.syncGeneratedImageMagnifierSource();
             if (this.imageLightboxMedia) {
-                this.imageLightboxMedia.setAttribute('aria-label', `${item.title}；滚轮或上下方向键纵向平移，Shift 加滚轮或左右方向键横向平移，Ctrl 加滚轮或加减按钮缩放，Page Up 和 Page Down 切换图片`);
+                const accessibleTitle = displayTitle || `第 ${this.activeGeneratedImageIndex + 1} 张未命名生成图片`;
+                this.imageLightboxMedia.setAttribute('aria-label', `${accessibleTitle}；滚轮或上下方向键纵向平移，Shift 加滚轮或左右方向键横向平移，Ctrl 加滚轮或加减按钮缩放，M 开关局部放大镜，Page Up 和 Page Down 切换图片`);
             }
             const onlyOne = this.generatedImages.length < 2;
             if (this.imageLightboxPreviousButton) this.imageLightboxPreviousButton.disabled = onlyOne;
