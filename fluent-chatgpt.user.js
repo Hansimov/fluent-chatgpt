@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      3.9.0
-// @description  优化长对话渲染，提供稳定的 SPA 会话切换导航、当前回答章节、自愈式全文搜索、默认定位到底部、安全全量加载，以及原始附件与 Artifacts 的离线归档
+// @version      4.0.0
+// @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-start
@@ -58,14 +58,21 @@
         // 半透明背景后的模糊强度。默认关闭，避免固定模糊层增加绘制开销。
         answerTocBackdropBlurPx: 0,
 
-        // 折叠按钮悬停多久后临时展开；光标离开整个面板后多久自动收起。
+        // 折叠态默认只响应明确点击，不因悬浮而展开。拖动手柄与展开按钮使用独立命中区。
+        answerTocExpandOnHover: false,
         answerTocHoverExpandDelayMs: 180,
         answerTocHoverCollapseDelayMs: 220,
+
+        // Image 2.0/2.5（以及兼容的 DALL·E / image_gen）生成图画廊与原图 ZIP。
+        enableGeneratedImageGallery: true,
+        generatedImageTitleMaxLength: 240,
+        generatedImageFilenameMaxLength: 96,
+        generatedImagePreviewConcurrency: 3,
 
         // 一级目录：整段对话中的用户提问；二级目录：当前回答里的 H1/H2。
         enableConversationToc: true,
         hideOfficialConversationToc: true,
-        answerTocInitialView: 'headings', // 可选：'conversation'、'headings'、'search' 或 'export'
+        answerTocInitialView: 'headings', // 可选：'conversation'、'headings'、'images'、'search' 或 'export'
         answerTocRememberView: true,
 
         // 快速搜索：检索当前页面已经挂载的 Assistant 章节与段落。
@@ -554,6 +561,8 @@
             this.host = null;
             this.shadow = null;
             this.launcher = null;
+            this.launcherDragHandle = null;
+            this.launcherExpandButton = null;
             this.panel = null;
             this.list = null;
             this.tocNav = null;
@@ -563,6 +572,20 @@
             this.exportNav = null;
             this.exportView = null;
             this.exportEmptyState = null;
+            this.imageView = null;
+            this.imageGalleryNav = null;
+            this.imageGalleryList = null;
+            this.imageGalleryEmptyState = null;
+            this.imageGalleryStatus = null;
+            this.imageDownloadAllButton = null;
+            this.imageLightbox = null;
+            this.imageLightboxImage = null;
+            this.imageLightboxTitle = null;
+            this.imageLightboxCounter = null;
+            this.imageLightboxPreviousButton = null;
+            this.imageLightboxNextButton = null;
+            this.imageLightboxDownloadButton = null;
+            this.imageLightboxLocateButton = null;
             this.headingEmptyState = null;
             this.conversationEmptyState = null;
             this.conversationTools = null;
@@ -586,10 +609,12 @@
             this.collapseButton = null;
             this.viewConversationButton = null;
             this.viewHeadingsButton = null;
+            this.viewImagesButton = null;
             this.viewSearchButton = null;
             this.viewExportButton = null;
             this.viewConversationCount = null;
             this.viewHeadingsCount = null;
+            this.viewImagesCount = null;
             this.viewSearchCount = null;
             this.viewExportCount = null;
             this.searchView = null;
@@ -665,6 +690,15 @@
             this.conversationApiAssetsByIndex = new Map();
             this.fileDownloadMetadataCache = new Map();
             this.artifactResolutionCache = new Map();
+
+            this.generatedImages = [];
+            this.generatedImageCards = [];
+            this.activeGeneratedImageIndex = -1;
+            this.generatedImageRefreshTimer = 0;
+            this.generatedImageRefreshToken = 0;
+            this.generatedImageDownloadAbortController = null;
+            this.generatedImageDownloadInProgress = false;
+            this.generatedImagePreviewObjectUrls = new Set();
 
             // ZIP 附件获取缓存。成功结果在当前对话页面内复用；失败只短期缓存，
             // 避免重复点击“全部 ZIP”时再次等待同一失效端点。
@@ -746,7 +780,6 @@
             this.dragState = null;
             this.dragFrameId = 0;
             this.pendingDragPoint = null;
-            this.suppressNextLauncherClick = false;
             this.rootStyleBeforeDrag = null;
 
             this.resizeState = null;
@@ -793,6 +826,7 @@
             this.bindMainObserver();
             this.syncOfficialConversationNav();
             this.rebuildConversationToc();
+            this.scheduleGeneratedImageRefresh(0, true);
             this.stableConversationDomSignature = this.getConversationDomSignature();
             this.updateInlineEndOffset();
             this.syncVisibility();
@@ -877,7 +911,12 @@
                 : '';
             const searchEnabled = Boolean(this.config.enableQuickSearch);
             const exportEnabled = Boolean(this.config.enableConversationArchive);
-            const viewColumnCount = 2 + Number(searchEnabled) + Number(exportEnabled);
+            const imageGalleryEnabled = Boolean(this.config.enableGeneratedImageGallery);
+            const imageTabHtml = imageGalleryEnabled
+                ? `<button id="view-images" class="view-tab" type="button" role="tab" data-view="images" aria-selected="false" hidden>
+              <span>图片</span><span id="view-images-count" class="view-count">0</span>
+            </button>`
+                : '';
             const searchTabHtml = searchEnabled
                 ? `<button id="view-search" class="view-tab" type="button" role="tab" data-view="search" aria-selected="false">
               <span>搜索</span><span id="view-search-count" class="view-count">0</span>
@@ -921,6 +960,42 @@
                 <ol id="search-list" class="toc-list"></ol>
               </nav>
             </section>`
+                : '';
+            const imageViewHtml = imageGalleryEnabled
+                ? `<section id="image-view" class="image-view" aria-label="生成图片浏览" hidden>
+              <div class="image-toolbar">
+                <span id="image-gallery-status" class="image-gallery-status" aria-live="polite">正在识别生成图片…</span>
+                <button id="image-download-all" class="tool-button" data-primary="true" type="button" title="按网页顺序将全部原图打包为 ZIP">全部原图 ZIP</button>
+              </div>
+              <nav id="image-gallery-nav" class="toc-nav image-gallery-nav" aria-label="生成图片画廊">
+                <div id="image-gallery-empty" class="empty-state">暂未找到生成图片</div>
+                <ol id="image-gallery-list" class="image-gallery-grid"></ol>
+              </nav>
+            </section>
+            <dialog id="image-lightbox" class="image-lightbox" aria-label="生成图片预览">
+              <div class="image-lightbox-shell">
+                <header class="image-lightbox-header">
+                  <span id="image-lightbox-counter" class="image-lightbox-counter"></span>
+                  <strong id="image-lightbox-title" class="image-lightbox-title"></strong>
+                  <button id="image-lightbox-close" class="image-lightbox-icon" type="button" aria-label="关闭图片预览" title="关闭（Esc）">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                  </button>
+                </header>
+                <div class="image-lightbox-stage">
+                  <button id="image-lightbox-previous" class="image-lightbox-arrow" data-direction="previous" type="button" aria-label="上一张" title="上一张（←）">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  <div class="image-lightbox-media"><img id="image-lightbox-image" alt=""/></div>
+                  <button id="image-lightbox-next" class="image-lightbox-arrow" data-direction="next" type="button" aria-label="下一张" title="下一张（→）">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                </div>
+                <footer class="image-lightbox-actions">
+                  <button id="image-lightbox-locate" class="tool-button" type="button">定位到网页</button>
+                  <button id="image-lightbox-download" class="tool-button" data-primary="true" type="button">下载这张原图</button>
+                </footer>
+              </div>
+            </dialog>`
                 : '';
             const exportViewHtml = exportEnabled
                 ? `<section id="export-view" class="export-view" aria-label="加载与导出" hidden>
@@ -1014,12 +1089,10 @@
 
           .launcher {
             display: inline-flex;
-            min-width: 42px;
             height: 38px;
             align-items: center;
-            justify-content: center;
-            gap: 5px;
-            padding: 0 9px;
+            overflow: hidden;
+            padding: 0;
             border: 1px solid var(--border-light, rgba(0, 0, 0, 0.14));
             border-radius: 12px;
             background: rgba(255, 255, 255, ${launcherOpacity});
@@ -1030,12 +1103,12 @@
             );
             color: var(--text-secondary, #444444);
             box-shadow: 0 6px 22px rgba(0, 0, 0, 0.14);
-            cursor: grab;
             touch-action: none;
             user-select: none;
           }
 
-          .launcher:hover {
+          .launcher:hover,
+          .launcher:focus-within {
             background: rgba(244, 244, 244, ${launcherOpacity});
             background: color-mix(
               in srgb,
@@ -1045,7 +1118,53 @@
             color: var(--text-primary, #161616);
           }
 
-          .launcher:focus-visible,
+          .launcher-drag-handle {
+            width: 27px;
+            height: 100%;
+            display: grid;
+            flex: none;
+            grid-template-columns: repeat(2, 3px);
+            grid-auto-rows: 3px;
+            place-content: center;
+            gap: 3px;
+            border-inline-end: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
+            color: var(--text-tertiary, #777777);
+            cursor: grab;
+          }
+
+          .launcher-drag-handle::before,
+          .launcher-drag-handle::after {
+            width: 3px;
+            height: 3px;
+            border-radius: 50%;
+            background: currentColor;
+            box-shadow: 0 6px currentColor, 0 -6px currentColor;
+            content: "";
+          }
+
+          .launcher-drag-handle:hover {
+            background: color-mix(in srgb, currentColor 8%, transparent);
+            color: var(--text-primary, #161616);
+          }
+
+          .launcher-open-button {
+            height: 100%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            padding: 0 9px 0 8px;
+            border: 0;
+            background: transparent;
+            color: inherit;
+            cursor: pointer;
+          }
+
+          .launcher-open-button:hover {
+            background: color-mix(in srgb, currentColor 9%, transparent);
+          }
+
+          .launcher-open-button:focus-visible,
           .icon-button:focus-visible,
           .view-tab:focus-visible,
           .toc-item:focus-visible,
@@ -1054,7 +1173,7 @@
             outline-offset: 2px;
           }
 
-          .launcher svg,
+          .launcher-open-button svg,
           .icon-button svg {
             width: 17px;
             height: 17px;
@@ -1104,8 +1223,10 @@
 
           .panel[hidden],
           .launcher[hidden],
+          .view-tab[hidden],
           .toc-nav[hidden],
           .search-view[hidden],
+          .image-view[hidden],
           .export-view[hidden],
           .empty-state[hidden],
           .search-clear[hidden] {
@@ -1152,6 +1273,10 @@
 
           :host([data-dragging]) .launcher,
           :host([data-dragging]) .panel-header {
+            cursor: grabbing;
+          }
+
+          :host([data-dragging]) .launcher-drag-handle {
             cursor: grabbing;
           }
 
@@ -1207,7 +1332,7 @@
           .view-tabs {
             display: grid;
             flex: none;
-            grid-template-columns: repeat(${viewColumnCount}, minmax(0, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(54px, 1fr));
             gap: 4px;
             padding: 5px 6px;
             border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
@@ -1219,13 +1344,17 @@
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            gap: 6px;
-            padding: 5px 8px;
+            gap: 3px;
+            padding: 5px 4px;
             border: 0;
             border-radius: 8px;
             background: transparent;
             color: var(--text-secondary, #4a4a4a);
             cursor: pointer;
+          }
+
+          .view-tab > span:first-child {
+            white-space: nowrap;
           }
 
           .view-tab:hover {
@@ -1244,8 +1373,8 @@
           }
 
           .view-count {
-            min-width: 1.6em;
-            padding: 1px 5px;
+            min-width: 1.4em;
+            padding: 1px 4px;
             border-radius: 999px;
             background: color-mix(in srgb, currentColor 10%, transparent);
             font-size: 10px;
@@ -1535,6 +1664,276 @@
             padding-top: 5px;
           }
 
+          .image-view {
+            min-height: 0;
+            display: flex;
+            flex: 1;
+            flex-direction: column;
+          }
+
+          .image-toolbar {
+            min-width: 0;
+            display: flex;
+            flex: none;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 8px;
+            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+          }
+
+          .image-gallery-status {
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+            color: var(--text-tertiary, #777777);
+            font-size: 10.5px;
+            line-height: 1.3;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .image-gallery-nav {
+            padding: 8px;
+          }
+
+          .image-gallery-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+            margin: 0;
+            padding: 0;
+            list-style: none;
+          }
+
+          .image-gallery-card {
+            min-width: 0;
+          }
+
+          .image-card-button {
+            width: 100%;
+            display: block;
+            overflow: hidden;
+            padding: 0;
+            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.13));
+            border-radius: 10px;
+            background: color-mix(in srgb, var(--main-surface-secondary, #f3f3f3) 54%, transparent);
+            color: var(--text-secondary, #444444);
+            text-align: start;
+            cursor: pointer;
+          }
+
+          .image-card-button:hover,
+          .image-card-button[data-active="true"] {
+            border-color: color-mix(in srgb, var(--text-primary, #161616) 34%, transparent);
+            background: var(--main-surface-secondary, var(--bg-secondary, #ededed));
+            color: var(--text-primary, #111111);
+          }
+
+          .image-card-button:focus-visible {
+            outline: 2px solid var(--text-primary, #161616);
+            outline-offset: 2px;
+          }
+
+          .image-card-media {
+            position: relative;
+            aspect-ratio: 1 / 1;
+            display: grid;
+            overflow: hidden;
+            place-items: center;
+            background:
+              linear-gradient(135deg, rgba(127, 127, 127, 0.09), rgba(127, 127, 127, 0.02)),
+              color-mix(in srgb, var(--main-surface-secondary, #f3f3f3) 76%, transparent);
+          }
+
+          .image-card-media img {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: cover;
+          }
+
+          .image-card-media img:not([src]),
+          .image-card-media img[data-load-failed="true"] {
+            display: none;
+          }
+
+          .image-card-placeholder {
+            width: 35%;
+            height: 35%;
+            color: var(--text-tertiary, #777777);
+            opacity: 0.56;
+          }
+
+          .image-card-media img[src] + .image-card-placeholder {
+            display: none;
+          }
+
+          .image-card-media img[data-load-failed="true"] + .image-card-placeholder {
+            display: block;
+          }
+
+          .image-card-order {
+            position: absolute;
+            top: 6px;
+            left: 6px;
+            min-width: 24px;
+            padding: 2px 5px;
+            border-radius: 999px;
+            background: rgba(0, 0, 0, 0.62);
+            color: #ffffff;
+            font-size: 9.5px;
+            font-variant-numeric: tabular-nums;
+            line-height: 1.2;
+            text-align: center;
+          }
+
+          .image-card-title {
+            min-height: 45px;
+            display: -webkit-box;
+            overflow: hidden;
+            padding: 7px 8px 8px;
+            color: inherit;
+            font-size: 11px;
+            line-height: 1.35;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+            overflow-wrap: anywhere;
+          }
+
+          .image-lightbox {
+            width: min(94vw, 1120px);
+            height: min(92vh, 920px);
+            max-width: none;
+            max-height: none;
+            padding: 0;
+            border: 1px solid rgba(127, 127, 127, 0.28);
+            border-radius: 16px;
+            background: color-mix(in srgb, var(--main-surface-primary, #ffffff) 96%, transparent);
+            color: var(--text-primary, #161616);
+            box-shadow: 0 24px 90px rgba(0, 0, 0, 0.42);
+          }
+
+          .image-lightbox::backdrop {
+            background: rgba(0, 0, 0, 0.76);
+          }
+
+          .image-lightbox-shell {
+            width: 100%;
+            height: 100%;
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr) auto;
+          }
+
+          .image-lightbox-header {
+            min-width: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
+          }
+
+          .image-lightbox-counter {
+            flex: none;
+            color: var(--text-tertiary, #777777);
+            font-size: 11px;
+            font-variant-numeric: tabular-nums;
+          }
+
+          .image-lightbox-title {
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1.35;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .image-lightbox-icon,
+          .image-lightbox-arrow {
+            display: grid;
+            flex: none;
+            place-items: center;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: inherit;
+            cursor: pointer;
+          }
+
+          .image-lightbox-icon {
+            width: 34px;
+            height: 34px;
+            border-radius: 9px;
+          }
+
+          .image-lightbox-icon:hover,
+          .image-lightbox-arrow:hover:not(:disabled) {
+            background: color-mix(in srgb, currentColor 10%, transparent);
+          }
+
+          .image-lightbox-icon svg,
+          .image-lightbox-arrow svg {
+            width: 21px;
+            height: 21px;
+          }
+
+          .image-lightbox-stage {
+            min-width: 0;
+            min-height: 0;
+            display: grid;
+            grid-template-columns: 52px minmax(0, 1fr) 52px;
+            align-items: stretch;
+            background: rgba(0, 0, 0, 0.92);
+          }
+
+          .image-lightbox-arrow {
+            width: 100%;
+            color: #ffffff;
+          }
+
+          .image-lightbox-arrow:disabled {
+            cursor: default;
+            opacity: 0.25;
+          }
+
+          .image-lightbox-media {
+            min-width: 0;
+            min-height: 0;
+            display: grid;
+            place-items: center;
+            overflow: hidden;
+          }
+
+          .image-lightbox-media img {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: contain;
+          }
+
+          .image-lightbox-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 7px;
+            padding: 9px 12px;
+            border-top: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
+          }
+
+          @media (max-width: 640px) {
+            .image-lightbox {
+              width: calc(100vw - 12px);
+              height: calc(100vh - 12px);
+              border-radius: 12px;
+            }
+
+            .image-lightbox-stage {
+              grid-template-columns: 42px minmax(0, 1fr) 42px;
+            }
+          }
+
           .search-view {
             min-height: 0;
             display: flex;
@@ -1769,6 +2168,9 @@
             .panel-header,
             .view-tabs,
             .search-toolbar,
+            .image-toolbar,
+            .image-lightbox-header,
+            .image-lightbox-actions,
             .conversation-tools {
               border-bottom-color: rgba(255, 255, 255, 0.11);
             }
@@ -1782,21 +2184,22 @@
           }
         </style>
 
-        <button
+        <div
           id="launcher"
           class="launcher"
-          type="button"
-          aria-label="展开导航目录"
-          aria-expanded="false"
-          title="悬停临时展开；在目录中点击、拖动或缩放后保持展开（Alt+Shift+O）"
+          role="group"
+          aria-label="导航目录快捷控件"
           hidden
         >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M5 6h14M5 12h14M5 18h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-          </svg>
-          <span id="launcher-mode" class="launcher-mode">章</span>
-          <span id="launcher-count" class="launcher-count">0</span>
-        </button>
+          <span id="launcher-drag-handle" class="launcher-drag-handle" aria-label="拖动导航控件" title="按住此手柄拖动；不会展开"></span>
+          <button id="launcher-expand-button" class="launcher-open-button" type="button" aria-label="展开导航目录" aria-expanded="false" title="点击展开导航目录（Alt+Shift+O）">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 6h14M5 12h14M5 18h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+            <span id="launcher-mode" class="launcher-mode">章</span>
+            <span id="launcher-count" class="launcher-count">0</span>
+          </button>
+        </div>
 
         <aside id="panel" class="panel" aria-label="ChatGPT 导航目录" hidden>
           <div class="panel-header" title="拖动标题栏可移动目录">
@@ -1825,6 +2228,7 @@
             <button id="view-headings" class="view-tab" type="button" role="tab" data-view="headings" aria-selected="true">
               <span>章节</span><span id="view-headings-count" class="view-count">0</span>
             </button>
+            ${imageTabHtml}
             ${searchTabHtml}
             ${exportTabHtml}
           </div>
@@ -1841,6 +2245,8 @@
 
           ${searchViewHtml}
 
+          ${imageViewHtml}
+
           ${exportViewHtml}
 
           <span class="resize-handle" aria-hidden="true" data-resize-corner="top-left"></span>
@@ -1855,6 +2261,8 @@
             this.host = host;
             this.shadow = shadow;
             this.launcher = shadow.getElementById('launcher');
+            this.launcherDragHandle = shadow.getElementById('launcher-drag-handle');
+            this.launcherExpandButton = shadow.getElementById('launcher-expand-button');
             this.panel = shadow.getElementById('panel');
             this.list = shadow.getElementById('toc-list');
             this.tocNav = shadow.getElementById('heading-nav');
@@ -1864,6 +2272,20 @@
             this.exportNav = shadow.getElementById('export-nav');
             this.exportView = shadow.getElementById('export-view');
             this.exportEmptyState = shadow.getElementById('export-empty');
+            this.imageView = shadow.getElementById('image-view');
+            this.imageGalleryNav = shadow.getElementById('image-gallery-nav');
+            this.imageGalleryList = shadow.getElementById('image-gallery-list');
+            this.imageGalleryEmptyState = shadow.getElementById('image-gallery-empty');
+            this.imageGalleryStatus = shadow.getElementById('image-gallery-status');
+            this.imageDownloadAllButton = shadow.getElementById('image-download-all');
+            this.imageLightbox = shadow.getElementById('image-lightbox');
+            this.imageLightboxImage = shadow.getElementById('image-lightbox-image');
+            this.imageLightboxTitle = shadow.getElementById('image-lightbox-title');
+            this.imageLightboxCounter = shadow.getElementById('image-lightbox-counter');
+            this.imageLightboxPreviousButton = shadow.getElementById('image-lightbox-previous');
+            this.imageLightboxNextButton = shadow.getElementById('image-lightbox-next');
+            this.imageLightboxDownloadButton = shadow.getElementById('image-lightbox-download');
+            this.imageLightboxLocateButton = shadow.getElementById('image-lightbox-locate');
             this.headingEmptyState = shadow.getElementById('heading-empty');
             this.conversationEmptyState = shadow.getElementById('conversation-empty');
             this.conversationTools = shadow.getElementById('conversation-tools');
@@ -1887,10 +2309,12 @@
             this.collapseButton = shadow.getElementById('collapse-button');
             this.viewConversationButton = shadow.getElementById('view-conversation');
             this.viewHeadingsButton = shadow.getElementById('view-headings');
+            this.viewImagesButton = shadow.getElementById('view-images');
             this.viewSearchButton = shadow.getElementById('view-search');
             this.viewExportButton = shadow.getElementById('view-export');
             this.viewConversationCount = shadow.getElementById('view-conversation-count');
             this.viewHeadingsCount = shadow.getElementById('view-headings-count');
+            this.viewImagesCount = shadow.getElementById('view-images-count');
             this.viewSearchCount = shadow.getElementById('view-search-count');
             this.viewExportCount = shadow.getElementById('view-export-count');
             this.searchView = shadow.getElementById('search-view');
@@ -1917,18 +2341,14 @@
                 this.setPanelSize(this.savedSize.width, this.savedSize.height, false);
             }
 
-            this.launcher.addEventListener('pointerenter', this.onLauncherPointerEnter);
-            this.launcher.addEventListener('pointerleave', this.onLauncherPointerLeave);
-            this.launcher.addEventListener('pointerdown', (event) => {
+            if (this.config.answerTocExpandOnHover === true) {
+                this.launcher.addEventListener('pointerenter', this.onLauncherPointerEnter);
+                this.launcher.addEventListener('pointerleave', this.onLauncherPointerLeave);
+            }
+            this.launcherDragHandle?.addEventListener('pointerdown', (event) => {
                 this.beginDrag(event, 'launcher');
             });
-            this.launcher.addEventListener('click', (event) => {
-                if (this.suppressNextLauncherClick) {
-                    event.preventDefault();
-                    event.stopImmediatePropagation();
-                    this.suppressNextLauncherClick = false;
-                    return;
-                }
+            this.launcherExpandButton?.addEventListener('click', () => {
                 this.setCollapsed(false, { source: 'click', persist: true });
             });
 
@@ -1954,6 +2374,10 @@
             this.viewHeadingsButton?.addEventListener('click', () => {
                 this.setActiveView('headings', true);
             });
+            this.viewImagesButton?.addEventListener('click', () => {
+                this.setActiveView('images', true);
+                this.hydrateGeneratedImagePreviews();
+            });
             this.viewSearchButton?.addEventListener('click', () => {
                 this.setActiveView('search', true, { focusSearch: true });
             });
@@ -1965,6 +2389,35 @@
             this.searchInput?.addEventListener('keydown', this.onSearchKeyDown);
             this.searchClearButton?.addEventListener('click', () => {
                 this.clearSearchQuery(true);
+            });
+            this.imageGalleryList?.addEventListener('click', (event) => {
+                const button = event.target instanceof Element
+                    ? event.target.closest('button[data-image-index]')
+                    : null;
+                if (!(button instanceof HTMLButtonElement)) return;
+                const index = Number.parseInt(button.dataset.imageIndex ?? '', 10);
+                if (Number.isInteger(index)) this.openGeneratedImageLightbox(index);
+            });
+            this.imageDownloadAllButton?.addEventListener('click', () => {
+                this.downloadAllGeneratedImagesZip();
+            });
+            shadow.getElementById('image-lightbox-close')?.addEventListener('click', () => {
+                this.closeGeneratedImageLightbox();
+            });
+            this.imageLightboxPreviousButton?.addEventListener('click', () => {
+                this.stepGeneratedImageLightbox(-1);
+            });
+            this.imageLightboxNextButton?.addEventListener('click', () => {
+                this.stepGeneratedImageLightbox(1);
+            });
+            this.imageLightboxDownloadButton?.addEventListener('click', () => {
+                this.downloadGeneratedImage(this.activeGeneratedImageIndex);
+            });
+            this.imageLightboxLocateButton?.addEventListener('click', () => {
+                this.locateGeneratedImage(this.activeGeneratedImageIndex);
+            });
+            this.imageLightbox?.addEventListener('click', (event) => {
+                if (event.target === this.imageLightbox) this.closeGeneratedImageLightbox();
             });
             this.searchList?.addEventListener('click', (event) => {
                 const button = event.target instanceof Element
@@ -2212,6 +2665,11 @@
             ) {
                 fallback = 'search';
             } else if (
+                this.config.answerTocInitialView === 'images' &&
+                this.config.enableGeneratedImageGallery
+            ) {
+                fallback = 'images';
+            } else if (
                 this.config.answerTocInitialView === 'export' &&
                 this.config.enableConversationArchive
             ) {
@@ -2223,6 +2681,7 @@
                 const stored = localStorage.getItem('cgpt-answer-toc-view-v1');
                 if (stored === 'conversation' || stored === 'headings') return stored;
                 if (stored === 'search' && this.config.enableQuickSearch) return stored;
+                if (stored === 'images' && this.config.enableGeneratedImageGallery) return stored;
                 if (stored === 'export' && this.config.enableConversationArchive) return stored;
             } catch {
                 // 忽略存储不可用的情况。
@@ -2247,6 +2706,8 @@
                 nextView = 'conversation';
             } else if (view === 'search' && this.config.enableQuickSearch) {
                 nextView = 'search';
+            } else if (view === 'images' && this.config.enableGeneratedImageGallery) {
+                nextView = 'images';
             } else if (view === 'export' && this.config.enableConversationArchive) {
                 nextView = 'export';
             }
@@ -2255,6 +2716,7 @@
             if (nextView === this.activeView) {
                 this.applyActiveView();
                 if (nextView === 'search') this.scheduleQuickSearch(0);
+                if (nextView === 'images') this.hydrateGeneratedImagePreviews();
                 if (shouldFocusSearch) {
                     window.requestAnimationFrame(() => this.searchInput?.focus());
                 }
@@ -2266,6 +2728,7 @@
             this.applyActiveView();
             this.updateViewMeta();
             if (nextView === 'search') this.scheduleQuickSearch(0);
+            if (nextView === 'images') this.hydrateGeneratedImagePreviews();
 
             window.requestAnimationFrame(() => {
                 const { nav, button } = this.getActiveViewNavigation();
@@ -2280,24 +2743,29 @@
             const conversationActive = this.activeView === 'conversation';
             const headingsActive = this.activeView === 'headings';
             const searchActive = this.activeView === 'search' && this.config.enableQuickSearch;
+            const imagesActive = this.activeView === 'images' && this.config.enableGeneratedImageGallery;
             const exportActive = this.activeView === 'export' && this.config.enableConversationArchive;
             this.conversationNav.hidden = !conversationActive;
             this.tocNav.hidden = !headingsActive;
             if (this.searchView) this.searchView.hidden = !searchActive;
+            if (this.imageView) this.imageView.hidden = !imagesActive;
             if (this.exportView) this.exportView.hidden = !exportActive;
             this.viewConversationButton?.setAttribute('aria-selected', String(conversationActive));
             this.viewHeadingsButton?.setAttribute('aria-selected', String(headingsActive));
             this.viewSearchButton?.setAttribute('aria-selected', String(searchActive));
+            this.viewImagesButton?.setAttribute('aria-selected', String(imagesActive));
             this.viewExportButton?.setAttribute('aria-selected', String(exportActive));
             this.viewConversationButton?.setAttribute('tabindex', conversationActive ? '0' : '-1');
             this.viewHeadingsButton?.setAttribute('tabindex', headingsActive ? '0' : '-1');
             this.viewSearchButton?.setAttribute('tabindex', searchActive ? '0' : '-1');
+            this.viewImagesButton?.setAttribute('tabindex', imagesActive ? '0' : '-1');
             this.viewExportButton?.setAttribute('tabindex', exportActive ? '0' : '-1');
         }
 
         updateViewMeta() {
             const conversationCount = this.conversationItems.length;
             const headingCount = this.headings.length;
+            const imageCount = this.generatedImages.length;
             const searchCount = this.searchTotalMatches;
             const maxSearchResults = Math.max(
                 1,
@@ -2312,20 +2780,29 @@
             const archiveSelected = this.selectedConversationIndices.size;
             const conversationActive = this.activeView === 'conversation';
             const searchActive = this.activeView === 'search';
+            const imagesActive = this.activeView === 'images';
             const exportActive = this.activeView === 'export';
             const activeCount = conversationActive
                 ? String(conversationCount)
                 : searchActive
                     ? searchCountLabel
-                    : exportActive
-                        ? String(archiveSelected || archiveLoaded)
-                        : String(headingCount);
+                    : imagesActive
+                        ? String(imageCount)
+                        : exportActive
+                            ? String(archiveSelected || archiveLoaded)
+                            : String(headingCount);
 
             if (this.viewConversationCount) {
                 this.viewConversationCount.textContent = String(conversationCount);
             }
             if (this.viewHeadingsCount) {
                 this.viewHeadingsCount.textContent = String(headingCount);
+            }
+            if (this.viewImagesCount) {
+                this.viewImagesCount.textContent = String(imageCount);
+            }
+            if (this.viewImagesButton) {
+                this.viewImagesButton.hidden = imageCount === 0;
             }
             if (this.viewSearchCount) {
                 this.viewSearchCount.textContent = searchCountLabel;
@@ -2342,6 +2819,8 @@
                         : this.searchQuery.trim()
                             ? `${searchCount} 项`
                             : '快速搜索';
+                } else if (imagesActive) {
+                    this.countLabel.textContent = `${imageCount} 图`;
                 } else if (exportActive) {
                     this.countLabel.textContent = `缓存 ${archiveLoaded}/${archiveTotal}，已选 ${archiveSelected}`;
                 } else {
@@ -2349,13 +2828,13 @@
                 }
             }
             if (this.launcherMode) {
-                this.launcherMode.textContent = conversationActive ? '问' : searchActive ? '搜' : exportActive ? '导' : '章';
+                this.launcherMode.textContent = conversationActive ? '问' : searchActive ? '搜' : imagesActive ? '图' : exportActive ? '导' : '章';
             }
             if (this.launcherCount) {
                 this.launcherCount.textContent = activeCount;
             }
-            if (this.launcher) {
-                this.launcher.title = `悬停临时展开；在目录中点击、拖动或缩放后保持展开；问答 ${conversationCount}，章节 ${headingCount}，搜索 ${searchCount}，缓存 ${archiveLoaded}/${archiveTotal}（Alt+Shift+F）`;
+            if (this.launcherExpandButton) {
+                this.launcherExpandButton.title = `点击展开；问答 ${conversationCount}，章节 ${headingCount}，图片 ${imageCount}，搜索 ${searchCount}，缓存 ${archiveLoaded}/${archiveTotal}（Alt+Shift+O）`;
             }
             if (this.conversationEmptyState) {
                 this.conversationEmptyState.hidden = conversationCount > 0;
@@ -2380,6 +2859,12 @@
                 return {
                     nav: this.searchNav,
                     button: this.searchResultButtons[this.activeSearchResultIndex] || null,
+                };
+            }
+            if (this.activeView === 'images') {
+                return {
+                    nav: this.imageGalleryNav,
+                    button: this.generatedImageCards[this.activeGeneratedImageIndex] || null,
                 };
             }
             if (this.activeView === 'export') {
@@ -2611,6 +3096,7 @@
             this.launcherHovered = true;
             this.cancelHoverCollapse();
             if (
+                this.config.answerTocExpandOnHover !== true ||
                 !this.collapsed ||
                 this.dragState ||
                 this.resizeState ||
@@ -2684,6 +3170,7 @@
 
             this.cancelHoverExpand();
             this.cancelHoverCollapse();
+            if (nextCollapsed) this.closeGeneratedImageLightbox();
 
             if (!nextCollapsed && source === 'hover') {
                 this.transientHoverOpen = true;
@@ -2733,7 +3220,7 @@
 
             this.launcher.hidden = !this.collapsed;
             this.panel.hidden = this.collapsed;
-            this.launcher.setAttribute('aria-expanded', String(!this.collapsed));
+            this.launcherExpandButton?.setAttribute('aria-expanded', String(!this.collapsed));
         }
 
         beginDrag(event, source) {
@@ -2871,34 +3358,8 @@
             this.rootStyleBeforeDrag = null;
             this.dragState = null;
 
-            const launcherActivation =
-                state.source === 'launcher' &&
-                !state.moved &&
-                !cancelled;
-
-            if (launcherActivation) {
-                /*
-                 * launcher 的 pointerdown 同时承担拖动起点，并调用了 preventDefault。
-                 * 某些 Chromium/React 组合不会再派发可靠的 click；在 pointerup 这里
-                 * 直接按“点击展开”处理，且明确退出 hover 临时展开状态。
-                 */
-                this.suppressNextLauncherClick = true;
-                this.setCollapsed(false, { source: 'click', persist: true });
-                window.setTimeout(() => {
-                    this.suppressNextLauncherClick = false;
-                }, 0);
-                return;
-            }
-
             if (state.moved && !cancelled) {
                 this.ensureManualPositionInViewport(true);
-
-                if (state.source === 'launcher') {
-                    this.suppressNextLauncherClick = true;
-                    window.setTimeout(() => {
-                        this.suppressNextLauncherClick = false;
-                    }, 0);
-                }
             }
 
             this.resumeTransientAutoCollapse(event.clientX, event.clientY);
@@ -3301,6 +3762,21 @@
                 }
             }
 
+            if (this.imageLightbox?.open) {
+                if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.stepGeneratedImageLightbox(event.key === 'ArrowLeft' ? -1 : 1);
+                    return;
+                }
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.closeGeneratedImageLightbox();
+                    return;
+                }
+            }
+
             if (event.altKey && event.shiftKey && event.code === 'KeyO') {
                 if (!this.host?.hidden) {
                     event.preventDefault();
@@ -3443,6 +3919,7 @@
             this.bindMainObserver();
             this.syncOfficialConversationNav();
             this.rebuildConversationToc();
+            this.scheduleGeneratedImageRefresh(30, true);
             this.updateInlineEndOffset();
             this.requestFrame(true);
             this.scheduleBottomPin('route-ready');
@@ -3483,6 +3960,7 @@
             this.conversationApiAssetsByIndex.clear();
             this.fileDownloadMetadataCache.clear();
             this.artifactResolutionCache.clear();
+            this.resetGeneratedImageGallery();
             this.assetBinaryCache.clear();
             this.assetBinaryCacheBytes = 0;
             this.assetFailureCache.clear();
@@ -3525,6 +4003,7 @@
             });
             this.markSearchIndexDirty(false);
             this.scheduleConversationRebuild(60);
+            this.scheduleGeneratedImageRefresh(100, true);
         }
 
         nodeMatchesOrContains(node, selector) {
@@ -3546,6 +4025,7 @@
             let assistantAdded = false;
             let conversationChanged = false;
             let searchContentChanged = false;
+            let imageContentChanged = false;
 
             for (const record of records) {
                 if (
@@ -3554,6 +4034,11 @@
                     this.currentAnswer.contains(record.target)
                 ) {
                     searchContentChanged = true;
+                    if ([...record.addedNodes, ...record.removedNodes].some((node) =>
+                        this.nodeMatchesOrContains(node, 'img, picture, [data-testid*="image" i]')
+                    )) {
+                        imageContentChanged = true;
+                    }
                     continue;
                 }
 
@@ -3561,11 +4046,15 @@
                     if (this.nodeMatchesOrContains(node, '[data-message-author-role="assistant"]')) {
                         assistantAdded = true;
                         searchContentChanged = true;
+                        imageContentChanged = true;
                     } else if (
                         node instanceof Text &&
                         node.parentElement?.closest?.('[data-message-author-role="assistant"]')
                     ) {
                         searchContentChanged = true;
+                    }
+                    if (this.nodeMatchesOrContains(node, 'img, picture, [data-testid*="image" i]')) {
+                        imageContentChanged = true;
                     }
                     if (
                         this.nodeMatchesOrContains(node, '[data-message-author-role="user"]') ||
@@ -3586,6 +4075,7 @@
             if (searchContentChanged) this.markSearchIndexDirty(true);
             if (conversationChanged) this.scheduleConversationRebuild();
             if (assistantAdded) this.requestFrame(true);
+            if (imageContentChanged) this.scheduleGeneratedImageRefresh(180, false);
         }
 
         requestFrame(forceAnswerDetection) {
@@ -6680,6 +7170,100 @@
             return 'file';
         }
 
+        normalizeGeneratedImageTitle(value) {
+            let text = String(value || '').trim();
+            if (!text) return '';
+            text = text
+                .replace(/^\s*(?:title|image title|标题|图片标题)\s*[:：]\s*/i, '')
+                .replace(/^\s*(?:已生成(?:的)?(?:图片|图像)|generated image)\s*[:：-]\s*/i, '')
+                .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+                .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+                .replace(/^[#>*`_~\s]+|[#>*`_~\s]+$/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            const maxLength = Math.max(40, Number(this.config.generatedImageTitleMaxLength) || 240);
+            return text.slice(0, maxLength);
+        }
+
+        isGenericGeneratedImageTitle(value) {
+            const title = this.normalizeGeneratedImageTitle(value);
+            if (!title) return true;
+            const stem = title.replace(/\.(?:png|jpe?g|webp|gif|avif|bmp|tiff?)$/i, '').trim();
+            if (/^(?:generated[-_ ]?)?(?:image|picture|photo|artwork|illustration|图片|图像|(?:已)?生成(?:的)?图片|(?:已)?生成(?:的)?图像)(?:[-_ ]?\d+)?$/i.test(stem)) return true;
+            if (/^(?:file[-_])?[a-z0-9_-]{24,}$/i.test(stem)) return true;
+            if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(stem)) return true;
+            return false;
+        }
+
+        pickGeneratedImageTitle(values, fallback = '生成图像') {
+            for (const value of values || []) {
+                const title = this.normalizeGeneratedImageTitle(value);
+                if (title && !this.isGenericGeneratedImageTitle(title)) return title;
+            }
+            return this.normalizeGeneratedImageTitle(fallback) || '生成图像';
+        }
+
+        getGeneratedImageTitleFromPart(part, message, logicalIndex) {
+            const metadata = part?.metadata && typeof part.metadata === 'object' ? part.metadata : {};
+            const generation = metadata.dalle || metadata.generation || metadata.image_generation ||
+                metadata.imageGeneration || metadata.image_gen || metadata.imageGen || metadata.gpt_image || {};
+            const messageMetadata = message?.metadata && typeof message.metadata === 'object' ? message.metadata : {};
+            const textParts = (Array.isArray(message?.content?.parts) ? message.content.parts : [])
+                .filter((value) => typeof value === 'string' && value.trim());
+            const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
+            return this.pickGeneratedImageTitle([
+                part?.title,
+                part?.image_title,
+                part?.imageTitle,
+                part?.caption,
+                part?.description,
+                metadata.title,
+                metadata.image_title,
+                metadata.imageTitle,
+                generation.title,
+                generation.image_title,
+                generation.imageTitle,
+                generation.display_name,
+                generation.displayName,
+                generation.caption,
+                generation.name,
+                metadata.caption,
+                generation.revised_prompt,
+                generation.revisedPrompt,
+                generation.prompt,
+                generation.image_description,
+                generation.imageDescription,
+                metadata.prompt,
+                messageMetadata.image_title,
+                messageMetadata.imageTitle,
+                messageMetadata.title,
+                ...textParts,
+                promptRecord?.fullLabel,
+                promptRecord?.label,
+            ], `第 ${logicalIndex + 1} 轮生成图像`);
+        }
+
+        isImageGenerationMessage(message, part = null) {
+            const metadata = part?.metadata && typeof part.metadata === 'object' ? part.metadata : {};
+            if (metadata.dalle || metadata.generation || metadata.image_generation || metadata.imageGeneration ||
+                metadata.image_gen || metadata.imageGen || metadata.gpt_image) {
+                return true;
+            }
+            const messageMetadata = message?.metadata && typeof message.metadata === 'object' ? message.metadata : {};
+            const signal = [
+                message?.author?.name,
+                message?.recipient,
+                message?.content?.content_type,
+                messageMetadata.tool_name,
+                messageMetadata.tool,
+                messageMetadata.model_slug,
+                messageMetadata.default_model_slug,
+                messageMetadata.invoked_plugin?.type,
+                Object.keys(metadata).join(' '),
+            ].filter(Boolean).join(' ');
+            return /(?:dall[-_. ]?e|image[_ -]?(?:gen|generation|creator)|gpt[_ -]?image|image\s*2(?:\.0|\.5)?|text2im)/i.test(signal);
+        }
+
         isLikelyDownloadableAssetReference({
             url = '', keySignal = '', mimeType = '', filename = '', fileId = '', artifactId = '',
             image = false, blob = null, kind = '',
@@ -6721,7 +7305,8 @@
             const add = ({
                 fileId = '', fileIds = [], originalFileId = '', artifactId = '', url = '', alternateUrls = [], originalUrls = [], previewUrls = [],
                 filename = '', originalFilename = '', label = '', mimeType = '', originalMimeType = '', expectedSize = 0,
-                kind = '', image = false, blob = null, sourcePath = '', signal = '', captureMethod = 'conversation-api',
+                kind = '', image = false, generatedImage = false, imageTitle = '', width = 0, height = 0,
+                blob = null, sourcePath = '', signal = '', captureMethod = 'conversation-api',
             } = {}) => {
                 const normalizedUrl = this.normalizeAssetCandidateUrl(url || sourcePath);
                 const fileIdCandidates = [...new Set([
@@ -6790,6 +7375,12 @@
                         existing.filenameHint = this.sanitizeAssetFilename(filename, existing.filenameHint || 'asset');
                     }
                     if (label && (!existing.label || existing.label === '附件' || existing.label === 'Artifact')) existing.label = String(label).trim();
+                    if (generatedImage) existing.generatedImage = true;
+                    if (imageTitle && (!existing.imageTitle || this.isGenericGeneratedImageTitle(existing.imageTitle))) {
+                        existing.imageTitle = this.normalizeGeneratedImageTitle(imageTitle);
+                    }
+                    if (!existing.width && Number(width) > 0) existing.width = Number(width);
+                    if (!existing.height && Number(height) > 0) existing.height = Number(height);
                     if (kind && (existing.kind === 'file' || existing.kind === 'artifact' || !existing.kind)) existing.kind = finalKind;
                     if (captureMethod && /inline|tool|interactive/i.test(captureMethod)) existing.captureMethod = captureMethod;
                     return;
@@ -6813,6 +7404,12 @@
                     mimeType: String(mimeType || inlineBlob?.type || ''),
                     originalMimeType: String(originalMimeType || ''),
                     expectedSize: Number(expectedSize) > 0 ? Number(expectedSize) : 0,
+                    generatedImage: Boolean(generatedImage),
+                    imageTitle: this.normalizeGeneratedImageTitle(imageTitle),
+                    width: Number(width) > 0 ? Number(width) : 0,
+                    height: Number(height) > 0 ? Number(height) : 0,
+                    messageId: String(message.id || ''),
+                    signal: String(signal || messageSignal || ''),
                     byteLength: inlineBlob?.size || 0,
                     blob: inlineBlob,
                     apiDerived: true,
@@ -6919,6 +7516,8 @@
                 if (!part || typeof part !== 'object') continue;
                 const partSignal = `content.parts ${part.content_type || ''} ${part.type || ''} ${part.kind || ''}`;
                 if (part.content_type === 'image_asset_pointer' && part.asset_pointer) {
+                    const generatedImage = this.isImageGenerationMessage(message, part);
+                    const imageTitle = this.getGeneratedImageTitleFromPart(part, message, logicalIndex);
                     add({
                         fileId: this.extractFileIdFromValue(part.asset_pointer, 'asset_pointer'),
                         fileIds: [part.original_file_id, part.source_file_id, part.upload_id, part.file_id, part.asset_pointer].filter(Boolean),
@@ -6928,11 +7527,16 @@
                         previewUrls: [part.preview_url, part.previewUrl, part.thumbnail_url, part.thumbnailUrl, part.url, part.src].filter(Boolean),
                         filename: part.metadata?.file_name || part.metadata?.name || (part.metadata?.dalle ? 'generated-image.png' : 'image.png'),
                         originalFilename: part.metadata?.file_name || part.metadata?.filename || part.metadata?.name || '',
-                        label: part.metadata?.dalle?.prompt || part.metadata?.name || '图片',
+                        label: imageTitle || part.metadata?.name || '图片',
                         mimeType: part.metadata?.mime_type || 'image/png',
                         originalMimeType: part.metadata?.mime_type || '',
-                        expectedSize: Number(part.metadata?.size || part.metadata?.byte_size || part.metadata?.bytes || 0) || 0,
+                        expectedSize: Number(part.size_bytes || part.metadata?.size || part.metadata?.byte_size || part.metadata?.bytes || 0) || 0,
                         image: true,
+                        generatedImage,
+                        imageTitle,
+                        width: Number(part.width || part.metadata?.width || 0) || 0,
+                        height: Number(part.height || part.metadata?.height || 0) || 0,
+                        signal: `${partSignal} ${generatedImage ? 'generated-image' : ''}`,
                     });
                 }
                 const directPayload = this.inferArtifactPayload(part, partSignal, `artifact-${sequence + 1}`);
@@ -6971,6 +7575,10 @@
                     if (!item || typeof item !== 'object') continue;
                     const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata : {};
                     const signal = `${collectionName} ${item.type || ''} ${item.kind || ''} ${item.content_type || ''}`;
+                    const generatedImage = this.isImageGenerationMessage(message, item) || /generated[_ -]?images?/i.test(signal);
+                    const imageTitle = generatedImage
+                        ? this.getGeneratedImageTitleFromPart(item, message, logicalIndex)
+                        : '';
                     const payload = this.inferArtifactPayload(item, signal, `${collectionName}-${sequence + 1}`) ||
                         this.inferArtifactPayload(metadata, signal, `${collectionName}-${sequence + 1}`);
                     const explicitFileEvidence = Boolean(
@@ -7019,13 +7627,17 @@
                         metadata.preview_url, metadata.thumbnail_url, metadata.url].filter(Boolean),
                         filename: item.name || item.file_name || item.filename || item.title || metadata.title || metadata.file_name || '',
                         originalFilename: item.file_name || item.filename || item.name || metadata.file_name || metadata.filename || '',
-                        label: item.title || item.name || item.file_name || metadata.title || '附件',
+                        label: imageTitle || item.title || item.name || item.file_name || metadata.title || '附件',
                         mimeType: item.mime_type || item.content_type || item.media_type || metadata.mime_type || metadata.content_type || payload?.mimeType || '',
                         originalMimeType: item.mime_type || item.media_type || metadata.mime_type || metadata.media_type || '',
                         expectedSize: Number(item.size || item.byte_size || item.bytes || item.content_length || metadata.size || metadata.byte_size || metadata.bytes || 0) || 0,
                         kind: payload?.kind || (/artifact|canvas/i.test(signal) ? 'artifact' : ''),
                         blob: payload?.blob || null,
                         image: /image/i.test(signal) || String(item.mime_type || '').startsWith('image/'),
+                        generatedImage,
+                        imageTitle,
+                        width: Number(item.width || metadata.width || 0) || 0,
+                        height: Number(item.height || metadata.height || 0) || 0,
                         signal,
                         captureMethod: payload ? 'conversation-api-inline-artifact' : 'conversation-api',
                     });
@@ -7073,6 +7685,12 @@
                 value.preview, value.thumbnail, value.src, value.url, value.href].filter((item) => typeof item === 'string');
                 const url = originalUrls[0] || value.content_url || value.contentUrl || value.url || value.href || value.src || value.sandbox_path || value.path || '';
                 const payload = this.inferArtifactPayload(value, signal, filename || `artifact-${sequence + 1}`);
+                const generatedImage = this.isImageGenerationMessage(message, value) && (
+                    /image/i.test(signal) || String(mimeType).startsWith('image/')
+                );
+                const imageTitle = generatedImage
+                    ? this.getGeneratedImageTitleFromPart(value, message, logicalIndex)
+                    : '';
                 const internalOrDownloadUrl = /^(?:sandbox|file-service|sediment|artifact|canvas|canmore|textdoc|document):/i.test(String(url || '')) ||
                     /(?:\/backend-api\/(?:files?|file|artifacts?|canvas|canmore|textdocs?|documents?)\/|\/download(?:[/?#]|$))/i.test(String(url || ''));
                 if (referenceOnlySubtree && !fileId && !artifactId && !payload && !internalOrDownloadUrl) return;
@@ -7088,13 +7706,17 @@
                         previewUrls,
                         filename: filename || payload?.filename || (/image/i.test(signal) ? 'image.png' : artifactId ? 'artifact' : 'attachment'),
                         originalFilename: value.file_name || value.filename || value.name || '',
-                        label: value.title || value.name || filename || (artifactId ? 'Artifact' : /image/i.test(signal) ? '图片' : '附件'),
+                        label: imageTitle || value.title || value.name || filename || (artifactId ? 'Artifact' : /image/i.test(signal) ? '图片' : '附件'),
                         mimeType: mimeType || payload?.mimeType || '',
                         originalMimeType: value.mime_type || value.media_type || '',
                         expectedSize: Number(value.size || value.byte_size || value.bytes || value.content_length || 0) || 0,
                         kind: payload?.kind || (/artifact|canvas|canmore|textdoc/i.test(signal) ? 'artifact' : ''),
                         blob: payload?.blob || null,
                         image: /image/i.test(signal) || String(mimeType).startsWith('image/'),
+                        generatedImage,
+                        imageTitle,
+                        width: Number(value.width || value.pixel_width || 0) || 0,
+                        height: Number(value.height || value.pixel_height || 0) || 0,
                         signal,
                         captureMethod: payload ? 'conversation-api-inline-artifact' : 'conversation-api-recursive',
                     });
@@ -7147,6 +7769,576 @@
                 map.get(logicalIndex).push(...assets);
             }
             return map;
+        }
+
+        resetGeneratedImageGallery() {
+            window.clearTimeout(this.generatedImageRefreshTimer);
+            this.generatedImageRefreshTimer = 0;
+            this.generatedImageRefreshToken += 1;
+            this.generatedImageDownloadAbortController?.abort();
+            this.generatedImageDownloadAbortController = null;
+            this.generatedImageDownloadInProgress = false;
+            for (const url of this.generatedImagePreviewObjectUrls) URL.revokeObjectURL(url);
+            this.generatedImagePreviewObjectUrls.clear();
+            this.closeGeneratedImageLightbox();
+            this.generatedImages = [];
+            this.generatedImageCards = [];
+            this.activeGeneratedImageIndex = -1;
+            if (this.activeView === 'images') this.activeView = 'headings';
+            this.renderGeneratedImageGallery();
+            this.applyActiveView();
+            this.updateViewMeta();
+        }
+
+        scheduleGeneratedImageRefresh(delay = 140, includeApi = false) {
+            if (!this.config.enableGeneratedImageGallery) return;
+            window.clearTimeout(this.generatedImageRefreshTimer);
+            this.generatedImageRefreshTimer = window.setTimeout(() => {
+                this.generatedImageRefreshTimer = 0;
+                this.refreshGeneratedImageGallery(includeApi);
+            }, Math.max(0, Number(delay) || 0));
+        }
+
+        isGeneratedImageAsset(asset) {
+            if (!asset) return false;
+            const imageLike = /image|canvas-image|svg-image/i.test(String(asset.kind || '')) ||
+                /^image\//i.test(String(asset.mimeType || asset.originalMimeType || '')) ||
+                /\.(?:png|jpe?g|webp|gif|avif|bmp|tiff?)(?:$|[?#])/i.test(String(asset.filenameHint || asset.originalFilename || ''));
+            if (!imageLike) return false;
+            if (asset.generatedImage) return true;
+            const signal = [asset.signal, asset.captureMethod, asset.modelSlug].filter(Boolean).join(' ');
+            return /(?:dall[-_. ]?e|image[_ -]?(?:gen|generation)|gpt[_ -]?image|text2im|generated[_ -]?image)/i.test(signal);
+        }
+
+        getGeneratedImagePreviewUrl(asset) {
+            const values = [
+                asset?.previewUrl,
+                ...(asset?.previewUrls || []),
+                asset?.sourceUrl,
+                ...(asset?.alternateUrls || []),
+                ...(asset?.originalUrls || []),
+            ];
+            for (const value of values) {
+                const url = this.normalizeAssetCandidateUrl(value);
+                if (/^(?:https?:|blob:|data:)/i.test(url)) return url;
+            }
+            return '';
+        }
+
+        getGeneratedImageApiItems() {
+            const items = [];
+            let galleryOrder = 0;
+            const entries = [...this.conversationApiAssetsByIndex.entries()]
+                .sort((first, second) => first[0] - second[0]);
+            for (const [logicalIndex, assets] of entries) {
+                for (const asset of assets || []) {
+                    if (!this.isGeneratedImageAsset(asset)) continue;
+                    const duplicate = items.find((item) => this.assetsShareStrongIdentity(item, asset));
+                    if (duplicate) {
+                        this.mergeArchiveAsset(duplicate, asset);
+                        continue;
+                    }
+                    const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
+                    const title = this.pickGeneratedImageTitle([
+                        asset.imageTitle,
+                        asset.label,
+                        promptRecord?.fullLabel,
+                        promptRecord?.label,
+                    ], `第 ${galleryOrder + 1} 张生成图像`);
+                    items.push({
+                        ...asset,
+                        logicalIndex,
+                        generatedImage: true,
+                        title,
+                        imageTitle: title,
+                        previewUrl: this.getGeneratedImagePreviewUrl(asset),
+                        galleryOrder,
+                        apiDerived: true,
+                    });
+                    galleryOrder += 1;
+                }
+            }
+            return items;
+        }
+
+        isLikelyGeneratedImageElement(image, allowLargeContentImages = false) {
+            if (!(image instanceof HTMLImageElement) || !image.isConnected) return false;
+            if (image.closest('[hidden], [aria-hidden="true"], [role="tooltip"], [data-message-actions]')) return false;
+            const source = this.getLargestImageCandidate(image);
+            if (!source) return false;
+            const context = image.closest('figure, [data-testid*="image" i], [class*="image" i]');
+            const signal = [
+                image.getAttribute('alt'),
+                image.getAttribute('title'),
+                image.getAttribute('aria-label'),
+                image.getAttribute('data-testid'),
+                image.className,
+                context?.getAttribute?.('aria-label'),
+                context?.getAttribute?.('data-testid'),
+                context?.className,
+                source,
+            ].filter(Boolean).join(' ');
+            if (/(?:avatar|emoji|favicon|site[-_ ]?icon|domain[-_ ]?icon|logo|profile)/i.test(signal)) return false;
+            if (image.closest('[data-testid*="citation" i], [data-testid*="source" i], [class*="citation" i], [class*="source" i]')) return false;
+            const rect = image.getBoundingClientRect();
+            const width = rect.width > 0
+                ? rect.width
+                : Math.max(Number(image.getAttribute('width')) || 0, image.naturalWidth || 0);
+            const height = rect.height > 0
+                ? rect.height
+                : Math.max(Number(image.getAttribute('height')) || 0, image.naturalHeight || 0);
+            const large = width >= 160 && height >= 120;
+            const explicit = /(?:generated[_ -]?(?:image|picture)|image[_ -]?(?:generation|output|asset)|dall[-_. ]?e|gpt[_ -]?image|生成(?:的)?(?:图片|图像)|创建的?(?:图片|图像))/i.test(signal);
+            const openAiImage = /(?:oaiusercontent\.com|oaistatic\.com|file-service|sediment|\/backend-api\/files?\/)/i.test(source);
+            return large && (explicit || allowLargeContentImages || openAiImage);
+        }
+
+        collectGeneratedImageDomItems(allowLargeContentImages = false) {
+            const items = [];
+            const assistants = this.getAssistantMessageElements();
+            const contextMap = this.buildSearchAssistantContextMap(assistants);
+            const seenElements = new Set();
+            for (const assistant of assistants) {
+                const logicalIndex = contextMap.get(assistant) ?? -1;
+                for (const image of assistant.querySelectorAll('img')) {
+                    if (seenElements.has(image) || !this.isLikelyGeneratedImageElement(image, allowLargeContentImages)) continue;
+                    seenElements.add(image);
+                    const sourceUrl = this.getLargestImageCandidate(image);
+                    const holder = image.closest('figure, [data-testid*="image" i], [class*="image" i]');
+                    const caption = holder?.querySelector?.('figcaption')?.textContent || '';
+                    const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
+                    const explicitTitle = this.pickGeneratedImageTitle([
+                        caption,
+                        image.getAttribute('title'),
+                        image.getAttribute('alt'),
+                        image.getAttribute('aria-label'),
+                        holder?.getAttribute?.('title'),
+                        holder?.getAttribute?.('aria-label'),
+                    ], '');
+                    const title = this.pickGeneratedImageTitle([
+                        explicitTitle,
+                        promptRecord?.fullLabel,
+                        promptRecord?.label,
+                    ], `第 ${items.length + 1} 张生成图像`);
+                    const fileId = this.extractFileIdFromValue(sourceUrl);
+                    const linkUrl = this.normalizeAssetCandidateUrl(image.closest('a[href]')?.getAttribute('href') || '');
+                    items.push({
+                        id: `dom-generated-image-${items.length + 1}`,
+                        logicalIndex,
+                        role: 'assistant',
+                        kind: 'image',
+                        label: title,
+                        title,
+                        imageTitle: title,
+                        generatedImage: true,
+                        sourceUrl,
+                        previewUrl: sourceUrl,
+                        previewUrls: [sourceUrl],
+                        originalUrls: linkUrl && this.isExplicitOriginalAssetUrl(linkUrl) ? [linkUrl] : [],
+                        alternateUrls: linkUrl && linkUrl !== sourceUrl ? [linkUrl] : this.getElementUrlAlternates(image, sourceUrl),
+                        fileId,
+                        fileIdCandidates: fileId ? [fileId] : [],
+                        filenameHint: 'generated-image.png',
+                        mimeType: /^data:([^;,]+)/i.exec(sourceUrl)?.[1] || 'image/png',
+                        element: image,
+                        explicitTitle,
+                        galleryOrder: items.length,
+                        captureMethod: 'dom-generated-image',
+                    });
+                }
+            }
+            return items;
+        }
+
+        mergeGeneratedImageItems(apiItems, domItems) {
+            if (!apiItems.length) return domItems.map((item, index) => ({ ...item, galleryOrder: index }));
+            const merged = apiItems.map((item) => ({ ...item }));
+            const usedApi = new Set();
+            for (const domItem of domItems) {
+                let index = merged.findIndex((apiItem, candidateIndex) =>
+                    !usedApi.has(candidateIndex) && this.assetsShareStrongIdentity(apiItem, domItem)
+                );
+                if (index < 0 && domItem.logicalIndex >= 0) {
+                    index = merged.findIndex((apiItem, candidateIndex) =>
+                        !usedApi.has(candidateIndex) && apiItem.logicalIndex === domItem.logicalIndex
+                    );
+                }
+                if (index < 0) index = merged.findIndex((unused, candidateIndex) => !usedApi.has(candidateIndex));
+                if (index < 0) {
+                    merged.push({ ...domItem, galleryOrder: merged.length });
+                    continue;
+                }
+                usedApi.add(index);
+                const apiItem = merged[index];
+                const domTitle = this.isGenericGeneratedImageTitle(domItem.explicitTitle) ? '' : domItem.explicitTitle;
+                const mergedTitle = this.pickGeneratedImageTitle(
+                    [domTitle, apiItem.imageTitle, apiItem.title, apiItem.label],
+                    apiItem.title,
+                );
+                merged[index] = {
+                    ...apiItem,
+                    element: domItem.element,
+                    previewUrl: domItem.previewUrl || apiItem.previewUrl,
+                    previewUrls: [...new Set([...(domItem.previewUrls || []), ...(apiItem.previewUrls || [])])],
+                    alternateUrls: [...new Set([...(apiItem.alternateUrls || []), ...(domItem.alternateUrls || [])])],
+                    title: mergedTitle,
+                    imageTitle: mergedTitle,
+                };
+            }
+            return merged.map((item, index) => ({ ...item, galleryOrder: index }));
+        }
+
+        async refreshGeneratedImageGallery(includeApi = true) {
+            if (!this.config.enableGeneratedImageGallery) return [];
+            const token = ++this.generatedImageRefreshToken;
+            const routeEpoch = this.routeEpoch;
+            let apiItems = this.getGeneratedImageApiItems();
+            if (includeApi && this.getCurrentConversationId()) {
+                try {
+                    await this.getConversationApiSnapshot();
+                    apiItems = this.getGeneratedImageApiItems();
+                } catch (error) {
+                    console.debug('[ChatGPT 图片画廊] 无法读取结构化图片信息，将使用页面图片：', error);
+                }
+            }
+            if (token !== this.generatedImageRefreshToken || routeEpoch !== this.routeEpoch) return this.generatedImages;
+            const domItems = this.collectGeneratedImageDomItems(apiItems.length > 0);
+            this.generatedImages = this.mergeGeneratedImageItems(apiItems, domItems);
+            this.activeGeneratedImageIndex = this.generatedImages.length
+                ? Math.min(Math.max(0, this.activeGeneratedImageIndex), this.generatedImages.length - 1)
+                : -1;
+            this.renderGeneratedImageGallery();
+            this.updateViewMeta();
+            this.syncVisibility();
+            if (!this.generatedImages.length && this.activeView === 'images') {
+                this.setActiveView('headings', false);
+            } else if (this.activeView === 'images') {
+                this.hydrateGeneratedImagePreviews();
+            }
+            return this.generatedImages;
+        }
+
+        setGeneratedImageStatus(message = '') {
+            if (this.imageGalleryStatus) {
+                this.imageGalleryStatus.textContent = message || `${this.generatedImages.length} 张生成图像 · 标题与网页顺序已保留`;
+                this.imageGalleryStatus.title = this.imageGalleryStatus.textContent;
+            }
+        }
+
+        renderGeneratedImageGallery() {
+            if (!this.imageGalleryList) return;
+            const fragment = document.createDocumentFragment();
+            this.generatedImageCards = [];
+            const digits = Math.max(2, String(this.generatedImages.length).length);
+            this.generatedImages.forEach((item, index) => {
+                const listItem = document.createElement('li');
+                listItem.className = 'image-gallery-card';
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'image-card-button';
+                button.dataset.imageIndex = String(index);
+                button.dataset.active = String(index === this.activeGeneratedImageIndex);
+                button.title = item.title;
+                button.setAttribute('aria-label', `查看第 ${index + 1} 张图片：${item.title}`);
+
+                const media = document.createElement('span');
+                media.className = 'image-card-media';
+                const image = document.createElement('img');
+                image.alt = item.title;
+                image.loading = 'lazy';
+                image.decoding = 'async';
+                const previewUrl = this.getGeneratedImagePreviewUrl(item);
+                if (previewUrl) image.src = previewUrl;
+                image.addEventListener('error', () => {
+                    image.dataset.loadFailed = 'true';
+                    item.previewUrl = '';
+                    item.previewResolutionFailed = false;
+                    this.ensureGeneratedImagePreview(index, true);
+                }, { once: true });
+                const placeholder = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                placeholder.setAttribute('class', 'image-card-placeholder');
+                placeholder.setAttribute('viewBox', '0 0 24 24');
+                placeholder.setAttribute('aria-hidden', 'true');
+                placeholder.innerHTML = '<rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="9" cy="10" r="2" fill="currentColor"/><path d="m5 18 5-5 3 3 2-2 4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>';
+                const order = document.createElement('span');
+                order.className = 'image-card-order';
+                order.textContent = String(index + 1).padStart(digits, '0');
+                media.append(image, placeholder, order);
+
+                const title = document.createElement('span');
+                title.className = 'image-card-title';
+                title.textContent = item.title;
+                button.append(media, title);
+                listItem.appendChild(button);
+                fragment.appendChild(listItem);
+                this.generatedImageCards.push(button);
+            });
+            this.imageGalleryList.replaceChildren(fragment);
+            if (this.imageGalleryEmptyState) this.imageGalleryEmptyState.hidden = this.generatedImages.length > 0;
+            if (this.imageDownloadAllButton) {
+                this.imageDownloadAllButton.disabled = this.generatedImageDownloadInProgress || !this.generatedImages.length;
+                if (!this.generatedImageDownloadInProgress) this.imageDownloadAllButton.textContent = '全部原图 ZIP';
+            }
+            if (!this.generatedImageDownloadInProgress) this.setGeneratedImageStatus();
+        }
+
+        updateGeneratedImagePreviewElements(index, url) {
+            const card = this.generatedImageCards[index];
+            const cardImage = card?.querySelector('img');
+            if (cardImage instanceof HTMLImageElement && url) {
+                cardImage.removeAttribute('data-load-failed');
+                if (cardImage.src !== url) cardImage.src = url;
+            }
+            if (this.imageLightbox?.open && index === this.activeGeneratedImageIndex && this.imageLightboxImage && url) {
+                this.imageLightboxImage.src = url;
+            }
+        }
+
+        async ensureGeneratedImagePreview(index, force = false) {
+            const item = this.generatedImages[index];
+            if (!item) return '';
+            const existing = this.getGeneratedImagePreviewUrl(item);
+            if (existing && !force) return existing;
+            if (item.previewResolutionPromise) return item.previewResolutionPromise;
+            if (item.previewResolutionFailed && !force) return '';
+            const fileId = [...this.getAssetStrongFileIds(item)][0] || '';
+            if (!fileId) {
+                item.previewResolutionFailed = true;
+                return '';
+            }
+            const token = this.generatedImageRefreshToken;
+            const task = this.resolveFileDownloadMetadata(fileId).then((metadata) => {
+                if (token !== this.generatedImageRefreshToken || !metadata) return '';
+                let url = '';
+                if (metadata.blob instanceof Blob) {
+                    url = URL.createObjectURL(metadata.blob);
+                    this.generatedImagePreviewObjectUrls.add(url);
+                } else {
+                    url = this.normalizeAssetCandidateUrl(metadata.downloadUrl || '');
+                }
+                if (url) {
+                    item.previewUrl = url;
+                    item.previewResolutionFailed = false;
+                    this.updateGeneratedImagePreviewElements(index, url);
+                } else {
+                    item.previewResolutionFailed = true;
+                }
+                return url;
+            }).catch((error) => {
+                item.previewResolutionFailed = true;
+                console.debug('[ChatGPT 图片画廊] 无法解析图片预览：', error);
+                return '';
+            }).finally(() => {
+                if (item.previewResolutionPromise === task) item.previewResolutionPromise = null;
+            });
+            item.previewResolutionPromise = task;
+            return task;
+        }
+
+        async hydrateGeneratedImagePreviews() {
+            const indices = this.generatedImages
+                .map((item, index) => ({ item, index }))
+                .filter(({ item }) => !this.getGeneratedImagePreviewUrl(item) && !item.previewResolutionFailed);
+            if (!indices.length) return;
+            const concurrency = Math.max(1, Number(this.config.generatedImagePreviewConcurrency) || 3);
+            try {
+                await this.runBoundedAssetWorkers(indices, concurrency, ({ index }) => this.ensureGeneratedImagePreview(index));
+            } catch {
+                // 单个预览失败只显示占位图，不影响其余图片与原图下载。
+            }
+        }
+
+        openGeneratedImageLightbox(index) {
+            if (!this.generatedImages.length || !this.imageLightbox) return;
+            this.activeGeneratedImageIndex = Math.min(this.generatedImages.length - 1, Math.max(0, index));
+            this.updateGeneratedImageLightbox();
+            if (!this.imageLightbox.open) {
+                try {
+                    this.imageLightbox.showModal();
+                } catch {
+                    this.imageLightbox.setAttribute('open', '');
+                }
+            }
+        }
+
+        closeGeneratedImageLightbox() {
+            if (!this.imageLightbox?.open) return;
+            try {
+                this.imageLightbox.close();
+            } catch {
+                this.imageLightbox.removeAttribute('open');
+            }
+        }
+
+        updateGeneratedImageLightbox() {
+            const item = this.generatedImages[this.activeGeneratedImageIndex];
+            if (!item) {
+                this.closeGeneratedImageLightbox();
+                return;
+            }
+            if (this.imageLightboxTitle) {
+                this.imageLightboxTitle.textContent = item.title;
+                this.imageLightboxTitle.title = item.title;
+            }
+            if (this.imageLightboxCounter) {
+                this.imageLightboxCounter.textContent = `${this.activeGeneratedImageIndex + 1} / ${this.generatedImages.length}`;
+            }
+            const previewUrl = this.getGeneratedImagePreviewUrl(item);
+            if (this.imageLightboxImage) {
+                this.imageLightboxImage.alt = item.title;
+                if (previewUrl) this.imageLightboxImage.src = previewUrl;
+                else this.imageLightboxImage.removeAttribute('src');
+            }
+            const onlyOne = this.generatedImages.length < 2;
+            if (this.imageLightboxPreviousButton) this.imageLightboxPreviousButton.disabled = onlyOne;
+            if (this.imageLightboxNextButton) this.imageLightboxNextButton.disabled = onlyOne;
+            this.generatedImageCards.forEach((card, index) => {
+                card.dataset.active = String(index === this.activeGeneratedImageIndex);
+            });
+            if (!previewUrl) this.ensureGeneratedImagePreview(this.activeGeneratedImageIndex);
+        }
+
+        stepGeneratedImageLightbox(delta) {
+            if (this.generatedImages.length < 2) return;
+            const length = this.generatedImages.length;
+            this.activeGeneratedImageIndex = (this.activeGeneratedImageIndex + Number(delta || 0) + length) % length;
+            this.updateGeneratedImageLightbox();
+        }
+
+        locateGeneratedImage(index) {
+            const item = this.generatedImages[index];
+            if (!item) return;
+            this.closeGeneratedImageLightbox();
+            if (item.element?.isConnected) {
+                item.element.scrollIntoView({ behavior: this.getConversationJumpBehavior(), block: 'center', inline: 'nearest' });
+                this.highlightSearchTarget(item.element);
+                return;
+            }
+            const conversationIndex = this.conversationItems.findIndex((record) => record.logicalIndex === item.logicalIndex);
+            if (conversationIndex >= 0) this.jumpToConversation(conversationIndex);
+        }
+
+        getGeneratedImageDownloadFilename(item, index, total, result = null) {
+            const digits = Math.max(3, String(Math.max(1, total)).length);
+            const prefix = String(index + 1).padStart(digits, '0');
+            const chosenTitle = this.pickGeneratedImageTitle([
+                item?.imageTitle,
+                item?.title,
+                item?.label,
+            ], `生成图像 ${prefix}`);
+            const withoutExtension = chosenTitle.replace(/\.(?:png|jpe?g|webp|gif|avif|bmp|tiff?)$/i, '').trim();
+            const configuredMax = Math.max(32, Number(this.config.generatedImageFilenameMaxLength) || 96);
+            let stem = this.sanitizeAssetFilename(withoutExtension, `生成图像-${prefix}`).slice(0, configuredMax);
+            if (this.isGenericGeneratedImageTitle(stem)) stem = `生成图像-${prefix}`;
+            const extension = this.normalizeAssetExtension(
+                this.getAssetFilenameExtension(result?.resolvedFilename || '') ||
+                this.getMimeExtension(result?.contentType || result?.blob?.type || item?.originalMimeType || item?.mimeType) ||
+                this.getAssetFilenameExtension(item?.originalFilename || item?.filenameHint || '') ||
+                'png',
+            );
+            return `${prefix}-${stem}.${extension || 'png'}`;
+        }
+
+        async downloadGeneratedImage(index) {
+            const item = this.generatedImages[index];
+            if (!item || this.generatedImageDownloadInProgress) return;
+            const button = this.imageLightboxDownloadButton;
+            if (button) {
+                button.disabled = true;
+                button.textContent = '正在获取原图…';
+            }
+            this.setGeneratedImageStatus(`正在获取第 ${index + 1} 张原图…`);
+            const controller = new AbortController();
+            try {
+                const result = await this.fetchArchiveAsset(item, controller.signal);
+                const filename = this.getGeneratedImageDownloadFilename(item, index, this.generatedImages.length, result);
+                this.downloadBlob(result.blob, filename);
+                this.setGeneratedImageStatus(`已下载：${filename}`);
+            } catch (error) {
+                this.setGeneratedImageStatus(`原图下载失败：${error?.message || error}`);
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = '下载这张原图';
+                }
+            }
+        }
+
+        async downloadAllGeneratedImagesZip() {
+            if (this.generatedImageDownloadInProgress) return;
+            this.generatedImageDownloadInProgress = true;
+            this.generatedImageDownloadAbortController = new AbortController();
+            const signal = this.generatedImageDownloadAbortController.signal;
+            if (this.imageDownloadAllButton) {
+                this.imageDownloadAllButton.disabled = true;
+                this.imageDownloadAllButton.textContent = '正在准备…';
+            }
+            try {
+                await this.refreshGeneratedImageGallery(true);
+                const items = [...this.generatedImages];
+                if (!items.length) throw new Error('当前会话没有可下载的生成图片');
+                const results = new Array(items.length);
+                let completed = 0;
+                let totalBytes = 0;
+                const maxZip = Math.max(1, Number(this.config.conversationExportMaxZipBytes) || 0);
+                const concurrency = this.getAdaptiveAssetConcurrency();
+                await this.runBoundedAssetWorkers(items, concurrency, async (item, index) => {
+                    try {
+                        const result = await this.fetchArchiveAsset(item, signal);
+                        if (totalBytes + result.blob.size > maxZip) {
+                            throw new Error(`原图总大小超过 ${Math.round(maxZip / 1024 / 1024)} MiB 限制`);
+                        }
+                        totalBytes += result.blob.size;
+                        results[index] = { item, result };
+                    } catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        results[index] = { item, error };
+                    } finally {
+                        completed += 1;
+                        this.setGeneratedImageStatus(`正在获取原图 ${completed}/${items.length}`);
+                        if (this.imageDownloadAllButton) this.imageDownloadAllButton.textContent = `${completed}/${items.length}`;
+                    }
+                }, signal);
+
+                const zip = new StoredZipBuilder();
+                const failures = [];
+                let included = 0;
+                for (let index = 0; index < results.length; index += 1) {
+                    const entry = results[index];
+                    if (!entry?.result?.blob) {
+                        failures.push(`${String(index + 1).padStart(3, '0')} ${entry?.item?.title || '生成图像'}：${entry?.error?.message || '无法取得原图'}`);
+                        continue;
+                    }
+                    const filename = this.getGeneratedImageDownloadFilename(entry.item, index, items.length, entry.result);
+                    this.setGeneratedImageStatus(`正在写入 ZIP ${index + 1}/${items.length}：${filename}`);
+                    await zip.add(filename, entry.result.blob);
+                    included += 1;
+                }
+                if (!included) throw new Error(failures[0] || '没有成功取得任何原图');
+                if (failures.length) {
+                    await zip.add('_下载失败.txt', new Blob([
+                        `以下 ${failures.length} 张图片未能取得原图：\r\n\r\n${failures.join('\r\n')}`,
+                    ], { type: 'text/plain;charset=utf-8' }));
+                }
+                const zipBlob = zip.build();
+                const title = this.sanitizeExportFilename(this.getConversationExportTitle() || 'ChatGPT-生成图片');
+                this.downloadBlob(zipBlob, `${title}-全部原图-${this.getExportTimestamp()}.zip`);
+                this.setGeneratedImageStatus(failures.length
+                    ? `ZIP 已下载：原图 ${included}/${items.length}，失败 ${failures.length}`
+                    : `ZIP 已下载：${included} 张原图，文件名已按网页顺序排列`);
+            } catch (error) {
+                this.setGeneratedImageStatus(error?.name === 'AbortError'
+                    ? '原图 ZIP 下载已取消'
+                    : `原图 ZIP 下载失败：${error?.message || error}`);
+                if (error?.name !== 'AbortError') console.error('[ChatGPT 图片画廊] 原图 ZIP 下载失败：', error);
+            } finally {
+                this.generatedImageDownloadInProgress = false;
+                this.generatedImageDownloadAbortController = null;
+                if (this.imageDownloadAllButton) {
+                    this.imageDownloadAllButton.disabled = !this.generatedImages.length;
+                    this.imageDownloadAllButton.textContent = '全部原图 ZIP';
+                }
+            }
         }
 
         getAssetStrongFileIds(asset) {
@@ -7256,6 +8448,14 @@
             if (!existing.originalMimeType && incoming.originalMimeType) existing.originalMimeType = incoming.originalMimeType;
             if (!existing.expectedSize && Number(incoming.expectedSize) > 0) existing.expectedSize = Number(incoming.expectedSize);
             if ((!existing.label || existing.label === '附件') && incoming.label) existing.label = incoming.label;
+            existing.generatedImage = existing.generatedImage || incoming.generatedImage;
+            if ((!existing.imageTitle || this.isGenericGeneratedImageTitle(existing.imageTitle)) && incoming.imageTitle) {
+                existing.imageTitle = incoming.imageTitle;
+            }
+            if (!existing.width && Number(incoming.width) > 0) existing.width = Number(incoming.width);
+            if (!existing.height && Number(incoming.height) > 0) existing.height = Number(incoming.height);
+            if (!existing.messageId && incoming.messageId) existing.messageId = incoming.messageId;
+            if (!existing.signal && incoming.signal) existing.signal = incoming.signal;
             existing.apiDerived = existing.apiDerived || incoming.apiDerived;
             existing.captureMethod = existing.captureMethod || incoming.captureMethod || '';
             return existing;
@@ -11783,6 +12983,7 @@
             const hasAnyNavigation =
                 this.conversationItems.length > 0 ||
                 this.headings.length > 0 ||
+                this.generatedImages.length > 0 ||
                 hasSearchableContent;
             this.host.hidden = !this.isViewportEligible() || !hasAnyNavigation;
 
