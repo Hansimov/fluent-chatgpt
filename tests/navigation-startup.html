@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Navigation startup regression</title>
+<style>main { margin: 24px auto; width: 600px; } .sr-only { display: none; }</style>
+<script>
+  window.__CGPT_TOC_TEST_MODE__ = true;
+  window.unsafeWindow = window;
+  window.GM_addStyle = () => {};
+  window.GM_xmlhttpRequest = () => {};
+  window.fixtureFetch = window.fetch.bind(window);
+  // Even a permanently pending metadata request must not hold the navigation UI hostage.
+  window.fetch = () => new Promise(() => {});
+  localStorage.clear();
+</script>
+<script src="/fluent-chatgpt.user.js"></script>
+<body>
+<div id="fixture"><main>
+  <div data-chatgpt-search-unit-key="turn:0:user" data-chatgpt-search-message-ids="user-1">首屏问题</div>
+  <div data-chatgpt-search-unit-key="turn:1:assistant" data-chatgpt-search-message-ids="answer-1">
+    <div data-markdown-text-style="assistant-message"><h2>首屏章节</h2><p>流式 HTML 尚未传输完成。</p></div>
+  </div>
+</main></div>
+<pre id="result">pending</pre>
+<script>
+  const checks = [];
+  const check = (name, pass, details = '') => checks.push({ name, pass: Boolean(pass), details });
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const labels = c => c.conversationItems.map(item => item.fullLabel).join('|');
+  const questions = (text, conversationId = location.pathname.split('/').pop()) => `<main><div data-chatgpt-search-unit-key="turn:0:user" data-chatgpt-search-message-ids="${text}">${text}</div><div data-chatgpt-search-unit-key="turn:1:assistant" data-chatgpt-search-message-ids="${text}-answer"><div data-chatgpt-selection-conversation-id="${conversationId}"><div data-markdown-text-style="assistant-message"><h2>${text}章节</h2><p>正文</p></div></div></div></main>`;
+  let earlyController;
+  // The server keeps this document response open until this callback releases it.
+  setTimeout(() => {
+    earlyController = window.__cgptAnswerTocController;
+    check('fixture really observes an unfinished HTML stream', document.readyState === 'loading', document.readyState);
+    check('panel starts before DOMContentLoaded', earlyController?.host?.isConnected && !earlyController.host.hidden);
+    check('first questions available before response completes', earlyController && labels(earlyController) === '首屏问题');
+    check('first headings available before response completes', earlyController?.headings.some(item => item.fullLabel === '首屏章节'));
+    window.fixtureFetch('/release-stream').catch(error => check('release stream', false, String(error)));
+  }, 250);
+
+  document.addEventListener('DOMContentLoaded', async () => {
+    const c = window.__cgptAnswerTocController;
+    try {
+      check('DOMContentLoaded does not start a second controller', earlyController && c === earlyController);
+      check('only one panel exists', document.querySelectorAll('#cgpt-answer-toc-host').length === 1);
+      c.config = { ...c.config, answerTocOpenConversationAtBottom: false };
+      c.cancelBottomPin();
+      c.clearHeadingRecovery();
+      // Disable polling to prove the real observers handle late mounting and removal.
+      clearInterval(c.healthTimer);
+      clearInterval(c.routeWatchTimer);
+      const requestFrame = window.requestAnimationFrame;
+      let suspendedFrames = 0;
+      window.cancelAnimationFrame(c.frameId);
+      c.frameId = 0;
+      clearTimeout(c.frameFallbackTimer);
+      window.requestAnimationFrame = () => { suspendedFrames++; return 2147483647; };
+      const fixture = document.getElementById('fixture');
+      fixture.replaceChildren();
+      await pause(50);
+      check('missing root stays discoverable without a route-reset loop', !c.mainElement && !c.routeTransitioning);
+      check('conversation panel remains available while messages are loading', c.host.isConnected && !c.host.hidden);
+      fixture.innerHTML = questions('延迟挂载');
+      await pause(240);
+      check('late root binds without 1200ms health polling', c.mainElement === fixture.querySelector('main'));
+      check('late root populates questions promptly', labels(c) === '延迟挂载', labels(c));
+      check('late root populates headings promptly', c.headings.some(item => item.fullLabel === '延迟挂载章节'), JSON.stringify({ headings: c.headings.map(item => item.fullLabel), connected: c.currentAnswer?.isConnected, frame: c.frameId, answer: c.findAnswerAtViewport()?.textContent }));
+      check('heading detection recovers even when animation frames are suspended', suspendedFrames > 0 && c.currentAnswer?.isConnected && c.headings.length > 0);
+      window.requestAnimationFrame = requestFrame;
+      const epoch = c.routeEpoch;
+      fixture.innerHTML = questions('同路由重建');
+      await pause(240);
+      check('same-route remount does not reset route settling', c.routeEpoch === epoch && !c.routeTransitioning);
+      check('same-route remount updates navigation promptly', labels(c).includes('同路由重建'), labels(c));
+      const host = c.host;
+      host.remove();
+      await pause(80);
+      check('hydration-removed host is restored without duplicate listeners', c.host === host && host.isConnected && document.querySelectorAll('#cgpt-answer-toc-host').length === 1);
+
+      // Continuous changes arrive faster than either old trailing-edge debounce.
+      const user = fixture.querySelector('[data-chatgpt-search-unit-key$=":user"]');
+      const heading = fixture.querySelector('h2');
+      const identitySignature = c.getConversationDomSignature();
+      let serial = 0;
+      const streaming = setInterval(() => {
+        user.firstChild.data = `流式问题${++serial}`;
+        heading.firstChild.data = `流式章节${serial}`;
+      }, 20);
+      await pause(420);
+      check('questions refresh during uninterrupted streaming', labels(c).includes('流式问题'), labels(c));
+      check('headings refresh during uninterrupted streaming', c.headings.some(item => item.fullLabel.startsWith('流式章节')), c.headings.map(item => item.fullLabel).join('|'));
+      clearInterval(streaming);
+      await pause(220);
+      check('streaming text does not change stable message identity', c.getConversationDomSignature() === identitySignature);
+
+      const originalRebuild = c.rebuildConversationToc;
+      let runs = 0;
+      c.rebuildConversationToc = () => { runs++; };
+      c.scheduleConversationRebuild(300);
+      c.scheduleConversationRebuild(0);
+      await pause(40);
+      check('urgent rebuild advances an existing deadline', runs === 1, String(runs));
+      c.rebuildConversationToc = originalRebuild;
+
+      c.config = { ...c.config, answerTocRouteSettleMinMs: 80, answerTocRouteSettleQuietMs: 40, answerTocRouteSettleMaxMs: 350 };
+      history.pushState({}, '', '/c/22222222-2222-2222-2222-222222222222');
+      c.checkForRouteChange();
+      check('route transition clears old navigation immediately', c.routeTransitioning && c.conversationItems.length === 0);
+      check('route transition keeps the navigation shell visible', !c.host.hidden);
+      fixture.innerHTML = questions('新会话');
+      // Without a stable message ID, text remains part of the fallback signature.
+      fixture.querySelector('[data-chatgpt-search-unit-key$=":assistant"]').removeAttribute('data-chatgpt-search-message-ids');
+      const churn = setInterval(() => {
+        fixture.querySelector('p').textContent = `正文持续更新${++serial}`;
+        c.scheduleRouteSettleCheck(50);
+      }, 10);
+      await pause(180);
+      check('changing fallback signature really exercises the route deadline', c.routeTransitioning);
+      await pause(370);
+      check('route maximum wait is enforced despite continuous mutations', !c.routeTransitioning);
+      check('new route labels replace old labels while streaming', labels(c) === '新会话', labels(c));
+      clearInterval(churn);
+
+      // React can replace messages before the route watcher runs.
+      fixture.innerHTML = questions('先挂载后检查路由', '33333333-3333-3333-3333-333333333333');
+      history.pushState({}, '', '/c/33333333-3333-3333-3333-333333333333');
+      c.config = { ...c.config, answerTocRouteSettleMaxMs: 1600 };
+      c.checkForRouteChange();
+      const decoration = setInterval(() => fixture.querySelector('p').setAttribute('aria-label', `状态${++serial}`), 10);
+      await pause(400);
+      check('already-mounted new messages do not wait for the route timeout', !c.routeTransitioning && labels(c) === '先挂载后检查路由', labels(c));
+      clearInterval(decoration);
+
+      // A nested scroll root can arrive while the original main is still connected.
+      const nested = document.createElement('div');
+      nested.className = 'thread-scroll-container';
+      nested.innerHTML = questions('后挂载滚动区');
+      fixture.querySelector('main').appendChild(nested);
+      await pause(240);
+      check('new nested root is adopted without waiting for health polling', c.mainElement === nested && labels(c).includes('后挂载滚动区'), labels(c));
+
+      // Timeouts must never re-publish the previous route while the network is slow.
+      c.config = { ...c.config, answerTocRouteSettleMaxMs: 200 };
+      history.pushState({}, '', '/c/44444444-4444-4444-4444-444444444444');
+      c.checkForRouteChange();
+      await pause(360);
+      check('slow route does not re-publish stale messages after timeout', c.routeTransitioning && c.conversationItems.length === 0);
+      fixture.innerHTML = questions('慢路由已加载');
+      await pause(240);
+      check('slow route recovers as soon as its messages arrive', !c.routeTransitioning && labels(c) === '慢路由已加载', labels(c));
+
+      const branchSignature = c.getConversationDomSignature();
+      history.pushState({}, '', '/c/55555555-5555-5555-5555-555555555555');
+      c.checkForRouteChange();
+      fixture.querySelector('[data-chatgpt-selection-conversation-id]').setAttribute('data-chatgpt-selection-conversation-id', '55555555-5555-5555-5555-555555555555');
+      await pause(240);
+      check('branch with identical message IDs resolves by conversation ownership', !c.routeTransitioning && c.getConversationDomSignature() === branchSignature && labels(c) === '慢路由已加载');
+      fixture.querySelector('[data-chatgpt-selection-conversation-id]').removeAttribute('data-chatgpt-selection-conversation-id');
+      history.pushState({}, '', '/c/77777777-7777-7777-7777-777777777777');
+      c.checkForRouteChange();
+      await pause(360);
+      check('legacy equivalent-content route retains a bounded fallback', !c.routeTransitioning && labels(c) === '慢路由已加载');
+
+      // A body replacement also removes both the observed main and the UI host.
+      const replacement = document.createElement('body');
+      replacement.innerHTML = questions('主体重建') + '<pre id="result">pending</pre>';
+      document.body.replaceWith(replacement);
+      await pause(240);
+      check('body replacement restores the same panel', c.host === host && host.parentElement === replacement && !host.hidden);
+      check('body replacement rebinds the conversation', c.mainElement === replacement.querySelector('main') && labels(c).includes('主体重建'), labels(c));
+      history.pushState({}, '', '/');
+      c.checkForRouteChange();
+      replacement.querySelector('main').remove();
+      await pause(550);
+      check('empty home page does not display a permanent loading panel', c.host.hidden);
+      replacement.insertAdjacentHTML('afterbegin', questions('首次提问'));
+      await pause(240);
+      history.pushState({}, '', '/c/66666666-6666-6666-6666-666666666666');
+      c.checkForRouteChange();
+      await pause(240);
+      check('new conversation URL can reuse the just-submitted messages', !c.routeTransitioning && labels(c).includes('首次提问'));
+    } catch (error) {
+      check('unexpected exception', false, error.stack || String(error));
+    }
+    c?.cancelBottomPin();
+    c?.clearHeadingRecovery();
+    c?.mainObserver?.disconnect();
+    c?.pageObserver?.disconnect();
+    const passed = checks.every(item => item.pass);
+    document.documentElement.dataset.testsPassed = String(passed);
+    document.documentElement.dataset.testCount = String(checks.length);
+    document.getElementById('result').textContent = JSON.stringify({ passed, checks }, null, 2);
+  });
+</script>
+<!-- STREAM_END -->
+</body>
+</html>

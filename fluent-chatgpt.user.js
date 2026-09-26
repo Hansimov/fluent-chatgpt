@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.7.0
+// @version      4.7.2
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -14,6 +14,8 @@
 
 (() => {
     'use strict';
+
+    const SCRIPT_VERSION = '4.7.2';
 
     const CONFIG = Object.freeze({
         // 单条回答本身非常长时再开启。默认关闭，兼容性更稳。
@@ -248,7 +250,7 @@
         answerTocBottomPinDurationMs: 3200,
 
         // ChatGPT 是 SPA；切换左侧会话时 URL、消息 DOM、官方 Prompt 导航并非同一帧更新。
-        // 这里用路由世代 + DOM 静默窗口隔离旧会话，防止上一会话的问答数量/标签泄漏到新会话。
+        // 用路由世代 + 消息身份稳定窗口隔离旧会话，不等待图片/流式正文全部停止更新。
         answerTocRouteWatchIntervalMs: 220,
         answerTocRouteSettleQuietMs: 140,
         answerTocRouteSettleMinMs: 260,
@@ -272,13 +274,15 @@
         answerTocMaxHeightPx: 760,
     });
 
-    // 新版 transcript 不再位于 <main> 内。角色选择器也用于 closest 和 CSS 拼接，
+    // 会话入口兼容 main 和独立的 transcript 滚动区。角色选择器也用于 closest 和 CSS 拼接，
     // 必须用 :is() 包裹，避免逗号把后续的后代选择器变成全局匹配。
     const CONVERSATION_ROOT_SELECTOR = '.thread-scroll-container, main, [role="main"]';
     const TRANSCRIPT_SELECTOR = '[class*="transcriptContent-"]';
     const TURN_SELECTOR = ':is([data-testid^="conversation-turn-"], [data-cgpt-turn])';
-    const ASSISTANT_SELECTOR = ':is([data-message-author-role="assistant"], [data-cgpt-message-role="assistant"])';
-    const USER_SELECTOR = ':is([data-message-author-role="user"], [data-cgpt-message-role="user"])';
+    const NATIVE_MESSAGE_SELECTOR = ':is([data-message-author-role="user"], [data-message-author-role="assistant"], [data-chatgpt-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":assistant"])';
+    const ASSISTANT_SELECTOR = ':is([data-message-author-role="assistant"], [data-chatgpt-search-unit-key$=":assistant"], [data-cgpt-message-role="assistant"])';
+    const USER_SELECTOR = ':is([data-message-author-role="user"], [data-chatgpt-search-unit-key$=":user"], [data-cgpt-message-role="user"])';
+    const ANSWER_CONTENT_SELECTOR = '.markdown, [data-message-content], .prose, [data-markdown-text-style="assistant-message"]';
     const GENERATED_IMAGE_CONTAINER_SELECTOR = '[id^="image-"], [class*="imagegen-image" i], [data-testid*="imagegen" i], [class~="group/generated-image-preview"], [class~="group/generated-image-gallery-controls"]';
 
     const LONG_ANSWER_BLOCK_SELECTOR = [
@@ -777,10 +781,12 @@
 
             this.mainElement = null;
             this.mainObserver = null;
+            this.pageObserver = null;
             this.answerObserver = null;
             this.headingTextObserver = null;
 
             this.frameId = 0;
+            this.frameFallbackTimer = 0;
             this.forceAnswerDetection = false;
             this.lastAnswerDetectionAt = 0;
             this.answerDetectionTimer = 0;
@@ -795,13 +801,13 @@
             this.routeEpoch = 0;
             this.routeTransitioning = false;
             this.routeTransitionStartedAt = 0;
-            this.routeTransitionBaseMutationSerial = 0;
             this.routePreviousDomSignature = '';
+            this.routeCandidateDomSignature = '';
+            this.routeCandidateSince = 0;
             this.routeAllowEquivalentDom = false;
             this.stableConversationDomSignature = '';
             this.routeSettleTimer = 0;
             this.mainMutationSerial = 0;
-            this.lastMainMutationAt = performance.now();
 
             this.bottomPinToken = 0;
             this.bottomPinTimers = new Set();
@@ -875,6 +881,7 @@
             if (!document.body) return;
 
             this.createUi();
+            this.bindPageObserver();
             this.bindMainObserver();
             this.syncOfficialConversationNav();
             this.rebuildConversationToc();
@@ -912,11 +919,7 @@
                 if (this.checkForRouteChange()) return;
                 this.lastUrl = location.href;
 
-                if (!this.mainElement?.isConnected) {
-                    this.resetForNavigation(this.currentRouteKey, { force: true, reason: 'main-remount' });
-                    return;
-                }
-                this.bindMainObserver();
+                this.refreshPageBindings();
 
                 if (this.routeTransitioning) {
                     this.scheduleRouteSettleCheck(0);
@@ -931,6 +934,27 @@
             this.scheduleBottomPin('initial');
             this.scheduleHeadingRecovery();
         }
+        bindPageObserver() {
+            // React 可以替换整个 main/body；旧 main 上的 observer 看不到自己的移除。
+            // 常态只检查连接状态和新增子树，不在每次流式输出时扫描整页。
+            this.pageObserver = new MutationObserver((records) => {
+                if (this.host?.isConnected && this.mainElement?.isConnected && !records.some((record) =>
+                    [...record.addedNodes].some((node) => this.nodeMatchesOrContains(node, CONVERSATION_ROOT_SELECTOR))
+                )) return;
+                this.scheduleNavigationTask('rebindTimer', () => this.refreshPageBindings(), 0);
+            });
+            this.pageObserver.observe(document, { childList: true, subtree: true });
+        }
+
+        refreshPageBindings() {
+            if (!document.body) return;
+            if (this.host && !this.host.isConnected) document.body.appendChild(this.host);
+            if (this.checkForRouteChange()) return;
+            // 同一路由重挂载只重绑 DOM，不清空缓存或重新等待整段路由静默窗口。
+            this.bindMainObserver();
+            this.syncVisibility();
+        }
+
         createUi() {
             document.querySelector('#cgpt-answer-toc-host')?.remove();
 
@@ -2629,7 +2653,7 @@
           <div class="panel-header" title="拖动标题栏可移动目录">
             <span class="drag-grip" aria-hidden="true"></span>
             <div class="panel-title-wrap">
-              <span class="panel-title">导航目录</span>
+              <span class="panel-title" title="Fluent ChatGPT v${SCRIPT_VERSION}">导航目录</span>
               <span id="count-label" class="count-label">0 节</span>
             </div>
             <button
@@ -2683,6 +2707,7 @@
             document.body.appendChild(host);
 
             this.host = host;
+            host.dataset.scriptVersion = SCRIPT_VERSION;
             this.shadow = shadow;
             this.launcher = shadow.getElementById('launcher');
             this.launcherDragHandle = shadow.getElementById('launcher-drag-handle');
@@ -3344,12 +3369,16 @@
             }
             if (this.conversationEmptyState) {
                 this.conversationEmptyState.hidden = conversationCount > 0;
+                this.conversationEmptyState.textContent = this.routeTransitioning || !this.mainElement
+                    ? '正在等待会话内容…' : '暂未找到可跳转的提问';
             }
             if (this.exportEmptyState) {
                 this.exportEmptyState.hidden = conversationCount > 0;
             }
             if (this.headingEmptyState) {
                 this.headingEmptyState.hidden = headingCount > 0;
+                this.headingEmptyState.textContent = this.routeTransitioning || !this.currentAnswer
+                    ? '正在等待回答内容…' : '当前回答没有 H1/H2 标题';
             }
             this.updateConversationArchiveUi();
         }
@@ -4405,6 +4434,7 @@
 
         onVisibilityChange() {
             if (!document.hidden) {
+                this.refreshPageBindings();
                 if (this.checkForRouteChange()) return;
                 if (this.routeTransitioning) {
                     this.scheduleRouteSettleCheck(0);
@@ -4455,22 +4485,52 @@
                 .filter((element) => element instanceof HTMLElement && element.isConnected)
                 .slice(-10);
             for (const [index, element] of nodes.entries()) {
-                const role = element.getAttribute('data-message-author-role') || element.dataset.cgptMessageRole || '?';
+                const role = element.getAttribute('data-message-author-role') || element.dataset.cgptMessageRole ||
+                    /:(user|assistant)$/.exec(element.getAttribute('data-chatgpt-search-unit-key') || '')?.[1] || '?';
                 const identity = this.getConversationRecordIdentity(element, index);
-                const text = this.normalizeConversationText(element.textContent || '').slice(0, 96);
+                // 真实消息 ID 已能区分会话；流式正文不应伪装成一次消息身份切换。
+                const text = identity.startsWith('message:') ? ''
+                    : this.normalizeConversationText(element.textContent || '').slice(0, 96);
                 parts.push(`${role}:${identity}:${text}`);
             }
             return parts.join('|');
         }
 
+        getConversationDomRouteState() {
+            const conversationId = this.getCurrentConversationId();
+            if (!conversationId) return 'unknown';
+            const owners = this.queryConversationElements('[data-chatgpt-selection-conversation-id]')
+                .filter((element) => !element.closest('[hidden], [aria-hidden="true"]'))
+                .map((element) => element.getAttribute('data-chatgpt-selection-conversation-id'))
+                .filter(Boolean);
+            if (!owners.length) return 'unknown';
+            if (owners.every((id) => id === conversationId)) return 'current';
+            return owners.includes(conversationId) ? 'mixed' : 'previous';
+        }
+
+        scheduleNavigationTask(timerKey, callback, delay) {
+            // 合并到最早的截止时间，而非每次 mutation 都向后推迟。
+            // 否则流式输出/动画会饿死目录刷新，连路由最大等待时间也无法生效。
+            const wait = Math.max(0, Number(delay) || 0);
+            const dueKey = `${timerKey}DueAt`;
+            const dueAt = performance.now() + wait;
+            if (this[timerKey] && this[dueKey] <= dueAt) return;
+            window.clearTimeout(this[timerKey]);
+            this[dueKey] = dueAt;
+            this[timerKey] = window.setTimeout(() => {
+                this[timerKey] = 0;
+                this[dueKey] = 0;
+                callback();
+            }, wait);
+        }
+
         scheduleRouteSettleCheck(delay = 70) {
-            window.clearTimeout(this.routeSettleTimer);
+            if (!this.routeTransitioning) return;
             const epoch = this.routeEpoch;
-            this.routeSettleTimer = window.setTimeout(() => {
-                this.routeSettleTimer = 0;
+            this.scheduleNavigationTask('routeSettleTimer', () => {
                 if (epoch !== this.routeEpoch) return;
                 this.tryFinishRouteTransition();
-            }, Math.max(0, Number(delay) || 0));
+            }, delay);
         }
 
         tryFinishRouteTransition() {
@@ -4479,24 +4539,33 @@
 
             const now = performance.now();
             const elapsed = now - this.routeTransitionStartedAt;
-            const quietFor = now - this.lastMainMutationAt;
             const quietMs = Math.max(40, Number(this.config.answerTocRouteSettleQuietMs) || 140);
             const minMs = Math.max(80, Number(this.config.answerTocRouteSettleMinMs) || 260);
             const maxMs = Math.max(minMs, Number(this.config.answerTocRouteSettleMaxMs) || 4200);
             const signature = this.getConversationDomSignature();
+            if (signature !== this.routeCandidateDomSignature) {
+                this.routeCandidateDomSignature = signature;
+                this.routeCandidateSince = now;
+            }
+            // 只等消息结构稳定，图片加载、工具状态和逐 token 输出不能延后整张目录。
+            const quietFor = now - this.routeCandidateSince;
             const hasMessages = Boolean(signature);
             const domChanged = Boolean(
                 signature &&
                 (!this.routePreviousDomSignature || signature !== this.routePreviousDomSignature)
             );
-            const mutated = this.mainMutationSerial > this.routeTransitionBaseMutationSerial;
+            const ownership = this.getConversationDomRouteState();
+            const equivalentDomIsCurrent = this.routeAllowEquivalentDom || ownership === 'current';
             const settled = elapsed >= minMs && quietFor >= quietMs && hasMessages && (
-                domChanged || (this.routeAllowEquivalentDom && mutated)
+                domChanged || equivalentDomIsCurrent
             );
             const timedOut = elapsed >= maxMs;
 
-            if (!settled && !timedOut) {
-                this.scheduleRouteSettleCheck(Math.min(160, Math.max(40, quietMs - quietFor + 20)));
+            // 分支可能保留同一组消息 ID；用原生会话归属解除等待。
+            // 旧版无归属属性时保留有界超时后备，不能因内容恰好相同而永久等待。
+            const stillOldMessages = hasMessages && (ownership === 'previous' || ownership === 'mixed');
+            if ((!settled && !timedOut) || stillOldMessages) {
+                this.scheduleRouteSettleCheck(timedOut ? 250 : Math.min(160, Math.max(40, quietMs - quietFor + 20)));
                 return;
             }
 
@@ -4519,16 +4588,18 @@
                 return;
             }
 
-            const previousStableSignature = this.getConversationDomSignature() || this.stableConversationDomSignature;
+            // URL 监听可能晚于 React 换 DOM；不能把已经挂载的新消息当成“上一会话”。
+            const previousStableSignature = this.stableConversationDomSignature || this.getConversationDomSignature();
+            const creatingConversation = !this.currentRouteKey.startsWith('conversation:') && nextRouteKey.startsWith('conversation:');
             this.routeEpoch += 1;
             this.currentRouteKey = nextRouteKey;
             this.lastUrl = location.href;
             this.routeTransitioning = true;
             this.routeTransitionStartedAt = performance.now();
-            this.routeTransitionBaseMutationSerial = this.mainMutationSerial;
             this.routePreviousDomSignature = previousStableSignature;
-            this.routeAllowEquivalentDom = Boolean(force && options.reason === 'main-remount');
-            this.lastMainMutationAt = performance.now();
+            this.routeCandidateDomSignature = '';
+            this.routeCandidateSince = this.routeTransitionStartedAt;
+            this.routeAllowEquivalentDom = creatingConversation || Boolean(force && options.reason === 'main-remount');
             window.clearTimeout(this.routeSettleTimer);
             this.routeSettleTimer = 0;
             this.cancelBottomPin();
@@ -4572,8 +4643,8 @@
             );
             // 优先真正的消息滚动区，不把侧栏、图片查看器或另一块 main 混进会话。
             return roots.find((root) => root.matches('.thread-scroll-container') &&
-                root.querySelector(`${TRANSCRIPT_SELECTOR}, [data-message-author-role], .sr-only`)) ||
-                roots.find((root) => root.querySelector('[data-message-author-role], [data-testid^="conversation-turn-"]')) ||
+                root.querySelector(`${TRANSCRIPT_SELECTOR}, ${NATIVE_MESSAGE_SELECTOR}, .sr-only`)) ||
+                roots.find((root) => root.querySelector(`${NATIVE_MESSAGE_SELECTOR}, [data-testid^="conversation-turn-"]`)) ||
                 roots.find((root) => root.querySelector('[data-composer-surface], #prompt-textarea, .ProseMirror')) ||
                 roots[0] || null;
         }
@@ -4583,29 +4654,47 @@
             return root ? [...root.querySelectorAll(selector)] : [];
         }
 
+        getAssistantMessageOwner(element) {
+            let owner = element?.closest?.(ASSISTANT_SELECTOR) || null;
+            // 渐进更新期间新旧角色属性可能同时嵌套；章节和搜索必须与去重后的回答节点一致。
+            for (let parent = owner?.parentElement?.closest(ASSISTANT_SELECTOR); parent;
+                parent = owner.parentElement?.closest(ASSISTANT_SELECTOR)) owner = parent;
+            return owner;
+        }
+
         syncConversationMessageRoles(root = this.getConversationRoot()) {
             if (!(root instanceof HTMLElement)) return false;
             const candidates = new Set(root.querySelectorAll('[data-cgpt-turn]'));
             for (const transcript of root.querySelectorAll(TRANSCRIPT_SELECTOR)) {
                 for (const child of transcript.children) candidates.add(child);
             }
+            // 当前网页的 message id / search unit 比本地化的“你说 / ChatGPT 说”更稳定。
+            // 用户读屏标题的父级可以是 display:contents，应直接选择带消息身份的气泡容器。
+            for (const message of root.querySelectorAll(`${NATIVE_MESSAGE_SELECTOR}, [data-content-search-unit-key$=":user"], [data-content-search-unit-key$=":assistant"]`)) {
+                candidates.add(message);
+            }
             // transcriptContent 的构建哈希也可能再次变化；保留结构化的读屏角色后备。
             // 只检查消息外层的直接角色标记，绝不把正文里引用的“你说”当成新消息。
-            for (const marker of root.querySelectorAll('.sr-only')) {
-                if (marker.closest('.markdown, .prose, [data-message-content], button, nav, aside, [role="dialog"]')) continue;
+            for (const marker of root.querySelectorAll('.sr-only, [data-conversation-role="assistant"]')) {
+                if (marker.closest(`${ANSWER_CONTENT_SELECTOR}, button, nav, aside, [role="dialog"]`)) continue;
                 const parent = marker.parentElement;
                 if (parent && parent !== root && !parent.matches(TRANSCRIPT_SELECTOR)) candidates.add(parent);
             }
             let changed = false;
             for (const turn of candidates) {
-                const marker = [...turn.children].find((child) => child.matches('.sr-only'));
+                const marker = [...turn.children].find((child) => child.matches('.sr-only, [data-conversation-role]'));
                 const label = this.normalizeText(marker?.textContent || '');
-                const role = /^(?:you(?: said)?|你说|你說|您说|您說)\s*[:：]?$/i.test(label)
+                const semanticRole = /:(user|assistant)$/.exec(
+                    turn.getAttribute('data-chatgpt-search-unit-key') || turn.getAttribute('data-content-search-unit-key') || '',
+                )?.[1] || marker?.getAttribute('data-conversation-role');
+                const role = /^(?:user|assistant)$/.test(semanticRole || '') ? semanticRole
+                    : /^(?:you(?: said)?|你说|你說|您说|您說)\s*[:：]?$/i.test(label)
                     ? 'user'
                     : /^(?:chatgpt(?:\s*(?:said|says|说|說))?|assistant)\s*[:：]?$/i.test(label)
                         ? 'assistant' : '';
                 // 原生 role 存在时沿用原生节点，避免外层 turn + 内层 message 双重计数。
-                const nativeRole = turn.matches('[data-message-author-role]') || turn.querySelector('[data-message-author-role]');
+                const nativeRole = turn.matches(NATIVE_MESSAGE_SELECTOR) || turn.querySelector(NATIVE_MESSAGE_SELECTOR) ||
+                    turn.parentElement?.closest(NATIVE_MESSAGE_SELECTOR);
                 const inferredRole = nativeRole ? '' : role;
                 if ((turn.getAttribute('data-cgpt-message-role') || '') !== inferredRole) {
                     if (inferredRole) turn.setAttribute('data-cgpt-message-role', inferredRole);
@@ -4624,9 +4713,14 @@
 
         bindMainObserver() {
             const main = this.getConversationRoot();
+            if (this.currentAnswer && !this.currentAnswer.isConnected) {
+                this.disconnectCurrentAnswer();
+                this.clearToc();
+            }
             if (!main) {
-                window.clearTimeout(this.rebindTimer);
-                this.rebindTimer = window.setTimeout(() => this.bindMainObserver(), 300);
+                this.mainObserver?.disconnect();
+                this.mainObserver = null;
+                this.mainElement = null;
                 return;
             }
 
@@ -4643,11 +4737,14 @@
                 attributes: true,
                 // React 经常直接复用 img 并更新 src/alt，而不是插入新的节点。
                 // 不观察脚本自己的 data-cgpt-*，避免标记结构触发自循环。
-                attributeFilter: ['src', 'srcset', 'alt', 'title', 'aria-label', 'hidden', 'aria-hidden', 'data-message-author-role', 'data-message-id'],
+                attributeFilter: ['src', 'srcset', 'alt', 'title', 'aria-label', 'hidden', 'aria-hidden', 'data-message-author-role', 'data-message-id',
+                    'data-chatgpt-search-unit-key', 'data-content-search-unit-key', 'data-chatgpt-search-message-ids', 'data-chatgpt-selection-message-id',
+                    'data-chatgpt-selection-conversation-id', 'data-conversation-role'],
             });
             this.markSearchIndexDirty(false);
             this.scheduleConversationRebuild(60);
             this.scheduleGeneratedImageRefresh(100, true);
+            this.requestFrame(true);
         }
 
         nodeMatchesOrContains(node, selector) {
@@ -4658,7 +4755,6 @@
 
         onMainMutations(records) {
             this.mainMutationSerial += Math.max(1, records.length);
-            this.lastMainMutationAt = performance.now();
             const structureChanged = this.syncConversationMessageRoles(this.mainElement);
 
             if (this.checkForRouteChange()) return;
@@ -4678,7 +4774,9 @@
                 if (target?.closest(ASSISTANT_SELECTOR)) searchContentChanged = true;
                 if (record.type === 'attributes') {
                     if (target?.matches('img, source') || target?.querySelector('img')) imageContentChanged = true;
-                    if (['hidden', 'aria-hidden', 'data-message-author-role', 'data-message-id'].includes(record.attributeName)) {
+                    if (['hidden', 'aria-hidden', 'data-message-author-role', 'data-message-id',
+                        'data-chatgpt-search-unit-key', 'data-content-search-unit-key', 'data-chatgpt-search-message-ids',
+                        'data-chatgpt-selection-message-id', 'data-chatgpt-selection-conversation-id', 'data-conversation-role'].includes(record.attributeName)) {
                         conversationChanged = true;
                         assistantAdded = true;
                     }
@@ -4743,8 +4841,16 @@
             this.forceAnswerDetection ||= Boolean(forceAnswerDetection);
             if (this.frameId) return;
 
-            this.frameId = window.requestAnimationFrame((timestamp) => {
+            const update = (timestamp) => {
+                window.cancelAnimationFrame(this.frameId);
                 this.frameId = 0;
+                window.clearTimeout(this.frameFallbackTimer);
+                this.frameFallbackTimer = 0;
+                if (this.checkForRouteChange()) return;
+                if (this.routeTransitioning) {
+                    this.scheduleRouteSettleCheck(0);
+                    return;
+                }
 
                 if (!this.isViewportEligible()) {
                     this.syncVisibility();
@@ -4773,7 +4879,10 @@
                 }
 
                 this.updateActiveHeading();
-            });
+            };
+            this.frameId = window.requestAnimationFrame(update);
+            // 后台/繁忙标签的 rAF 可能停发；语义目录不能一直等待下一次绘制。
+            this.frameFallbackTimer = window.setTimeout(() => update(performance.now()), 120);
         }
 
         detectCurrentAnswer() {
@@ -4834,7 +4943,7 @@
                         : [document.elementFromPoint(x, y)].filter(Boolean);
                     const answersAtPoint = new Set();
                     for (const element of stack) {
-                        const answer = element?.closest?.(ASSISTANT_SELECTOR);
+                        const answer = this.getAssistantMessageOwner(element);
                         if (answer instanceof HTMLElement && answer.isConnected && this.mainElement?.contains(answer)) answersAtPoint.add(answer);
                     }
                     for (const answer of answersAtPoint) {
@@ -4983,11 +5092,7 @@
         }
 
         scheduleTocRebuild() {
-            window.clearTimeout(this.rebuildTimer);
-            this.rebuildTimer = window.setTimeout(() => {
-                this.rebuildTimer = 0;
-                this.rebuildToc();
-            }, 180);
+            this.scheduleNavigationTask('rebuildTimer', () => this.rebuildToc(), 180);
         }
 
         rebuildToc() {
@@ -5017,14 +5122,14 @@
             const selector = this.config.answerTocHeadingSelector;
             const all = [...answer.querySelectorAll(selector)].filter((element) => {
                 if (!(element instanceof HTMLElement) || !element.isConnected) return false;
-                if (element.closest(ASSISTANT_SELECTOR) !== answer) return false;
+                if (this.getAssistantMessageOwner(element) !== answer) return false;
                 if (element.closest('.sr-only, [hidden], [aria-hidden="true"], nav, aside, [role="menu"], [role="tooltip"]')) return false;
                 const label = this.normalizeText(element.textContent || '');
                 return Boolean(label);
             });
 
             const semantic = all.filter((element) => Boolean(
-                element.closest('.markdown, [data-message-content], .prose')
+                element.closest(ANSWER_CONTENT_SELECTOR)
             ));
             const chosen = semantic.length ? semantic : all;
             return chosen.map((element) => {
@@ -5514,11 +5619,11 @@
             let order = 0;
 
             for (const assistant of assistants) {
-                const markdownRoots = assistant.matches('.markdown')
+                const markdownRoots = assistant.matches(ANSWER_CONTENT_SELECTOR)
                     ? [assistant]
-                    : [...assistant.querySelectorAll('.markdown')].filter((root) => (
-                        root.closest(ASSISTANT_SELECTOR) === assistant &&
-                        !root.parentElement?.closest('.markdown')
+                    : [...assistant.querySelectorAll(ANSWER_CONTENT_SELECTOR)].filter((root) => (
+                        this.getAssistantMessageOwner(root) === assistant &&
+                        !root.parentElement?.closest(ANSWER_CONTENT_SELECTOR)
                     ));
                 const roots = markdownRoots.length ? markdownRoots : [assistant];
 
@@ -5536,7 +5641,7 @@
                         seen.add(element);
                         if (!element.isConnected) continue;
                         if (element.closest('.sr-only, [hidden], [aria-hidden="true"]')) continue;
-                        if (element.closest(ASSISTANT_SELECTOR) !== assistant) continue;
+                        if (this.getAssistantMessageOwner(element) !== assistant) continue;
                         if (element.closest('button, nav, aside, [role="toolbar"], [role="menu"]')) {
                             continue;
                         }
@@ -6121,7 +6226,7 @@
             const candidates = this.queryConversationElements(`${ASSISTANT_SELECTOR} ${selector}`)
                 .filter((element) => element instanceof HTMLElement && element.isConnected);
             const assistants = [...new Set(candidates.map((element) => (
-                element.closest(ASSISTANT_SELECTOR)
+                this.getAssistantMessageOwner(element)
             )).filter(Boolean))];
             const contextMap = this.buildSearchAssistantContextMap(assistants);
             let fallback = null;
@@ -6129,7 +6234,7 @@
             for (const element of candidates) {
                 const text = this.extractSearchBlockText(element);
                 if (text !== result.fullText) continue;
-                const assistant = element.closest(ASSISTANT_SELECTOR);
+                const assistant = this.getAssistantMessageOwner(element);
                 const logicalIndex = contextMap.get(assistant) ?? -1;
                 if (logicalIndex === result.logicalIndex) return element;
                 fallback ||= element;
@@ -6182,10 +6287,14 @@
 
         getConversationRecordIdentity(element, fallbackIndex = 0) {
             const turn = this.getConversationTurnElement(element);
+            const modernMessage = element?.closest?.('[data-chatgpt-search-message-ids], [data-chatgpt-selection-message-id]') ||
+                element?.querySelector?.('[data-chatgpt-search-message-ids], [data-chatgpt-selection-message-id]');
             const messageId =
                 element?.getAttribute?.('data-message-id') ||
                 element?.closest?.('[data-message-id]')?.getAttribute('data-message-id') ||
                 turn?.querySelector?.('[data-message-id]')?.getAttribute('data-message-id') ||
+                modernMessage?.getAttribute('data-chatgpt-search-message-ids')?.trim().split(/\s+/)[0] ||
+                modernMessage?.getAttribute('data-chatgpt-selection-message-id') ||
                 '';
             if (messageId) return `message:${messageId}`;
 
@@ -6412,11 +6521,7 @@
                 this.scheduleRouteSettleCheck(Math.min(90, Math.max(30, Number(delay) || 0)));
                 return;
             }
-            window.clearTimeout(this.conversationRebuildTimer);
-            this.conversationRebuildTimer = window.setTimeout(() => {
-                this.conversationRebuildTimer = 0;
-                this.rebuildConversationToc();
-            }, Math.max(0, Number(delay) || 0));
+            this.scheduleNavigationTask('conversationRebuildTimer', () => this.rebuildConversationToc(), delay);
         }
 
         findCurrentPromptRecordIndex(records) {
@@ -15082,7 +15187,9 @@
                 this.headings.length > 0 ||
                 this.generatedImages.length > 0 ||
                 hasSearchableContent;
-            this.host.hidden = !this.isViewportEligible() || !hasAnyNavigation;
+            // 已打开会话时先提供面板和等待提示，不能把入口绑在解析/API/图片加载完成上。
+            const hasConversationRoute = this.currentRouteKey.startsWith('conversation:');
+            this.host.hidden = !this.isViewportEligible() || !(hasAnyNavigation || hasConversationRoute);
 
             if (this.host.hidden && this.transientHoverOpen) {
                 this.transientHoverOpen = false;
@@ -15305,15 +15412,25 @@
     }
 
 
+    let answerTocStarted = false;
+    let bodyObserver = null;
     const startAnswerToc = () => {
+        if (answerTocStarted || !document.body) return;
+        answerTocStarted = true;
+        bodyObserver?.disconnect();
+        document.removeEventListener('DOMContentLoaded', startAnswerToc);
         const controller = new AnswerTocController(CONFIG);
         if (window.__CGPT_TOC_TEST_MODE__) window.__cgptAnswerTocController = controller;
         controller.start();
     };
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', startAnswerToc, { once: true });
-    } else {
+    if (document.body) {
         startAnswerToc();
+    } else {
+        // ChatGPT 的 HTML 可以流式传输；正文已绘制时 DOMContentLoaded 仍可能没触发。
+        // 只等 body 出现，随后由消息 observer 渐进补齐目录。
+        bodyObserver = new MutationObserver(startAnswerToc);
+        bodyObserver.observe(document, { childList: true, subtree: true });
+        document.addEventListener('DOMContentLoaded', startAnswerToc, { once: true });
     }
 })();

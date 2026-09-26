@@ -151,6 +151,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     check('reused node role changes clear old user role', !c.getUserMessageElements().includes(streaming) && c.getAssistantMessageElements().includes(streaming));
 
     c.getCurrentConversationId = () => 'test-conversation';
+    c.currentRouteKey = c.getConversationRouteKey();
     c.conversationApiSnapshotId = 'test-conversation';
     c.conversationApiSnapshot = makeSnapshot(['早先的问题', '绘制第一张图', '流式更新后的问题']);
     const records = c.collectUserMessageRecords();
@@ -183,6 +184,46 @@ document.addEventListener('DOMContentLoaded', async () => {
     mount('<div class="thread-scroll-container"><section><div><h2 class="sr-only">你說：</h2><div>不同构建下的问题</div></div><div><h2 class="sr-only">ChatGPT 說：</h2><h2>不同构建下的章节</h2></div></section></div>');
     equal('reader role fallback independent of transcript build hash', c.getUserMessageElements().length, 1);
     equal('reader role fallback headings', c.collectHeadingsForAnswer(c.getAssistantMessageElements()[0]).map(item => item.fullLabel), ['不同构建下的章节']);
+    // Real DOM has extra display:contents wrappers omitted by the accessibility tree.
+    mount(`<main><div class="thread-scroll-container"><div class="transcriptContent-liveBuild"><div class="flex flex-col">
+      <div role="status"><span class="sr-only">正在加载更早的消息…</span></div>
+      <div class="relative shrink-0"><div class="contents" style="display:contents"><div class="contents" style="display:contents"><div class="group flex flex-col"><div class="flex flex-col">
+        <div class="block-BQZwFn" style="display:contents"><h4 class="sr-only m-0 select-none">Vous avez dit :</h4>
+          <div id="live-user" class="group/user-message" style="display:flex" data-chatgpt-search-unit-key="fallback-turn-7:0:user" data-chatgpt-search-message-ids="real-user-id">
+            <div data-content-search-unit-key="fallback-turn-7:0:user"><div data-user-message-bubble="true"><div class="whitespace-pre-wrap">真实结构中的提问</div></div></div>
+          </div>
+        </div>
+        <div><h2>不属于回答的工具状态</h2></div>
+        <div class="block-BQZwFn" style="display:contents"><div id="live-answer" data-content-search-unit-key="fallback-turn-7:2:assistant" data-chatgpt-search-unit-key="fallback-turn-7:2:assistant" data-chatgpt-search-message-ids="real-assistant-id real-assistant-id">
+          <h4 class="sr-only m-0 select-none" data-conversation-role="assistant">ChatGPT a dit :</h4><h2>正文外部控件标题</h2>
+          <div data-chatgpt-selection-message-id="real-assistant-id"><div data-markdown-text-style="assistant-message" class="MarkdownRoot-rZKhxa"><h2 class="Heading-Ro3lZr"><span>实际章节一</span></h2><p>实际回答正文</p><h2>实际章节二</h2></div></div>
+        </div></div>
+      </div></div></div></div></div>
+    </div></div></div></main>`);
+    equal('live search-unit questions independent of reader locale', c.getUserMessageElements().length, 1);
+    check('live user target is layout-bearing message, not display:contents wrapper', c.getUserMessageElements()[0] === document.getElementById('live-user') && c.getUserMessageElements()[0].getBoundingClientRect().height > 0);
+    equal('live content/search-unit wrappers do not double count', c.getAssistantMessageElements().length, 1);
+    equal('live question message ID read from search IDs', c.collectUserMessageRecords()[0].identity, 'message:real-user-id');
+    equal('duplicate assistant message IDs normalize to one identity', c.getConversationRecordIdentity(document.getElementById('live-answer')), 'message:real-assistant-id');
+    equal('MarkdownRoot chapters exclude surrounding interface headings', c.collectHeadingsForAnswer(document.getElementById('live-answer')).map(item => item.fullLabel), ['实际章节一', '实际章节二']);
+    const liveSearch = c.collectSearchCandidateDescriptors();
+    check('new markdown body is indexed by search', liveSearch.some(item => item.element?.textContent === '实际回答正文'));
+    check('new markdown search excludes interface headings', !liveSearch.some(item => item.element?.textContent === '正文外部控件标题'));
+    equal('live user prompt excludes reader header', c.conversationItems[0]?.fullLabel, '真实结构中的提问');
+    check('live semantic message pairing', c.findAssistantForUser(document.getElementById('live-user')) === document.getElementById('live-answer'));
+    equal('script version is inspectable on host', c.host.dataset.scriptVersion, '4.7.2');
+    check('script version is visible as navigation-title hint', c.shadow.querySelector('.panel-title').title.includes('4.7.2'));
+    document.getElementById('live-answer').removeAttribute('data-chatgpt-search-unit-key');
+    await pause();
+    equal('content-search-unit attribute is a standalone fallback', c.getAssistantMessageElements().length, 1);
+    document.getElementById('live-answer').removeAttribute('data-content-search-unit-key');
+    await pause();
+    equal('data-conversation-role marker works without localized text', c.getAssistantMessageElements().length, 1);
+    mount('<main><div data-message-author-role="user"><div data-chatgpt-search-unit-key="turn:0:user" data-chatgpt-search-message-ids="mixed-user">混合结构提问</div></div><div data-chatgpt-search-unit-key="turn:1:assistant"><div data-message-author-role="assistant"><div data-markdown-text-style="assistant-message"><h2>混合结构章节</h2><p>混合结构正文</p></div></div></div></main>');
+    equal('mixed native role generations deduplicate questions', c.getUserMessageElements().length, 1);
+    equal('mixed native role generations deduplicate answers', c.getAssistantMessageElements().length, 1);
+    equal('nested legacy/modern role chapter ownership stays canonical', c.collectHeadingsForAnswer(c.getAssistantMessageElements()[0]).map(item => item.fullLabel), ['混合结构章节']);
+    check('nested legacy/modern role search ownership stays canonical', c.collectSearchCandidateDescriptors().some(item => item.element?.textContent === '混合结构正文'));
     mount('<main><div data-message-author-role="user">切换会话后</div><div data-message-author-role="assistant"><h2>新会话章节</h2></div></main>');
     equal('remount rebinds observer and clears old message nodes', c.getUserMessageElements().length, 1);
     check('observer attached to current root', c.mainElement === document.querySelector('main'));
@@ -192,6 +233,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   c.cancelBottomPin();
   c.clearHeadingRecovery();
   c.mainObserver?.disconnect();
+  c.pageObserver?.disconnect();
   const passed = checks.every(check => check.pass);
   document.documentElement.dataset.testsPassed = String(passed);
   document.documentElement.dataset.testCount = String(checks.length);
