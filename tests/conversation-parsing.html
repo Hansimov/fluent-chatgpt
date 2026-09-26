@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Conversation parsing regression</title>
+<style>
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; }
+  .thread-scroll-container { height: 450px; overflow-y: auto; }
+  .transcript { flex: none; }
+  img { object-fit: contain; }
+</style>
+<script>
+  window.__CGPT_TOC_TEST_MODE__ = true;
+  window.unsafeWindow = window;
+  window.GM_addStyle = () => {};
+  window.GM_xmlhttpRequest = () => {};
+  window.fetch = async () => { throw new Error('Network disabled in regression fixture'); };
+</script>
+<script src="../fluent-chatgpt.user.js"></script>
+<body>
+<div id="fixture"><main></main></div>
+<pre id="result">pending</pre>
+<script>
+document.addEventListener('DOMContentLoaded', async () => {
+  const c = window.__cgptAnswerTocController;
+  const checks = [];
+  const check = (name, pass, details = '') => {
+    checks.push({ name, pass: Boolean(pass), details });
+  };
+  const equal = (name, actual, expected) => check(name, JSON.stringify(actual) === JSON.stringify(expected), JSON.stringify(actual));
+  const pause = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
+  const svg = (color) => 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1200"><rect width="800" height="1200" fill="${color}"/></svg>`);
+  const makeSnapshot = (prompts) => ({ current_node: `u${prompts.length - 1}`, mapping: Object.fromEntries(prompts.map((text, index) => [
+    `u${index}`, { parent: index ? `u${index - 1}` : null, children: index < prompts.length - 1 ? [`u${index + 1}`] : [],
+      message: { id: `u${index}`, author: { role: 'user' }, content: { parts: [text] } } },
+  ])) });
+  const mount = (html) => {
+    c.cancelBottomPin();
+    c.clearHeadingRecovery();
+    c.disconnectCurrentAnswer();
+    c.conversationApiSnapshot = null;
+    c.clearConversationLabelCacheState();
+    document.getElementById('fixture').innerHTML = html;
+    c.bindMainObserver();
+    c.rebuildConversationToc();
+    c.cancelBottomPin();
+  };
+  try {
+    c.config = { ...c.config, answerTocOpenConversationAtBottom: false };
+    clearInterval(c.healthTimer);
+    clearInterval(c.routeWatchTimer);
+    c.scheduleGeneratedImageRefresh = () => {};
+    mount(`<aside><div data-message-author-role="user">侧栏伪消息</div></aside><main>
+      <article data-testid="conversation-turn-0"><div data-message-author-role="user" data-message-id="u0"><div class="whitespace-pre-wrap">第一问</div></div></article>
+      <article data-testid="conversation-turn-1"><div data-message-author-role="assistant"><div class="markdown"><h1>旧版章</h1><h2>旧版节</h2><p>可检索正文</p></div></div></article>
+      <article data-testid="conversation-turn-2"><div data-message-author-role="user" data-message-id="u1">第二问<div data-message-author-role="user"></div></div></article>
+      <article data-testid="conversation-turn-3"><div data-message-author-role="assistant"><h2>第二回答</h2></div></article>
+      <div aria-hidden="true" data-message-author-role="user" data-message-id="u1">隐藏的第二问副本</div>
+      <div hidden data-message-author-role="assistant"><h2>隐藏章节</h2></div>
+    </main>`);
+    equal('legacy questions and duplicate/side-panel exclusion', c.conversationItems.map(item => item.fullLabel), ['第一问', '第二问']);
+    equal('legacy assistant count', c.getAssistantMessageElements().length, 2);
+    equal('legacy heading extraction', c.collectHeadingsForAnswer(c.getAssistantMessageElements()[0]).map(item => item.fullLabel), ['旧版章', '旧版节']);
+    check('legacy assistant pairing', c.findAssistantForUser(c.getUserMessageElements()[1]) === c.getAssistantMessageElements()[1]);
+    check('search uses same message adapter', c.collectSearchCandidateDescriptors().some(item => item.fullText?.includes('可检索正文') || item.element?.textContent === '可检索正文'));
+
+    mount(`<div class="thread-scroll-container"><div class="transcriptContent-buildA transcript">
+      <div><h2 class="sr-only">You said:</h2><div data-message-author-role="user" data-message-id="u0">没有 main 的提问</div></div>
+      <div><h2 class="sr-only">ChatGPT said:</h2><div data-message-author-role="assistant"><div class="markdown"><h2>新版正文标题</h2></div></div></div>
+    </div></div>`);
+    equal('native roles without main', c.conversationItems.map(item => item.fullLabel), ['没有 main 的提问']);
+    equal('native and inferred roles not double counted', c.getAssistantMessageElements().length, 1);
+    equal('no synthetic role around native messages', document.querySelectorAll('[data-cgpt-message-role]').length, 0);
+
+    // Classes and reader-label placement observed in the live 2026-09 transcript.
+    mount(`<div class="thread-scroll-container" style="display:flex;flex-direction:column-reverse"><div class="transcriptContent-newHash transcript">
+      <div class="relative shrink-0" id="new-user-1"><h2 class="sr-only">你说：</h2><div>绘制第一张图</div><button>复制消息</button><button>编辑消息</button><img id="upload" width="300" height="220" alt="已生成图像 1"></div>
+      <div class="relative shrink-0" id="new-answer-1"><h2 class="sr-only">ChatGPT 说：</h2><div class="markdown"><h1>架构总览</h1><h2>训练流程</h2><p>新的正文</p><h2 class="sr-only">读屏提示</h2><nav><h2>非正文章节</h2></nav><div hidden><h2>隐藏标题</h2></div></div>
+        <div class="group/generated-image-gallery-controls"><div class="group/generated-image-preview"><button aria-label="已生成图像 1"><img id="generated-1" class="ImageTransparencyBackdrop-newHash image-transparency-backdrop" width="300" height="450" alt="已生成图像 1"></button></div>
+        <div aria-label="生成的图像"><button aria-label="显示生成的图像 1"><img id="thumbnail-1" width="56" height="56"></button><button aria-label="显示生成的图像 2"><img id="thumbnail-2" width="56" height="56"></button></div></div>
+      </div>
+      <div class="relative shrink-0" id="new-user-2"><h2 class="sr-only">你说：</h2><div>解释第二张图</div></div>
+      <div class="relative shrink-0" id="new-answer-2"><h2 class="sr-only">ChatGPT 说：</h2><div class="markdown"><h2>第二个流程</h2><p>第二条正文</p></div></div>
+    </div></div><div role="dialog"><div data-message-author-role="user">图片弹层伪消息</div><img width="500" height="500" alt="已生成图像 1"></div>`);
+    document.getElementById('upload').src = svg('red');
+    document.getElementById('generated-1').src = svg('blue');
+    document.getElementById('thumbnail-1').src = svg('blue');
+    document.getElementById('thumbnail-2').src = svg('green');
+    equal('reader labels become two prompts, without action text', c.conversationItems.map(item => item.fullLabel), ['绘制第一张图', '解释第二张图']);
+    equal('reader labels become two assistants', c.getAssistantMessageElements().length, 2);
+    equal('only content headings, not reader labels/nav/hidden', c.collectHeadingsForAnswer(c.getAssistantMessageElements()[0]).map(item => item.fullLabel), ['架构总览', '训练流程']);
+    check('modern answer pairing', c.findAssistantForUser(document.getElementById('new-user-2')) === document.getElementById('new-answer-2'));
+    check('modern turn target', c.getConversationTurnElement(document.querySelector('#new-answer-1 h1')) === document.getElementById('new-answer-1'));
+    const identity = c.getConversationRecordIdentity(document.getElementById('new-user-2'), 1);
+    equal('identity does not depend on virtualized DOM ordinal', c.getConversationRecordIdentity(document.getElementById('new-user-2'), 0), identity);
+    const domImages = c.collectGeneratedImageDomItems();
+    equal('modern gallery includes thumbnails, deduplicates preview, excludes upload', domImages.length, 2);
+    equal('generic image labels remain untitled', domImages.map(item => item.imageTitle), ['', '']);
+    equal('modern native gallery indices', domImages.map(item => item.nativeImageIndex), [0, 1]);
+    equal('image prompt hints and ownership', domImages.map(item => [item.logicalIndex, item.promptText]), [[0, '绘制第一张图'], [0, '绘制第一张图']]);
+    check('large preview chosen as locate target', domImages[0]?.element.id === 'generated-1');
+    document.querySelector('.group\\/generated-image-gallery-controls').__reactProps$test = { images: [{ image_title: '另一张图片的标题' }] };
+    equal('gallery sibling React title does not leak into current image', c.collectGeneratedImageDomItems()[0]?.imageTitle, '');
+    equal('gallery sibling React title does not leak into thumbnail', c.collectGeneratedImageDomItems()[1]?.imageTitle, '');
+    document.getElementById('generated-1').__reactProps$test = { children: { _owner: { memoizedProps: { image_title: '不能沿 React owner 找到的其他图片标题' } } } };
+    equal('React owner does not escape image title boundary', c.collectGeneratedImageDomItems()[0]?.imageTitle, '');
+    for (const label of ['显示生成的图像 2', '编辑生成的图像 1', '分享生成的图像 3', 'Show generated image 2', 'Edit generated image 1']) {
+      check(`generic gallery action label: ${label}`, c.isGenericGeneratedImageTitle(label));
+    }
+    document.getElementById('generated-1').title = 'MiniMax H3训练生成数据维度全流程';
+    equal('native per-image title kept separate from prompt', c.collectGeneratedImageDomItems()[0]?.imageTitle, 'MiniMax H3训练生成数据维度全流程');
+
+    const root = c.getConversationRoot();
+    root.scrollTop = -root.scrollHeight;
+    check('fixture exercises negative scrollTop', root.scrollTop < 0);
+    c.scrollConversationToBottom();
+    equal('column-reverse bottom is zero', root.scrollTop, 0);
+    check('question navigation scrolls reverse container', c.scrollSearchTarget(document.getElementById('new-user-1')) && root.scrollTop < 0);
+
+    let refreshed = 0;
+    c.scheduleGeneratedImageRefresh = () => { refreshed++; };
+    await pause();
+    refreshed = 0;
+    document.getElementById('generated-1').src = svg('purple');
+    document.getElementById('generated-1').alt = '已生成图像 2';
+    await pause();
+    check('reused image src/alt triggers refresh', refreshed > 0);
+    const pendingImage = document.createElement('img');
+    pendingImage.src = svg('purple');
+    Object.defineProperty(pendingImage, 'currentSrc', { value: svg('blue') });
+    equal('pending native image uses new src, not previous currentSrc', c.getLargestImageCandidate(pendingImage), svg('purple'));
+    document.getElementById('generated-1').src = svg('green');
+    document.getElementById('generated-1').closest('button').setAttribute('aria-label', '已生成图像 2');
+    equal('DOM-only gallery follows native image order after switching', c.collectGeneratedImageDomItems().map(item => item.nativeImageIndex), [0, 1]);
+    await pause();
+    const beforeSerial = c.mainMutationSerial;
+    c.syncConversationMessageRoles();
+    await pause();
+    equal('role annotation causes no observer feedback loop', c.mainMutationSerial, beforeSerial);
+    document.querySelector('#new-user-2 > div').firstChild.data = '流式更新后的问题';
+    await pause(200);
+    check('characterData updates question labels', c.conversationItems.some(item => item.fullLabel === '流式更新后的问题'));
+    const streaming = document.createElement('div');
+    streaming.innerHTML = '<h2 class="sr-only"></h2><div>延迟挂载的提问</div>';
+    document.querySelector('[class*="transcriptContent-"]').append(streaming);
+    await pause();
+    streaming.querySelector('h2').textContent = 'You said:';
+    await pause(220);
+    check('late reader-role text detected', c.getUserMessageElements().includes(streaming));
+    streaming.querySelector('h2').textContent = 'ChatGPT said:';
+    await pause();
+    check('reused node role changes clear old user role', !c.getUserMessageElements().includes(streaming) && c.getAssistantMessageElements().includes(streaming));
+
+    c.getCurrentConversationId = () => 'test-conversation';
+    c.conversationApiSnapshotId = 'test-conversation';
+    c.conversationApiSnapshot = makeSnapshot(['早先的问题', '绘制第一张图', '流式更新后的问题']);
+    const records = c.collectUserMessageRecords();
+    equal('virtualized prompts align to API branch', c.getConversationApiRecordIndices(records), [1, 2]);
+    equal('API alignment used before DOM zero-based indexing', [...c.mapUserRecordsToLogicalIndices(records, []).recordsByIndex.keys()], [1, 2]);
+    const partialButton = document.createElement('button');
+    partialButton.dataset.tocItemIndex = '0';
+    equal('exact API indices survive partially hydrated native TOC', [...c.mapUserRecordsToLogicalIndices(records, [partialButton]).recordsByIndex.keys()], [1, 2]);
+    c.conversationApiSnapshot = makeSnapshot(['继续', '中间', '继续']);
+    equal('ambiguous repeated prompt is not guessed', c.getConversationApiRecordIndices([{ identity: '', fullLabel: '继续' }]), null);
+    equal('message ID disambiguates repeated prompt', c.getConversationApiRecordIndices([{ identity: 'message:u2', fullLabel: '继续' }]), [2]);
+    equal('complete repeated sequence is safely aligned', c.getConversationApiRecordIndices([{ fullLabel: '继续' }, { fullLabel: '中间' }, { fullLabel: '继续' }]), [0, 1, 2]);
+    c.conversationApiSnapshotId = 'another-conversation';
+    equal('old route API snapshot rejected', c.getConversationApiRecordIndices(records), null);
+    check('incompatible partial native TOC does not crash parser', c.mapUserRecordsToLogicalIndices(records, [partialButton]).recordsByIndex instanceof Map);
+    const cyclicNode = { message: { id: 'cycle' }, children: ['a'] };
+    equal('malformed API cycle terminates', c.getConversationBranchMessages({ mapping: { a: cyclicNode } }).length, 1);
+
+    const api = [0, 1, 2].map(index => ({ logicalIndex: 1, fileId: `file-image-${index}`, fileIdCandidates: [`file-image-${index}`], imageTitle: `标题${index}`, sourceUrl: `https://example.test/${index}.png` }));
+    const selected = { logicalIndex: 1, nativeImageIndex: 0, imageTitle: '当前图标题', explicitTitle: '当前图标题', previewUrl: 'blob:current-image' };
+    const merged = c.mergeGeneratedImageItems(api, [selected]);
+    equal('native image index maps selected first image, not latest', merged.map(item => item.imageTitle), ['当前图标题', '标题1', '标题2']);
+    const exact = c.mergeGeneratedImageItems(api, [{ ...selected, nativeImageIndex: 0, fileId: 'file-image-2' }]);
+    equal('file ID has priority over ordinal', exact.map(item => item.imageTitle), ['标题0', '标题1', '当前图标题']);
+    const conflicting = c.mergeGeneratedImageItems(api, [{ ...selected, fileId: 'file-new-image' }]);
+    equal('conflicting file ID cannot overwrite older image', conflicting.length, 4);
+    equal('unmapped DOM cannot overwrite other question title', c.mergeGeneratedImageItems(api, [{ ...selected, logicalIndex: -1 }]).slice(0, 3).map(item => item.imageTitle), ['标题0', '标题1', '标题2']);
+    equal('API-missing image remains in conversation order', c.mergeGeneratedImageItems(api, [{ ...selected, logicalIndex: 0, fileId: 'file-new-image' }]).map(item => item.logicalIndex), [0, 1, 1, 1]);
+
+    mount('<div class="thread-scroll-container"><section><div><h2 class="sr-only">你說：</h2><div>不同构建下的问题</div></div><div><h2 class="sr-only">ChatGPT 說：</h2><h2>不同构建下的章节</h2></div></section></div>');
+    equal('reader role fallback independent of transcript build hash', c.getUserMessageElements().length, 1);
+    equal('reader role fallback headings', c.collectHeadingsForAnswer(c.getAssistantMessageElements()[0]).map(item => item.fullLabel), ['不同构建下的章节']);
+    mount('<main><div data-message-author-role="user">切换会话后</div><div data-message-author-role="assistant"><h2>新会话章节</h2></div></main>');
+    equal('remount rebinds observer and clears old message nodes', c.getUserMessageElements().length, 1);
+    check('observer attached to current root', c.mainElement === document.querySelector('main'));
+  } catch (error) {
+    check('unexpected exception', false, error.stack || String(error));
+  }
+  c.cancelBottomPin();
+  c.clearHeadingRecovery();
+  c.mainObserver?.disconnect();
+  const passed = checks.every(check => check.pass);
+  document.documentElement.dataset.testsPassed = String(passed);
+  document.documentElement.dataset.testCount = String(checks.length);
+  document.getElementById('result').textContent = JSON.stringify({ passed, checks }, null, 2);
+});
+</script>
+</body>
+</html>

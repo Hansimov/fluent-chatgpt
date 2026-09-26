@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.6.1
+// @version      4.7.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -272,9 +272,14 @@
         answerTocMaxHeightPx: 760,
     });
 
-    const TURN_SELECTOR = 'main [data-testid^="conversation-turn-"]';
-    const ASSISTANT_SELECTOR = 'main [data-message-author-role="assistant"]';
-    const USER_SELECTOR = 'main [data-message-author-role="user"]';
+    // 新版 transcript 不再位于 <main> 内。角色选择器也用于 closest 和 CSS 拼接，
+    // 必须用 :is() 包裹，避免逗号把后续的后代选择器变成全局匹配。
+    const CONVERSATION_ROOT_SELECTOR = '.thread-scroll-container, main, [role="main"]';
+    const TRANSCRIPT_SELECTOR = '[class*="transcriptContent-"]';
+    const TURN_SELECTOR = ':is([data-testid^="conversation-turn-"], [data-cgpt-turn])';
+    const ASSISTANT_SELECTOR = ':is([data-message-author-role="assistant"], [data-cgpt-message-role="assistant"])';
+    const USER_SELECTOR = ':is([data-message-author-role="user"], [data-cgpt-message-role="user"])';
+    const GENERATED_IMAGE_CONTAINER_SELECTOR = '[id^="image-"], [class*="imagegen-image" i], [data-testid*="imagegen" i], [class~="group/generated-image-preview"], [class~="group/generated-image-gallery-controls"]';
 
     const LONG_ANSWER_BLOCK_SELECTOR = [
         `${ASSISTANT_SELECTOR} .markdown > p`,
@@ -911,6 +916,7 @@
                     this.resetForNavigation(this.currentRouteKey, { force: true, reason: 'main-remount' });
                     return;
                 }
+                this.bindMainObserver();
 
                 if (this.routeTransitioning) {
                     this.scheduleRouteSettleCheck(0);
@@ -4152,7 +4158,7 @@
         }
 
         findConversationScrollRoot() {
-            const messages = [...document.querySelectorAll(`${USER_SELECTOR}, ${ASSISTANT_SELECTOR}`)]
+            const messages = this.queryConversationElements(`${USER_SELECTOR}, ${ASSISTANT_SELECTOR}`)
                 .filter((element) => element instanceof HTMLElement && element.isConnected);
             const anchor = messages[messages.length - 1] || this.currentAnswer;
             return anchor instanceof HTMLElement ? this.findScrollRoot(anchor) : null;
@@ -4162,7 +4168,10 @@
             const scrollRoot = this.findConversationScrollRoot();
             if (scrollRoot instanceof HTMLElement) {
                 const before = scrollRoot.scrollTop;
-                scrollRoot.scrollTop = Math.max(0, scrollRoot.scrollHeight - scrollRoot.clientHeight);
+                // 新版 thread 使用 column-reverse，底部为 0，向历史滚动时 scrollTop 为负。
+                scrollRoot.scrollTop = getComputedStyle(scrollRoot).flexDirection === 'column-reverse'
+                    ? 0
+                    : Math.max(0, scrollRoot.scrollHeight - scrollRoot.clientHeight);
                 return Math.abs(scrollRoot.scrollTop - before) > 0.5 || scrollRoot.scrollTop > 0;
             }
             const root = document.scrollingElement || document.documentElement;
@@ -4442,11 +4451,11 @@
 
         getConversationDomSignature() {
             const parts = [];
-            const nodes = [...document.querySelectorAll(`${USER_SELECTOR}, ${ASSISTANT_SELECTOR}`)]
+            const nodes = this.queryConversationElements(`${USER_SELECTOR}, ${ASSISTANT_SELECTOR}`)
                 .filter((element) => element instanceof HTMLElement && element.isConnected)
                 .slice(-10);
             for (const [index, element] of nodes.entries()) {
-                const role = element.getAttribute('data-message-author-role') || '?';
+                const role = element.getAttribute('data-message-author-role') || element.dataset.cgptMessageRole || '?';
                 const identity = this.getConversationRecordIdentity(element, index);
                 const text = this.normalizeConversationText(element.textContent || '').slice(0, 96);
                 parts.push(`${role}:${identity}:${text}`);
@@ -4557,18 +4566,71 @@
             this.scheduleRouteSettleCheck(80);
         }
 
+        getConversationRoot() {
+            const roots = [...document.querySelectorAll(CONVERSATION_ROOT_SELECTOR)].filter((root) =>
+                !root.closest('[hidden], [aria-hidden="true"], [role="dialog"], nav, aside')
+            );
+            // 优先真正的消息滚动区，不把侧栏、图片查看器或另一块 main 混进会话。
+            return roots.find((root) => root.matches('.thread-scroll-container') &&
+                root.querySelector(`${TRANSCRIPT_SELECTOR}, [data-message-author-role], .sr-only`)) ||
+                roots.find((root) => root.querySelector('[data-message-author-role], [data-testid^="conversation-turn-"]')) ||
+                roots.find((root) => root.querySelector('[data-composer-surface], #prompt-textarea, .ProseMirror')) ||
+                roots[0] || null;
+        }
+
+        queryConversationElements(selector) {
+            const root = this.getConversationRoot();
+            return root ? [...root.querySelectorAll(selector)] : [];
+        }
+
+        syncConversationMessageRoles(root = this.getConversationRoot()) {
+            if (!(root instanceof HTMLElement)) return false;
+            const candidates = new Set(root.querySelectorAll('[data-cgpt-turn]'));
+            for (const transcript of root.querySelectorAll(TRANSCRIPT_SELECTOR)) {
+                for (const child of transcript.children) candidates.add(child);
+            }
+            // transcriptContent 的构建哈希也可能再次变化；保留结构化的读屏角色后备。
+            // 只检查消息外层的直接角色标记，绝不把正文里引用的“你说”当成新消息。
+            for (const marker of root.querySelectorAll('.sr-only')) {
+                if (marker.closest('.markdown, .prose, [data-message-content], button, nav, aside, [role="dialog"]')) continue;
+                const parent = marker.parentElement;
+                if (parent && parent !== root && !parent.matches(TRANSCRIPT_SELECTOR)) candidates.add(parent);
+            }
+            let changed = false;
+            for (const turn of candidates) {
+                const marker = [...turn.children].find((child) => child.matches('.sr-only'));
+                const label = this.normalizeText(marker?.textContent || '');
+                const role = /^(?:you(?: said)?|你说|你說|您说|您說)\s*[:：]?$/i.test(label)
+                    ? 'user'
+                    : /^(?:chatgpt(?:\s*(?:said|says|说|說))?|assistant)\s*[:：]?$/i.test(label)
+                        ? 'assistant' : '';
+                // 原生 role 存在时沿用原生节点，避免外层 turn + 内层 message 双重计数。
+                const nativeRole = turn.matches('[data-message-author-role]') || turn.querySelector('[data-message-author-role]');
+                const inferredRole = nativeRole ? '' : role;
+                if ((turn.getAttribute('data-cgpt-message-role') || '') !== inferredRole) {
+                    if (inferredRole) turn.setAttribute('data-cgpt-message-role', inferredRole);
+                    else turn.removeAttribute('data-cgpt-message-role');
+                    changed = true;
+                }
+                const isTurn = Boolean(role || nativeRole);
+                if (turn.hasAttribute('data-cgpt-turn') !== isTurn) {
+                    if (isTurn) turn.setAttribute('data-cgpt-turn', '');
+                    else turn.removeAttribute('data-cgpt-turn');
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
         bindMainObserver() {
-            const conversationAnchor =
-                document.querySelector('[data-message-author-role="assistant"]') ||
-                document.querySelector('[data-message-author-role="user"]') ||
-                document.querySelector('[data-composer-surface="true"], #prompt-textarea');
-            const main = conversationAnchor?.closest('main') || document.querySelector('main');
+            const main = this.getConversationRoot();
             if (!main) {
                 window.clearTimeout(this.rebindTimer);
                 this.rebindTimer = window.setTimeout(() => this.bindMainObserver(), 300);
                 return;
             }
 
+            this.syncConversationMessageRoles(main);
             if (main === this.mainElement && this.mainObserver) return;
 
             this.mainObserver?.disconnect();
@@ -4577,6 +4639,11 @@
             this.mainObserver.observe(main, {
                 childList: true,
                 subtree: true,
+                characterData: true,
+                attributes: true,
+                // React 经常直接复用 img 并更新 src/alt，而不是插入新的节点。
+                // 不观察脚本自己的 data-cgpt-*，避免标记结构触发自循环。
+                attributeFilter: ['src', 'srcset', 'alt', 'title', 'aria-label', 'hidden', 'aria-hidden', 'data-message-author-role', 'data-message-id'],
             });
             this.markSearchIndexDirty(false);
             this.scheduleConversationRebuild(60);
@@ -4592,6 +4659,7 @@
         onMainMutations(records) {
             this.mainMutationSerial += Math.max(1, records.length);
             this.lastMainMutationAt = performance.now();
+            const structureChanged = this.syncConversationMessageRoles(this.mainElement);
 
             if (this.checkForRouteChange()) return;
             if (this.routeTransitioning) {
@@ -4599,12 +4667,22 @@
                 return;
             }
 
-            let assistantAdded = false;
-            let conversationChanged = false;
-            let searchContentChanged = false;
-            let imageContentChanged = false;
+            let assistantAdded = structureChanged;
+            let conversationChanged = structureChanged;
+            let searchContentChanged = structureChanged;
+            let imageContentChanged = structureChanged;
 
             for (const record of records) {
+                const target = record.target instanceof Element ? record.target : record.target.parentElement;
+                if (target?.closest(USER_SELECTOR)) conversationChanged = true;
+                if (target?.closest(ASSISTANT_SELECTOR)) searchContentChanged = true;
+                if (record.type === 'attributes') {
+                    if (target?.matches('img, source') || target?.querySelector('img')) imageContentChanged = true;
+                    if (['hidden', 'aria-hidden', 'data-message-author-role', 'data-message-id'].includes(record.attributeName)) {
+                        conversationChanged = true;
+                        assistantAdded = true;
+                    }
+                }
                 if (
                     this.currentAnswer?.isConnected &&
                     record.target instanceof Node &&
@@ -4620,13 +4698,13 @@
                 }
 
                 for (const node of [...record.addedNodes, ...record.removedNodes]) {
-                    if (this.nodeMatchesOrContains(node, '[data-message-author-role="assistant"]')) {
+                    if (this.nodeMatchesOrContains(node, ASSISTANT_SELECTOR)) {
                         assistantAdded = true;
                         searchContentChanged = true;
                         imageContentChanged = true;
                     } else if (
                         node instanceof Text &&
-                        node.parentElement?.closest?.('[data-message-author-role="assistant"]')
+                        node.parentElement?.closest?.(ASSISTANT_SELECTOR)
                     ) {
                         searchContentChanged = true;
                     }
@@ -4634,7 +4712,7 @@
                         imageContentChanged = true;
                     }
                     if (
-                        this.nodeMatchesOrContains(node, '[data-message-author-role="user"]') ||
+                        this.nodeMatchesOrContains(node, USER_SELECTOR) ||
                         this.nodeMatchesOrContains(node, 'button[data-toc-item-index]')
                     ) {
                         conversationChanged = true;
@@ -4756,8 +4834,8 @@
                         : [document.elementFromPoint(x, y)].filter(Boolean);
                     const answersAtPoint = new Set();
                     for (const element of stack) {
-                        const answer = element?.closest?.('[data-message-author-role="assistant"]');
-                        if (answer instanceof HTMLElement && answer.isConnected) answersAtPoint.add(answer);
+                        const answer = element?.closest?.(ASSISTANT_SELECTOR);
+                        if (answer instanceof HTMLElement && answer.isConnected && this.mainElement?.contains(answer)) answersAtPoint.add(answer);
                     }
                     for (const answer of answersAtPoint) {
                         const verticalWeight =
@@ -4792,7 +4870,7 @@
 
             if (!currentStillVisible) {
                 let bestVisiblePixels = 0;
-                for (const answer of document.querySelectorAll(ASSISTANT_SELECTOR)) {
+                for (const answer of this.getAssistantMessageElements()) {
                     const rect = answer.getBoundingClientRect();
                     const visiblePixels = Math.max(
                         0,
@@ -4939,8 +5017,8 @@
             const selector = this.config.answerTocHeadingSelector;
             const all = [...answer.querySelectorAll(selector)].filter((element) => {
                 if (!(element instanceof HTMLElement) || !element.isConnected) return false;
-                if (element.closest('[data-message-author-role="assistant"]') !== answer) return false;
-                if (element.closest('[hidden], nav, aside, [role="menu"], [role="tooltip"]')) return false;
+                if (element.closest(ASSISTANT_SELECTOR) !== answer) return false;
+                if (element.closest('.sr-only, [hidden], [aria-hidden="true"], nav, aside, [role="menu"], [role="tooltip"]')) return false;
                 const label = this.normalizeText(element.textContent || '');
                 return Boolean(label);
             });
@@ -4972,8 +5050,7 @@
             let best = null;
             let bestScore = -Infinity;
 
-            const answers = [...document.querySelectorAll(ASSISTANT_SELECTOR)]
-                .filter((answer) => answer instanceof HTMLElement && answer.isConnected);
+            const answers = this.getAssistantMessageElements();
             for (const answer of answers) {
                 if (!answer.querySelector(this.config.answerTocHeadingSelector)) continue;
                 if (!this.collectHeadingsForAnswer(answer).length) continue;
@@ -5363,12 +5440,7 @@
                 return this.currentAnswer?.isConnected ? [this.currentAnswer] : [];
             }
 
-            return [...document.querySelectorAll(ASSISTANT_SELECTOR)].filter((element) => (
-                element instanceof HTMLElement &&
-                element.isConnected &&
-                !element.parentElement?.closest('[data-message-author-role="assistant"]') &&
-                !element.closest('[hidden], [aria-hidden="true"]')
-            ));
+            return this.getAssistantMessageElements();
         }
 
         buildSearchAssistantContextMap(assistants) {
@@ -5445,7 +5517,7 @@
                 const markdownRoots = assistant.matches('.markdown')
                     ? [assistant]
                     : [...assistant.querySelectorAll('.markdown')].filter((root) => (
-                        root.closest('[data-message-author-role="assistant"]') === assistant &&
+                        root.closest(ASSISTANT_SELECTOR) === assistant &&
                         !root.parentElement?.closest('.markdown')
                     ));
                 const roots = markdownRoots.length ? markdownRoots : [assistant];
@@ -5463,8 +5535,8 @@
                         if (!(element instanceof HTMLElement) || seen.has(element)) continue;
                         seen.add(element);
                         if (!element.isConnected) continue;
-                        if (element.closest('[hidden], [aria-hidden="true"]')) continue;
-                        if (element.closest('[data-message-author-role="assistant"]') !== assistant) continue;
+                        if (element.closest('.sr-only, [hidden], [aria-hidden="true"]')) continue;
+                        if (element.closest(ASSISTANT_SELECTOR) !== assistant) continue;
                         if (element.closest('button, nav, aside, [role="toolbar"], [role="menu"]')) {
                             continue;
                         }
@@ -6046,7 +6118,7 @@
             const selector = result.tagName.toLowerCase();
             if (!/^(h[1-6]|p|li|blockquote|pre|tr)$/.test(selector)) return null;
 
-            const candidates = [...document.querySelectorAll(`${ASSISTANT_SELECTOR} ${selector}`)]
+            const candidates = this.queryConversationElements(`${ASSISTANT_SELECTOR} ${selector}`)
                 .filter((element) => element instanceof HTMLElement && element.isConnected);
             const assistants = [...new Set(candidates.map((element) => (
                 element.closest(ASSISTANT_SELECTOR)
@@ -6094,7 +6166,7 @@
 
         getConversationTurnElement(element) {
             return element instanceof Element
-                ? element.closest('[data-testid^="conversation-turn-"]')
+                ? element.closest(TURN_SELECTOR)
                 : null;
         }
 
@@ -6118,14 +6190,26 @@
             if (messageId) return `message:${messageId}`;
 
             const testId = turn?.getAttribute('data-testid') || '';
-            return testId || `user-node:${fallbackIndex}`;
+            if (testId) return testId;
+            // 无原生 ID 的新版节点使用对象身份；不能因旧消息卸载而把第 N 个 DOM 节点
+            // 错认成之前的第 N 问，污染标题缓存。
+            if (element instanceof Element) {
+                this.conversationNodeIdentities ||= new WeakMap();
+                if (!this.conversationNodeIdentities.has(element)) {
+                    this.conversationNodeIdentitySequence = (this.conversationNodeIdentitySequence || 0) + 1;
+                    this.conversationNodeIdentities.set(element, `dom-message:${this.conversationNodeIdentitySequence}`);
+                }
+                return this.conversationNodeIdentities.get(element);
+            }
+            return `user-node:${fallbackIndex}`;
         }
 
         getUserMessageElements() {
-            const candidates = [...document.querySelectorAll(USER_SELECTOR)].filter((element) => {
+            this.syncConversationMessageRoles();
+            const candidates = this.queryConversationElements(USER_SELECTOR).filter((element) => {
                 if (!(element instanceof HTMLElement) || !element.isConnected) return false;
-                if (element.parentElement?.closest('[data-message-author-role="user"]')) return false;
-                if (element.closest('[hidden]')) return false;
+                if (element.parentElement?.closest(USER_SELECTOR)) return false;
+                if (element.closest('[hidden], [aria-hidden="true"], [role="dialog"]')) return false;
                 return true;
             });
 
@@ -6175,7 +6259,7 @@
             const clone = source.cloneNode(true);
             if (clone instanceof Element) {
                 for (const removable of clone.querySelectorAll(
-                    'button, script, style, svg, [aria-hidden="true"], [role="tooltip"]',
+                    'button, script, style, svg, .sr-only, [hidden], [aria-hidden="true"], [role="tooltip"], [data-message-actions]',
                 )) {
                     removable.remove();
                 }
@@ -6449,6 +6533,40 @@
             this.conversationLabelCache.set(logicalIndex, record.fullLabel);
         }
 
+        getConversationApiRecordIndices(records) {
+            if (!records.length || !this.conversationApiSnapshot ||
+                this.conversationApiSnapshotId !== this.getCurrentConversationId()) return null;
+            const prompts = this.getConversationBranchMessages(this.conversationApiSnapshot)
+                .filter((message) => message?.author?.role === 'user')
+                .map((message) => ({
+                    identity: message.id ? `message:${message.id}` : '',
+                    text: this.normalizeConversationText(this.extractApiMessagePromptText(message)),
+                }));
+            const candidates = records.map((record) => {
+                const byId = prompts.findIndex((prompt) => prompt.identity && prompt.identity === record.identity);
+                if (byId >= 0) return [byId];
+                const text = this.normalizeConversationText(record.fullLabel);
+                return text ? prompts.flatMap((prompt, index) => prompt.text === text ? [index] : []) : [];
+            });
+            if (candidates.some((indices) => !indices.length)) return null;
+            // 前向最早 + 后向最晚必须完全一致才接受：重复的“继续”不能凭猜测绑定轮次。
+            const earliest = [];
+            let previous = -1;
+            for (const indices of candidates) {
+                const index = indices.find((value) => value > previous);
+                if (index === undefined) return null;
+                earliest.push(index);
+                previous = index;
+            }
+            let next = prompts.length;
+            for (let position = candidates.length - 1; position >= 0; position -= 1) {
+                const index = candidates[position].findLast((value) => value < next);
+                if (index !== earliest[position]) return null;
+                next = index;
+            }
+            return earliest;
+        }
+
         mapUserRecordsToLogicalIndices(records, officialButtons) {
             const buttonsByIndex = new Map();
             let maxOfficialIndex = -1;
@@ -6483,7 +6601,9 @@
                 candidateConfident,
                 candidateTrustLabels,
             ) => {
-                if (mappedIndices || !this.validateRecordIndexMapping(candidate, maxOfficialIndex)) {
+                // 原生导航在 hydration 期间可能只挂载一部分；精确 API 身份映射不受其临时上限限制。
+                const limit = candidateSource === 'api-message-identity' ? -1 : maxOfficialIndex;
+                if (mappedIndices || !this.validateRecordIndexMapping(candidate, limit)) {
                     return false;
                 }
                 mappedIndices = candidate;
@@ -6505,7 +6625,10 @@
                 };
             }
 
-            if (!officialCount) {
+            const apiIndices = this.getConversationApiRecordIndices(records);
+            if (apiIndices) acceptCandidate(apiIndices, 'api-message-identity', true, true);
+
+            if (!officialCount && !mappedIndices) {
                 acceptCandidate(
                     records.map((_, index) => index),
                     'dom-only',
@@ -6617,9 +6740,10 @@
             }
 
             const recordsByIndex = new Map();
-            mappedIndices.forEach((logicalIndex, recordIndex) => {
+            // 官方导航/消息异步挂载期间可能没有任何可信候选；不应让解析器整体抛错。
+            (mappedIndices || []).forEach((logicalIndex, recordIndex) => {
                 if (!Number.isInteger(logicalIndex) || logicalIndex < 0) return;
-                if (maxOfficialIndex >= 0 && logicalIndex > maxOfficialIndex) return;
+                if (source !== 'api-message-identity' && maxOfficialIndex >= 0 && logicalIndex > maxOfficialIndex) return;
                 const record = records[recordIndex];
                 if (!record) return;
 
@@ -7351,8 +7475,11 @@
         }
 
         getAssistantMessageElements() {
-            return [...document.querySelectorAll(ASSISTANT_SELECTOR)]
-                .filter((element) => element instanceof HTMLElement && element.isConnected)
+            this.syncConversationMessageRoles();
+            return this.queryConversationElements(ASSISTANT_SELECTOR)
+                .filter((element) => element instanceof HTMLElement && element.isConnected &&
+                    !element.parentElement?.closest(ASSISTANT_SELECTOR) &&
+                    !element.closest('[hidden], [aria-hidden="true"], [role="dialog"]'))
                 .sort((a, b) => {
                     if (a === b) return 0;
                     const relation = a.compareDocumentPosition(b);
@@ -7367,9 +7494,10 @@
             const userTurnNumber = this.getConversationTurnNumber(userElement);
             if (Number.isInteger(userTurnNumber)) {
                 const exact = document.querySelector(
-                    `[data-testid="conversation-turn-${userTurnNumber + 1}"] ${ASSISTANT_SELECTOR.replace(/^main\s+/, '')}`,
+                    `[data-testid="conversation-turn-${userTurnNumber + 1}"] ${ASSISTANT_SELECTOR}`,
                 );
-                if (exact instanceof HTMLElement && exact.isConnected) return exact;
+                if (exact instanceof HTMLElement && exact.isConnected &&
+                    !exact.closest('[hidden], [aria-hidden="true"]') && this.getConversationRoot()?.contains(exact)) return exact;
             }
 
             const nextUser = this.getUserMessageElements().find((candidate) => {
@@ -7577,6 +7705,7 @@
                 ) {
                     this.conversationApiSnapshot = snapshot;
                     this.conversationApiAssetsByIndex = this.buildConversationApiAssetMap(snapshot);
+                    this.scheduleConversationRebuild(0);
                 }
                 return snapshot;
             }).finally(() => {
@@ -7603,7 +7732,9 @@
 
             const roots = Object.values(mapping).filter((node) => !node?.parent);
             let node = roots[0] || null;
-            while (node) {
+            visited.clear();
+            while (node && !visited.has(node)) {
+                visited.add(node);
                 if (node.message) messages.push(node.message);
                 const children = Array.isArray(node.children) ? node.children : [];
                 node = children.length ? mapping[children[children.length - 1]] : null;
@@ -7774,6 +7905,7 @@
             if (!title) return true;
             const stem = title.replace(/\.(?:png|jpe?g|webp|gif|avif|bmp|tiff?)$/i, '').trim();
             if (/^(?:generated[-_ ]?)?(?:image|picture|photo|artwork|illustration|图片|图像|(?:已)?生成(?:的)?图片|(?:已)?生成(?:的)?图像)(?:[-_ ]?\d+)?$/i.test(stem)) return true;
+            if (/^(?:(?:show|edit|share|open|view|preview|download)\s+(?:the\s+)?generated\s+(?:image|picture)|(?:显示|编辑|分享|打开|查看|预览|下载)(?:已)?生成(?:的)?(?:图片|图像))(?:\s*\d+)?$/i.test(stem)) return true;
             if (/^(?:image[_ -]?(?:gen(?:eration)?|creator)|gpt[_ -]?image|dall[-_. ]?e)(?:\s+tool)?$/i.test(stem)) return true;
             if (/^(?:(?:dall[-_. ]?e|gpt[_ -]?image|image[_ -]?gen(?:eration)?)\s+)?(?:generation\s+)?metadata$/i.test(stem)) return true;
             if (/^(?:(?:open|view|preview|download|zoom)(?: the)?|打开|查看|预览|下载|放大)?\s*(?:image|picture|图片|图像)(?:\s*\d+)?$/i.test(stem)) return true;
@@ -7880,6 +8012,9 @@
                 let entries = [];
                 try { entries = Object.entries(value); } catch { return; }
                 for (const [key, child] of entries) {
+                    // React element 的 _owner/return 可以回到包含整轮乃至整段会话的 Fiber，
+                    // 不属于这张图片的描述数据，不能跨越容器边界继续找标题。
+                    if (/^(?:_owner|_store|_debug.*|return|alternate|stateNode)$/.test(key)) continue;
                     const priority = getPriority(key, path);
                     const nextPriority = priority < 0 ? 0 : (priority || inheritedPriority);
                     walk(child, path ? `${path}.${key}` : key, depth + 1, nextPriority);
@@ -8982,7 +9117,9 @@
 
         isLikelyGeneratedImageElement(image, allowLargeContentImages = false) {
             if (!(image instanceof HTMLImageElement) || !image.isConnected) return false;
-            if (image.closest('[hidden], [aria-hidden="true"], [role="tooltip"], [data-message-actions]')) return false;
+            if (image.closest('[hidden], [aria-hidden="true"], [role="dialog"], [role="tooltip"], [data-message-actions]')) return false;
+            // 用户上传的图片也走 OpenAI 文件域名，不能仅凭域名当作生成结果。
+            if (image.closest(USER_SELECTOR)) return false;
             const source = this.getLargestImageCandidate(image);
             if (!source) return false;
             const context = image.closest('figure, [data-testid*="image" i], [class*="image" i]');
@@ -9009,26 +9146,30 @@
             const large = width >= 160 && height >= 120;
             const explicit = /(?:generated[_ -]?(?:image|picture)|image[_ -]?(?:generation|output|asset)|dall[-_. ]?e|gpt[_ -]?image|生成(?:的)?(?:图片|图像)|创建的?(?:图片|图像))/i.test(signal);
             const openAiImage = /(?:oaiusercontent\.com|oaistatic\.com|file-service|sediment|\/backend-api\/files?\/)/i.test(source);
-            const generatedContainer = image.closest('[id^="image-"], [class*="imagegen-image" i], [data-testid*="imagegen" i]');
+            const generatedContainer = image.closest(GENERATED_IMAGE_CONTAINER_SELECTOR);
             const allowedByContext = allowLargeContentImages && Boolean(
                 generatedContainer || image.closest(ASSISTANT_SELECTOR),
             );
-            return large && (explicit || allowedByContext || openAiImage);
+            const generatedThumbnail = generatedContainer && width >= 40 && height >= 40;
+            return Boolean((large || generatedThumbnail) && (explicit || generatedContainer || allowedByContext || openAiImage));
         }
 
         collectGeneratedImageDomItems(allowLargeContentImages = false) {
             const items = [];
-            // Image 2.5 的 imagegen-image 与文字回答是同一 turn 的兄弟节点，不一定带 assistant role。
-            // 因而必须从 main 全局收集，再按最近的用户消息映射逻辑轮次。
-            const images = [...document.querySelectorAll('main img')]
+            this.syncConversationMessageRoles();
+            // 图片画廊可以是文字回答的兄弟节点；从实际消息区收集，不依赖 main 或 assistant。
+            const images = this.queryConversationElements('img')
                 .filter((image) => this.isLikelyGeneratedImageElement(image, allowLargeContentImages));
             const contextMap = this.buildSearchAssistantContextMap(images);
             for (const image of images) {
                 const logicalIndex = contextMap.get(image) ?? -1;
                 const sourceUrl = this.getLargestImageCandidate(image);
-                const holder = image.closest(
-                    '[id^="image-"], [class*="imagegen-image" i], figure, [data-testid*="image" i], [class*="image" i]',
-                );
+                // image-transparency-backdrop 是 img 自身的样式，不是标题容器。
+                const generatedHolder = image.parentElement?.closest(GENERATED_IMAGE_CONTAINER_SELECTOR);
+                const holder = (generatedHolder?.matches('[class~="group/generated-image-gallery-controls"]')
+                    ? image.closest('button') || image.parentElement
+                    : generatedHolder) ||
+                    image.parentElement?.closest('figure, [data-testid*="image" i]') || image.parentElement;
                 const caption = holder?.querySelector?.('figcaption')?.textContent || '';
                 const promptRecord = this.conversationItems.find((item) => item.logicalIndex === logicalIndex);
                 const promptText = this.normalizeConversationText(
@@ -9044,10 +9185,10 @@
                         const value = titleNode.getAttribute?.(attribute);
                         if (value) nearbyTitles.push(value);
                     }
-                    if (titleNode === holder || titleNode.matches?.('main, [data-testid^="conversation-turn-"]')) break;
+                    if (titleNode === holder || titleNode.matches?.(TURN_SELECTOR)) break;
                 }
                 const reactTitles = this.collectGeneratedImageTitleCandidates(
-                    this.getReactInternalPayloads(image, true),
+                    this.getReactInternalPayloads(image, true, holder),
                     185,
                 ).filter((candidate) => !this.isGeneratedImageTitleSameAsPrompt(candidate, promptText));
                 const explicitTitle = this.pickExplicitGeneratedImageTitle([
@@ -9063,6 +9204,9 @@
                 const title = explicitTitle || '未命名生成图像';
                 const fileId = this.extractFileIdFromValue(sourceUrl);
                 const linkUrl = this.normalizeAssetCandidateUrl(image.closest('a[href]')?.getAttribute('href') || '');
+                const nativeLabel = image.closest('button[aria-label]')?.getAttribute('aria-label') || image.alt || '';
+                const nativeIndexMatch = /^(?:(?:(?:show|edit|share)\s+)?generated\s+image|(?:已|显示|编辑|分享)?生成(?:的)?(?:图片|图像))\s+(\d+)$/i.exec(nativeLabel.trim());
+                const nativeImageIndex = nativeIndexMatch ? Number(nativeIndexMatch[1]) - 1 : null;
                 items.push({
                     id: `dom-generated-image-${items.length + 1}`,
                     logicalIndex,
@@ -9084,12 +9228,33 @@
                     filenameHint: 'generated-image.png',
                     mimeType: /^data:([^;,]+)/i.exec(sourceUrl)?.[1] || 'image/png',
                     element: image,
+                    nativeImageIndex,
+                    nativeGalleryElement: image.closest('[class~="group/generated-image-gallery-controls"]'),
                     explicitTitle,
                     galleryOrder: items.length,
                     captureMethod: 'dom-generated-image',
                 });
             }
-            return items;
+            // 主预览和缩略图常同时指向同一原图，只保留一项；优先保留较大的定位节点。
+            const unique = [];
+            for (const item of items) {
+                const duplicate = unique.find((candidate) =>
+                    this.assetsShareStrongIdentity(candidate, item) ||
+                    candidate.sourceUrl === item.sourceUrl
+                );
+                if (!duplicate) { unique.push(item); continue; }
+                if (!duplicate.imageTitle && item.imageTitle) {
+                    duplicate.title = duplicate.imageTitle = duplicate.explicitTitle = item.imageTitle;
+                    duplicate.imageTitleSource = item.imageTitleSource;
+                }
+                if (item.element.getBoundingClientRect().width > duplicate.element.getBoundingClientRect().width) {
+                    duplicate.element = item.element;
+                }
+            }
+            unique.sort((first, second) => first.nativeGalleryElement && first.nativeGalleryElement === second.nativeGalleryElement &&
+                Number.isInteger(first.nativeImageIndex) && Number.isInteger(second.nativeImageIndex)
+                ? first.nativeImageIndex - second.nativeImageIndex : first.galleryOrder - second.galleryOrder);
+            return unique.map((item, index) => ({ ...item, galleryOrder: index }));
         }
 
         mergeGeneratedImageItems(apiItems, domItems) {
@@ -9109,11 +9274,22 @@
                 }
             }
 
+            // 新画廊显式标记“已生成图像 N”。切回第 1 张时不能再与 API 最后一张盲配。
+            for (const domItem of domItems) {
+                if (assignments.has(domItem) || domItem.logicalIndex < 0 || !Number.isInteger(domItem.nativeImageIndex)) continue;
+                const siblings = merged.map((item, index) => ({ item, index }))
+                    .filter(({ item }) => item.logicalIndex === domItem.logicalIndex);
+                const candidate = siblings[domItem.nativeImageIndex];
+                if (!candidate || usedApi.has(candidate.index) || this.assetsHaveConflictingStrongIdentity(candidate.item, domItem)) continue;
+                assignments.set(domItem, candidate.index);
+                usedApi.add(candidate.index);
+            }
+
             // ChatGPT 同一轮通常只在 DOM 中挂载当前选中的版本，而 API 会返回全部历史版本。
             // 将未命中的 DOM 项与该轮 API 尾部对齐，才能把当前（通常也是最新）版本放回正确位置。
             const remainingByLogicalIndex = new Map();
             for (const domItem of domItems) {
-                if (assignments.has(domItem) || domItem.logicalIndex < 0) continue;
+                if (assignments.has(domItem) || domItem.logicalIndex < 0 || Number.isInteger(domItem.nativeImageIndex)) continue;
                 if (!remainingByLogicalIndex.has(domItem.logicalIndex)) remainingByLogicalIndex.set(domItem.logicalIndex, []);
                 remainingByLogicalIndex.get(domItem.logicalIndex).push(domItem);
             }
@@ -9124,22 +9300,13 @@
                     .map(({ index }) => index);
                 const aligned = candidates.slice(Math.max(0, candidates.length - group.length));
                 for (let position = 0; position < Math.min(group.length, aligned.length); position += 1) {
+                    if (this.assetsHaveConflictingStrongIdentity(merged[aligned[position]], group[position])) continue;
                     assignments.set(group[position], aligned[position]);
                     usedApi.add(aligned[position]);
                 }
             }
 
-            // DOM 上下文尚未映射到问答索引时，仍按整页顺序从尾部对齐；不跨问答盲配已知索引。
-            const unknownDomItems = domItems.filter((item) => !assignments.has(item) && item.logicalIndex < 0);
-            const unknownApiIndices = merged
-                .map((item, index) => ({ item, index }))
-                .filter(({ index }) => !usedApi.has(index))
-                .map(({ index }) => index);
-            const alignedUnknown = unknownApiIndices.slice(Math.max(0, unknownApiIndices.length - unknownDomItems.length));
-            for (let position = 0; position < Math.min(unknownDomItems.length, alignedUnknown.length); position += 1) {
-                assignments.set(unknownDomItems[position], alignedUnknown[position]);
-                usedApi.add(alignedUnknown[position]);
-            }
+            // 无法确认所属问答时保留独立项；虚拟化后的局部 DOM 顺序不是会话全局顺序。
 
             for (const domItem of domItems) {
                 const index = assignments.get(domItem);
@@ -9166,6 +9333,12 @@
                     promptText: apiItem.promptText || domItem.promptText || '',
                 };
             }
+            // API 尚未包含的新图也应回到其所属问答，不能统统追加到整个会话末尾。
+            merged.sort((first, second) => {
+                const firstIndex = Number.isInteger(first.logicalIndex) && first.logicalIndex >= 0 ? first.logicalIndex : Infinity;
+                const secondIndex = Number.isInteger(second.logicalIndex) && second.logicalIndex >= 0 ? second.logicalIndex : Infinity;
+                return firstIndex === secondIndex ? 0 : firstIndex - secondIndex;
+            });
             return merged.map((item, index) => ({ ...item, galleryOrder: index }));
         }
 
@@ -10600,7 +10773,9 @@
                 return { url: match[1], weight };
             })).filter(Boolean).sort((a, b) => b.weight - a.weight);
             return this.normalizeAssetCandidateUrl(
-                candidates[0]?.url || image.currentSrc || image.getAttribute('src') || '',
+                // img 被复用且新图片尚未加载完成时，currentSrc 可能仍指向上一张。
+                // 显式 src/srcset 才是这一轮 UI 当前请求的图片。
+                candidates[0]?.url || image.getAttribute('src') || image.currentSrc || '',
             );
         }
 
@@ -10784,7 +10959,7 @@
             return new Map(this.queryAllDeep(selector).map((node) => [node, this.getArtifactNodeState(node)]));
         }
 
-        getReactInternalPayloads(element, force = false) {
+        getReactInternalPayloads(element, force = false, boundary = null) {
             if ((!force && this.config.conversationExportProbeReactProperties === false) || !(element instanceof Element)) return [];
             const payloads = [];
             const seen = new Set();
@@ -10800,13 +10975,15 @@
                         if (value && typeof value === 'object' && !seen.has(value)) { seen.add(value); payloads.push(value); }
                     } else if (key.startsWith('__reactFiber$')) {
                         let fiber = value;
-                        for (let up = 0; fiber && up < 4; up += 1, fiber = fiber.return) {
+                        // 图片标题只能读取本图容器内的 props，不追溯到含多图的画廊组件。
+                        for (let up = 0; fiber && up < (boundary ? 1 : 4); up += 1, fiber = fiber.return) {
                             for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
                                 if (props && typeof props === 'object' && !seen.has(props)) { seen.add(props); payloads.push(props); }
                             }
                         }
                     }
                 }
+                if (node === boundary) break;
             }
             return payloads.slice(0, 16);
         }
@@ -14897,7 +15074,7 @@
                 (
                     this.config.quickSearchScope === 'current-answer'
                         ? this.currentAnswer?.isConnected
-                        : this.currentAnswer?.isConnected || document.querySelector(ASSISTANT_SELECTOR)
+                        : this.currentAnswer?.isConnected || this.queryConversationElements(ASSISTANT_SELECTOR).length
                 ),
             );
             const hasAnyNavigation =
