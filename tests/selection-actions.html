@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Selection actions regression</title>
+<script>
+  window.__CGPT_TOC_TEST_MODE__ = true;
+  window.unsafeWindow = window;
+  window.GM_addStyle = css => { const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style); };
+  window.GM_xmlhttpRequest = () => {};
+  window.fetch = () => new Promise(() => {});
+</script>
+<script src="../fluent-chatgpt.user.js"></script>
+<body>
+<main>
+  <div data-message-author-role="assistant"><p id="answer">正文文字可以继续选中和复制。</p><button id="inline-ask">向 ChatGPT 提问</button></div>
+  <div data-composer-body>
+    <div id="composer" contenteditable="true" class="ProseMirror" data-composer-markdown>输入框文字可以继续选中和编辑。</div>
+    <div id="attachment-toolbar" role="toolbar"><button>添加附件</button><button>发送</button></div>
+    <div id="editor-local-selection" class="pointer-events-none w-max absolute" style="left: 80px; top: 120px; transform: translateX(clamp(-50px, -50%, calc(400px - 100%))) translateY(-100%);">
+      <div role="presentation" class="pointer-events-auto flex w-fit max-w-full"><button aria-label="加粗">B</button><button aria-label="斜体">I</button></div>
+    </div>
+  </div>
+</main>
+<!-- Structure observed in the live SelectionOverlay, without private conversation content. -->
+<div id="answer-selection" class="pointer-events-none w-max fixed z-50" style="left: 80px; top: 60px; max-width: 1200px; transform: translateX(clamp(-50px, 0%, calc(400px - 100%))) translateY(-100%);">
+  <div role="presentation" class="pointer-events-auto flex w-fit max-w-full overflow-hidden rounded-lg"><button>向 ChatGPT 提问</button></div>
+</div>
+<div id="editor-selection" class="pointer-events-none w-max fixed z-50" style="left: 80px; top: 200px; transform: translateX(clamp(-50px, -50%, calc(400px - 100%))) translateY(-100%);">
+  <div role="presentation" class="pointer-events-auto flex w-fit max-w-full min-w-0 flex-wrap items-center rounded-xl"><button aria-label="Bold">B</button><button aria-label="Italic">I</button></div>
+</div>
+<div id="zoomed-selection" class="pointer-events-none w-max fixed z-50" style="left: 80px; top: 200px; transform: translateX(clamp(-50px, -50%, calc(400px - 100%))) translateY(-100%);">
+  <div style="zoom:1.25"><div role="presentation" class="pointer-events-auto"><button>Ask ChatGPT</button></div></div>
+</div>
+<!-- Composer uses a separate Radix popover; this structure follows its loaded formatToolbar component. -->
+<div id="composer-format-popover" data-radix-popper-content-wrapper style="position:fixed;transform:translate(20px,150px)">
+  <div role="dialog" data-state="open" data-side="top" aria-label="Text formatting" class="z-50 select-none">
+    <div role="presentation" class="pointer-events-auto flex w-fit max-w-full overflow-hidden min-w-0 flex-wrap items-center rounded-xl">
+      <button aria-label="Link">链接</button><button aria-label="Bold" aria-pressed="false">B</button><button aria-label="Italic" aria-pressed="true">I</button><button aria-haspopup="menu">正文</button>
+    </div>
+  </div>
+</div>
+<div id="ordinary-radix-popover" data-radix-popper-content-wrapper style="position:fixed;transform:translate(20px,250px)"><div role="dialog"><button aria-pressed="true">选择模型</button><button aria-haspopup="menu">更多</button></div></div>
+<div id="legacy-selection" popover="manual" style="--targeted-action-selection-top: 20px"><button>开始写作</button></div>
+<div id="normal-popover" popover="manual"><button>选择模型</button></div>
+<div id="image-toolbar" role="toolbar" data-image-preview-toolbar><button>下载图片</button></div>
+<div id="floating-tooltip" class="pointer-events-none w-max fixed" style="transform: translateX(clamp(-50px, 0%, calc(400px - 100%))) translateY(-100%);"><div role="tooltip" class="pointer-events-auto">普通工具提示</div></div>
+<div id="ordinary-presentation" class="pointer-events-none w-max fixed" style="transform: translateY(10px)"><div role="presentation" class="pointer-events-auto"><button>普通浮动按钮</button></div></div>
+<pre id="result">pending</pre>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const checks = [];
+  const check = (name, pass, details = '') => checks.push({ name, pass: Boolean(pass), details });
+  try {
+    for (const id of ['answer-selection', 'editor-selection', 'editor-local-selection', 'zoomed-selection', 'legacy-selection', 'composer-format-popover']) {
+      const element = document.getElementById(id);
+      if (element.hasAttribute('popover')) element.showPopover();
+      check(`${id}: hidden without relying on localized button text`, getComputedStyle(element).display === 'none');
+      check(`${id}: cannot receive accidental pointer clicks`, getComputedStyle(element).pointerEvents === 'none' && element.querySelector('button').getClientRects().length === 0);
+    }
+    document.getElementById('normal-popover').showPopover();
+    for (const id of ['inline-ask', 'attachment-toolbar', 'normal-popover', 'image-toolbar', 'floating-tooltip', 'ordinary-presentation', 'ordinary-radix-popover']) {
+      const element = document.getElementById(id);
+      check(`${id}: unrelated controls remain visible`, getComputedStyle(element).display !== 'none' && element.getClientRects().length > 0);
+    }
+    const late = document.getElementById('answer-selection').cloneNode(true);
+    late.id = 'late-selection';
+    document.body.appendChild(late);
+    check('late-mounted selection overlay is hidden before painting', getComputedStyle(late).display === 'none');
+    const formatDialog = document.querySelector('#composer-format-popover [role="dialog"]');
+    formatDialog.setAttribute('aria-label', 'Format du texte');
+    formatDialog.querySelectorAll('button').forEach((button, index) => button.setAttribute('aria-label', `其他语言 ${index}`));
+    check('composer formatting suppression does not depend on UI language', getComputedStyle(formatDialog.parentElement).display === 'none');
+    for (const id of ['answer', 'composer']) {
+      const element = document.getElementById(id);
+      if (element.isContentEditable) element.focus();
+      const selection = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event('selectionchange'));
+      check(`${id}: selected text is preserved`, selection.toString() === element.textContent);
+      const copy = new Event('copy', { bubbles: true, cancelable: true });
+      element.dispatchEvent(copy);
+      check(`${id}: normal copy events are not cancelled`, !copy.defaultPrevented);
+      const key = new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true });
+      element.dispatchEvent(key);
+      check(`${id}: Ctrl+C remains available`, !key.defaultPrevented);
+    }
+    check('composer remains editable and focused', document.getElementById('composer').isContentEditable && document.activeElement.id === 'composer');
+    getSelection().removeAllRanges();
+  } catch (error) {
+    check('unexpected exception', false, error.stack || String(error));
+  }
+  const passed = checks.every(item => item.pass);
+  document.documentElement.dataset.testsPassed = String(passed);
+  document.documentElement.dataset.testCount = String(checks.length);
+  document.getElementById('result').textContent = JSON.stringify({ passed, checks }, null, 2);
+});
+</script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.7.2
+// @version      4.7.3
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -15,7 +15,7 @@
 (() => {
     'use strict';
 
-    const SCRIPT_VERSION = '4.7.2';
+    const SCRIPT_VERSION = '4.7.3';
 
     const CONFIG = Object.freeze({
         // 单条回答本身非常长时再开启。默认关闭，兼容性更稳。
@@ -24,7 +24,7 @@
         // 仅当“正在输入的提示词本身也很长”时尝试开启。
         disableEditorSpellcheck: false,
 
-        // 隐藏选中文字后出现的“询问 ChatGPT / 开始写作”浮层。
+        // 隐藏选中文字后的“向 ChatGPT 提问”和输入框格式编辑浮层；不影响选择、复制或输入。
         hideSelectionActions: true,
 
         // 启用当前 Assistant 回答的 H1/H2 目录。
@@ -337,8 +337,16 @@
 
     if (CONFIG.hideSelectionActions) {
         css.push(`
-      [popover="manual"][style*="--targeted-action-selection"] {
+      /* 旧版 targeted-action popover，以及新版 SelectionOverlay 的独立定位层。
+       * 新版没有 popover 属性；同时限定定位样式与 presentation 工具条。
+       * Composer 的格式工具条使用 Radix 定位层：格式切换按钮 + 文本样式菜单，
+       * 不依赖“加粗 / Bold”等翻译文本或构建哈希。
+       * 不要粗暴隐藏所有 toolbar/popover（会误伤附件、模型选择和图片控件）。 */
+      [popover="manual"][style*="--targeted-action-selection"],
+      .pointer-events-none.w-max:is(.fixed, .absolute)[style*="translateX(clamp("][style*="translateY(-100%)"]:has([role="presentation"].pointer-events-auto),
+      [data-radix-popper-content-wrapper]:has([role="presentation"].pointer-events-auto.flex-wrap button[aria-pressed]):has([role="presentation"].pointer-events-auto.flex-wrap button[aria-haspopup="menu"]) {
         display: none !important;
+        visibility: hidden !important;
         pointer-events: none !important;
       }
     `);
@@ -989,20 +997,23 @@
             const searchEnabled = Boolean(this.config.enableQuickSearch);
             const exportEnabled = Boolean(this.config.enableConversationArchive);
             const imageGalleryEnabled = Boolean(this.config.enableGeneratedImageGallery);
+            const viewTabHtml = (view, label, shortLabel, selected = false, hidden = false) => `
+              <button id="view-${view}" class="view-tab" type="button" role="tab" data-view="${view}"
+                aria-selected="${selected}" aria-label="${label}" title="${label}"${hidden ? ' hidden' : ''}>
+                <span class="view-tab-content" aria-hidden="true">
+                  <span class="view-tab-label view-tab-full">${label}</span>
+                  <span class="view-tab-label view-tab-short">${shortLabel}</span>
+                  <span id="view-${view}-count" class="view-count">0</span>
+                </span>
+              </button>`;
             const imageTabHtml = imageGalleryEnabled
-                ? `<button id="view-images" class="view-tab" type="button" role="tab" data-view="images" aria-selected="false" hidden>
-              <span>图片</span><span id="view-images-count" class="view-count">0</span>
-            </button>`
+                ? viewTabHtml('images', '图片', '图', false, true)
                 : '';
             const searchTabHtml = searchEnabled
-                ? `<button id="view-search" class="view-tab" type="button" role="tab" data-view="search" aria-selected="false">
-              <span>搜索</span><span id="view-search-count" class="view-count">0</span>
-            </button>`
+                ? viewTabHtml('search', '搜索', '搜')
                 : '';
             const exportTabHtml = exportEnabled
-                ? `<button id="view-export" class="view-tab" type="button" role="tab" data-view="export" aria-selected="false">
-              <span>导出</span><span id="view-export-count" class="view-count">0</span>
-            </button>`
+                ? viewTabHtml('export', '导出', '导')
                 : '';
             const searchViewHtml = searchEnabled
                 ? `<section id="search-view" class="search-view" aria-label="快速搜索" hidden>
@@ -1320,6 +1331,7 @@
           }
 
           .panel {
+            container: cgpt-navigation / inline-size;
             position: relative;
             width: min(var(--cgpt-answer-toc-width, 300px), calc(100vw - 16px));
             max-height: min(68vh, 660px, calc(100vh - 16px));
@@ -1457,20 +1469,22 @@
           .view-tabs {
             display: grid;
             flex: none;
-            grid-template-columns: repeat(auto-fit, minmax(54px, 1fr));
-            gap: 4px;
-            padding: 5px 6px;
+            /* 每个可见标签一列，不能因最小列宽自动换行。 */
+            grid-auto-flow: column;
+            grid-auto-columns: minmax(0, 1fr);
+            gap: clamp(1px, 1cqi, 4px);
+            padding: 5px clamp(2px, 1.5cqi, 6px);
             border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
           }
 
           .view-tab {
+            container: cgpt-navigation-tab / inline-size;
             min-width: 0;
             min-height: 31px;
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            gap: 3px;
-            padding: 5px 4px;
+            padding: 5px clamp(1px, 1cqi, 4px);
             border: 0;
             border-radius: 8px;
             background: transparent;
@@ -1478,8 +1492,29 @@
             cursor: pointer;
           }
 
-          .view-tab > span:first-child {
+          .view-tab-content {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 0;
+            max-width: 100%;
+            gap: clamp(1px, 5cqi, 3px);
+            font-size: clamp(11px, 24cqi, 13px);
             white-space: nowrap;
+          }
+
+          .view-tab-label {
+            flex: none;
+          }
+
+          .view-tab-full {
+            display: none;
+          }
+
+          /* 按每个按钮的实际可用宽度切换，隐藏图片/关闭功能后也会自动恢复全名。 */
+          @container cgpt-navigation-tab (min-width: 60px) {
+            .view-tab-full { display: inline; }
+            .view-tab-short { display: none; }
           }
 
           .view-tab:hover {
@@ -1498,11 +1533,15 @@
           }
 
           .view-count {
-            min-width: 1.4em;
-            padding: 1px 4px;
+            flex: 0 1 auto;
+            min-width: 0;
+            padding: 1px clamp(0px, calc(10cqi - 3px), 4px);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
             border-radius: 999px;
             background: color-mix(in srgb, currentColor 10%, transparent);
-            font-size: 10px;
+            font-size: clamp(9px, 20cqi, 10px);
             font-variant-numeric: tabular-nums;
             font-weight: 500;
           }
@@ -2670,12 +2709,8 @@
           </div>
 
           <div class="view-tabs" role="tablist" aria-label="目录层级">
-            <button id="view-conversation" class="view-tab" type="button" role="tab" data-view="conversation" aria-selected="false">
-              <span>问答</span><span id="view-conversation-count" class="view-count">0</span>
-            </button>
-            <button id="view-headings" class="view-tab" type="button" role="tab" data-view="headings" aria-selected="true">
-              <span>章节</span><span id="view-headings-count" class="view-count">0</span>
-            </button>
+            ${viewTabHtml('conversation', '问答', '问')}
+            ${viewTabHtml('headings', '章节', '章', true)}
             ${imageTabHtml}
             ${searchTabHtml}
             ${exportTabHtml}
@@ -3340,6 +3375,20 @@
             }
             if (this.viewExportCount) {
                 this.viewExportCount.textContent = archiveTotal ? `${archiveLoaded}/${archiveTotal}` : '0';
+            }
+            // 窄栏的大计数允许省略显示，但悬浮和辅助技术始终能读到完整名称/数值。
+            for (const [button, count, label] of [
+                [this.viewConversationButton, this.viewConversationCount, '问答'],
+                [this.viewHeadingsButton, this.viewHeadingsCount, '章节'],
+                [this.viewImagesButton, this.viewImagesCount, '图片'],
+                [this.viewSearchButton, this.viewSearchCount, '搜索'],
+                [this.viewExportButton, this.viewExportCount, '导出'],
+            ]) {
+                if (!button || !count) continue;
+                const hint = `${label}（${count.textContent}）`;
+                button.title = hint;
+                button.setAttribute('aria-label', hint);
+                count.title = count.textContent;
             }
             if (this.countLabel) {
                 if (conversationActive) {

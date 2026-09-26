@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Navigation tab layout regression</title>
+<style>:root { color-scheme: light; --main-surface-primary: #fff; --main-surface-secondary: #f3f3f3; --text-primary: #161616; --text-secondary: #444; --border-light: rgba(0,0,0,.12); }</style>
+<script>
+  window.__CGPT_TOC_TEST_MODE__ = true;
+  window.unsafeWindow = window;
+  window.GM_addStyle = () => {};
+  window.GM_xmlhttpRequest = () => {};
+  window.fetch = () => new Promise(() => {});
+  localStorage.clear();
+</script>
+<script src="../fluent-chatgpt.user.js"></script>
+<body>
+<main><div data-message-author-role="user">标签布局测试</div><div data-message-author-role="assistant"><h2>测试章节</h2><p>仅使用合成内容，无网络请求。</p></div></main>
+<pre id="result">pending</pre>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const c = window.__cgptAnswerTocController;
+  const checks = [];
+  const check = (name, pass, details = '') => checks.push({ name, pass: Boolean(pass), details });
+  try {
+    clearInterval(c.healthTimer);
+    clearInterval(c.routeWatchTimer);
+    clearTimeout(c.generatedImageRefreshTimer);
+    clearTimeout(c.conversationRebuildTimer);
+    clearTimeout(c.frameFallbackTimer);
+    cancelAnimationFrame(c.frameId);
+    c.cancelBottomPin();
+    c.clearHeadingRecovery();
+    c.pageObserver?.disconnect();
+    c.mainObserver?.disconnect();
+    c.answerObserver?.disconnect();
+    c.headingTextObserver?.disconnect();
+    c.hydrateGeneratedImagePreviews = () => {};
+    c.generatedImages = [{ imageTitle: '测试图片' }];
+    c.config = { ...c.config, answerTocOpenConversationAtBottom: false };
+    c.setCollapsed(false, { persist: false });
+    c.syncVisibility();
+    c.host.removeAttribute('data-size-mode');
+    const tabs = c.shadow.querySelector('.view-tabs');
+    const buttons = [...tabs.querySelectorAll('.view-tab')];
+    const labels = ['问答', '章节', '图片', '搜索', '导出'];
+    const shortLabels = ['问', '章', '图', '搜', '导'];
+    const visibleLabel = button => [...button.querySelectorAll('.view-tab-label')]
+      .find(label => getComputedStyle(label).display !== 'none');
+    const setWidth = width => {
+      c.host.style.setProperty('--cgpt-answer-toc-width', `${width}px`);
+      c.panel.getBoundingClientRect(); // Flush size/container queries without waiting for animation frames.
+    };
+    for (const counts of [['1', '2', '3', '4', '0/1'], ['12345', '6789', '1234', '80+', '12345/67890']]) {
+      buttons.forEach((button, index) => button.querySelector('.view-count').textContent = counts[index]);
+      for (const width of [160, 180, 220, 260, 300, 360, 440, 560]) {
+        setWidth(width);
+        const rects = buttons.map(button => button.getBoundingClientRect());
+        const tabRect = tabs.getBoundingClientRect();
+        const caseName = `${width}px, ${counts[0] === '1' ? 'normal' : 'large'} counts`;
+        check(`${caseName}: all five tabs share one row`, rects.every(rect => Math.abs(rect.top - rects[0].top) < 1 && Math.abs(rect.bottom - rects[0].bottom) < 1));
+        check(`${caseName}: no horizontal overflow`, tabs.scrollWidth <= tabs.clientWidth + 1 && buttons.every(button => button.scrollWidth <= button.clientWidth + 1));
+        check(`${caseName}: all buttons fit without overlap`, rects.every((rect, index) => rect.left >= tabRect.left && rect.right <= tabRect.right + 1 && (!index || rect.left >= rects[index - 1].right)));
+        check(`${caseName}: complete labels remain readable`, buttons.every((button, index) => {
+          const label = visibleLabel(button);
+          const rect = label?.getBoundingClientRect();
+          const buttonRect = rects[index];
+          return label && [labels[index], shortLabels[index]].includes(label.textContent) && parseFloat(getComputedStyle(label).fontSize) >= 11 && rect.left >= buttonRect.left && rect.right <= buttonRect.right;
+        }));
+        if (counts[0] === '1') check(`${caseName}: ordinary counts are not clipped`, buttons.every(button => {
+          const count = button.querySelector('.view-count');
+          return count.scrollWidth <= count.clientWidth + 1;
+        }));
+      }
+    }
+    setWidth(220);
+    check('narrow panel uses the requested single-character labels', buttons.map(button => visibleLabel(button).textContent).join('/') === shortLabels.join('/'));
+    const narrowFont = parseFloat(getComputedStyle(buttons[0].querySelector('.view-tab-content')).fontSize);
+    const narrowGap = parseFloat(getComputedStyle(tabs).gap);
+    setWidth(560);
+    check('wide panel restores full labels', buttons.map(button => visibleLabel(button).textContent).join('/') === labels.join('/'));
+    check('font size and spacing adapt to panel width', parseFloat(getComputedStyle(buttons[0].querySelector('.view-tab-content')).fontSize) > narrowFont && parseFloat(getComputedStyle(tabs).gap) > narrowGap);
+    check('container sizing preserves the panel contents height', c.panel.getBoundingClientRect().height > tabs.getBoundingClientRect().height + 32);
+
+    setWidth(300);
+    c.generatedImages = [];
+    c.updateViewMeta();
+    check('image tab stays hidden when no images exist', getComputedStyle(c.viewImagesButton).display === 'none');
+    const four = buttons.filter(button => !button.hidden);
+    check('four tabs use the released space and restore full labels', four.every(button => visibleLabel(button).textContent.length === 2));
+    c.viewSearchButton.hidden = true;
+    c.viewExportButton.hidden = true;
+    setWidth(160);
+    const two = buttons.filter(button => !button.hidden);
+    check('disabled/absent tabs leave no empty grid columns', two.length === 2 && two.every(button => button.getBoundingClientRect().width > 70));
+    c.viewSearchButton.hidden = false;
+    c.viewExportButton.hidden = false;
+    c.generatedImages = [{ imageTitle: '测试图片' }];
+    c.updateViewMeta();
+    setWidth(220);
+    for (const [index, button] of buttons.entries()) {
+      button.click();
+      check(`${labels[index]}: clicking the short label still selects its view`, c.activeView === button.dataset.view && button.getAttribute('aria-selected') === 'true');
+      const count = button.querySelector('.view-count').textContent;
+      check(`${labels[index]}: hover and accessible name retain full label/count`, button.title.includes(labels[index]) && button.title.includes(count) && button.getAttribute('aria-label') === button.title);
+    }
+    c.setActiveView('headings', false);
+    c.setCollapsed(true, { persist: false });
+    check('collapsed launcher keeps its intrinsic width and separate drag handle', c.launcher.getBoundingClientRect().width >= 60 && c.launcher.scrollWidth <= c.launcher.clientWidth + 1 && c.launcherDragHandle.getBoundingClientRect().width > 0);
+    check('tab size containment does not apply to the collapsed launcher', getComputedStyle(c.launcher).containerType === 'normal');
+    c.setCollapsed(false, { persist: false });
+    const previewWidth = Number(new URLSearchParams(location.search).get('preview'));
+    setWidth(previewWidth || 220);
+    if (previewWidth) document.getElementById('result').style.display = 'none';
+  } catch (error) {
+    check('unexpected exception', false, error.stack || String(error));
+  }
+  const passed = checks.every(item => item.pass);
+  document.documentElement.dataset.testsPassed = String(passed);
+  document.documentElement.dataset.testCount = String(checks.length);
+  document.getElementById('result').textContent = JSON.stringify({ passed, checks }, null, 2);
+});
+</script>
+</body>
+</html>
