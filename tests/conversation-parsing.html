@@ -211,8 +211,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     check('new markdown search excludes interface headings', !liveSearch.some(item => item.element?.textContent === '正文外部控件标题'));
     equal('live user prompt excludes reader header', c.conversationItems[0]?.fullLabel, '真实结构中的提问');
     check('live semantic message pairing', c.findAssistantForUser(document.getElementById('live-user')) === document.getElementById('live-answer'));
-    equal('script version is inspectable on host', c.host.dataset.scriptVersion, '4.7.3');
-    check('script version is visible as navigation-title hint', c.shadow.querySelector('.panel-title').title.includes('4.7.3'));
+    equal('script version is inspectable on host', c.host.dataset.scriptVersion, '4.7.4');
+    check('script version is visible as navigation-title hint', c.shadow.querySelector('.panel-title').title.includes('4.7.4'));
     document.getElementById('live-answer').removeAttribute('data-chatgpt-search-unit-key');
     await pause();
     equal('content-search-unit attribute is a standalone fallback', c.getAssistantMessageElements().length, 1);

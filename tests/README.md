@@ -13,7 +13,7 @@ node tests/run-startup-tests.cjs
 
 覆盖旧版消息结构、新版无 `main` 的 transcript、搜索单元及消息身份属性、`display:contents` 包装、`MarkdownRoot` 正文、读屏角色后备、新旧属性混合嵌套、隐藏/重复消息、章节和搜索、图片归属/标题/顺序、节点复用、反向滚动、API 分支映射与会话容器重新挂载。新版结构来自本机样本页的只读检查；测试使用合成内容，不保存私人会话或登录信息。
 
-`run-browser-tests.cjs` 同时检查标签栏在 160–560px 宽度、普通/大计数、不同可见标签数量下保持单行，自动切换全名/单字，且保留点击和完整的辅助名称。选区测试覆盖旧版 popover、新版正文 SelectionOverlay、输入框 Radix 格式工具条、缩放包装和延迟挂载，并确认选择/复制/输入、附件、模型菜单和图片控件不受影响。可分别打开 `navigation-tabs.html`、`selection-actions.html` 查看夹具结果。
+`run-browser-tests.cjs` 同时检查标签栏在 160–560px 宽度、普通/大计数、不同可见标签数量下保持单行和双字全名，压缩按钮及标签栏两侧留白，并验证字体不小于 11px。极窄按钮暂时隐藏计数徽标（悬浮提示和辅助名称仍保留完整计数），宽度恢复或可见标签减少后自动恢复；正常面板宽度下计数保持可见。选区测试覆盖旧版 popover、新版正文 SelectionOverlay、输入框 Radix 格式工具条、缩放包装和延迟挂载，并确认选择/复制/输入、附件、模型菜单和图片控件不受影响。可分别打开 `navigation-tabs.html`、`selection-actions.html` 查看夹具结果。
 
 导航标题悬浮提示和宿主节点的 `data-script-version` 显示实际运行版本。项目文件更新不会自动替换已经运行的标签页脚本；需更新油猴中的脚本并刷新标签页。
 

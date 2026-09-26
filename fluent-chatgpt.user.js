@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.7.3
+// @version      4.7.4
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -15,7 +15,7 @@
 (() => {
     'use strict';
 
-    const SCRIPT_VERSION = '4.7.3';
+    const SCRIPT_VERSION = '4.7.4';
 
     const CONFIG = Object.freeze({
         // 单条回答本身非常长时再开启。默认关闭，兼容性更稳。
@@ -997,23 +997,22 @@
             const searchEnabled = Boolean(this.config.enableQuickSearch);
             const exportEnabled = Boolean(this.config.enableConversationArchive);
             const imageGalleryEnabled = Boolean(this.config.enableGeneratedImageGallery);
-            const viewTabHtml = (view, label, shortLabel, selected = false, hidden = false) => `
+            const viewTabHtml = (view, label, selected = false, hidden = false) => `
               <button id="view-${view}" class="view-tab" type="button" role="tab" data-view="${view}"
                 aria-selected="${selected}" aria-label="${label}" title="${label}"${hidden ? ' hidden' : ''}>
                 <span class="view-tab-content" aria-hidden="true">
-                  <span class="view-tab-label view-tab-full">${label}</span>
-                  <span class="view-tab-label view-tab-short">${shortLabel}</span>
+                  <span class="view-tab-label">${label}</span>
                   <span id="view-${view}-count" class="view-count">0</span>
                 </span>
               </button>`;
             const imageTabHtml = imageGalleryEnabled
-                ? viewTabHtml('images', '图片', '图', false, true)
+                ? viewTabHtml('images', '图片', false, true)
                 : '';
             const searchTabHtml = searchEnabled
-                ? viewTabHtml('search', '搜索', '搜')
+                ? viewTabHtml('search', '搜索')
                 : '';
             const exportTabHtml = exportEnabled
-                ? viewTabHtml('export', '导出', '导')
+                ? viewTabHtml('export', '导出')
                 : '';
             const searchViewHtml = searchEnabled
                 ? `<section id="search-view" class="search-view" aria-label="快速搜索" hidden>
@@ -1472,8 +1471,8 @@
             /* 每个可见标签一列，不能因最小列宽自动换行。 */
             grid-auto-flow: column;
             grid-auto-columns: minmax(0, 1fr);
-            gap: clamp(1px, 1cqi, 4px);
-            padding: 5px clamp(2px, 1.5cqi, 6px);
+            gap: clamp(1px, calc(1cqi - 2px), 2px);
+            padding: 5px 2px;
             border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
           }
 
@@ -1484,7 +1483,7 @@
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            padding: 5px clamp(1px, 1cqi, 4px);
+            padding: 5px 1px;
             border: 0;
             border-radius: 8px;
             background: transparent;
@@ -1498,23 +1497,13 @@
             justify-content: center;
             min-width: 0;
             max-width: 100%;
-            gap: clamp(1px, 5cqi, 3px);
-            font-size: clamp(11px, 24cqi, 13px);
+            gap: clamp(1px, calc(5cqi - 1px), 2px);
+            font-size: clamp(11px, 30cqi, 13px);
             white-space: nowrap;
           }
 
           .view-tab-label {
             flex: none;
-          }
-
-          .view-tab-full {
-            display: none;
-          }
-
-          /* 按每个按钮的实际可用宽度切换，隐藏图片/关闭功能后也会自动恢复全名。 */
-          @container cgpt-navigation-tab (min-width: 60px) {
-            .view-tab-full { display: inline; }
-            .view-tab-short { display: none; }
           }
 
           .view-tab:hover {
@@ -1535,15 +1524,21 @@
           .view-count {
             flex: 0 1 auto;
             min-width: 0;
-            padding: 1px clamp(0px, calc(10cqi - 3px), 4px);
+            padding: 1px clamp(0px, calc(10cqi - 4px), 2px);
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
             border-radius: 999px;
             background: color-mix(in srgb, currentColor 10%, transparent);
-            font-size: clamp(9px, 20cqi, 10px);
+            font-size: clamp(9px, 24cqi, 10px);
             font-variant-numeric: tabular-nums;
             font-weight: 500;
+          }
+
+          /* 始终保留双字标签；极窄按钮优先显示名称，完整计数仍在 title/aria-label 中。
+             按按钮实际空间判断，减少可见标签后会自动恢复计数，无需 JS 测量。 */
+          @container cgpt-navigation-tab (max-width: 37px) {
+            .view-count { display: none; }
           }
 
           .export-view {
@@ -2709,8 +2704,8 @@
           </div>
 
           <div class="view-tabs" role="tablist" aria-label="目录层级">
-            ${viewTabHtml('conversation', '问答', '问')}
-            ${viewTabHtml('headings', '章节', '章', true)}
+            ${viewTabHtml('conversation', '问答')}
+            ${viewTabHtml('headings', '章节', true)}
             ${imageTabHtml}
             ${searchTabHtml}
             ${exportTabHtml}
