@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Navigation themes and viewport restoration regression</title>
+<style>body { margin: 0; } iframe { display: block; border: 0; width: 1200px; height: 850px; }</style>
+<pre id="result">pending</pre>
+<script>
+localStorage.clear();
+const frame = document.createElement('iframe');
+frame.src = 'navigation-fixture.html';
+document.body.prepend(frame);
+frame.addEventListener('load', async function run() {
+  frame.removeEventListener('load', run);
+  const checks = [];
+  const check = (name, pass, details = '') => checks.push({ name, pass: Boolean(pass), details });
+  let w = frame.contentWindow, d = frame.contentDocument, c = w.__cgptAnswerTocController;
+  const pause = () => new Promise(resolve => setTimeout(resolve, 70));
+  const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const near = (a, b) => Math.abs(a - b) < 1;
+  const stored = key => localStorage.getItem(`cgpt-answer-toc-${key}-v1`);
+  const rect = () => c.getVisibleWidget().getBoundingClientRect();
+  const geometry = () => JSON.stringify({ rect: rect().toJSON(), viewport: [d.documentElement.clientWidth, d.documentElement.clientHeight], saved: c.savedPosition, size: c.savedSize, css: c.host.style.cssText });
+  const inside = () => { const r = rect(); return r.left >= 7 && r.top >= 7 && r.right <= d.documentElement.clientWidth - 7 && r.bottom <= d.documentElement.clientHeight - 7; };
+  const resize = async (width, height) => { frame.style.width = `${width}px`; frame.style.height = `${height}px`; await pause(); };
+  try {
+    await pause();
+    c.setCollapsed(false, { persist: false });
+    check('appearance fixture includes real parsed headings and conversations', c.headings.length >= 2 && c.conversationItems.length === 1);
+    const hoverStyle = d.createElement('style');
+    hoverStyle.textContent = c.shadow.querySelector('style').textContent.replaceAll(':hover', '.fixture-hover');
+    c.shadow.appendChild(hoverStyle); // Exercise the actual hover declarations with a deterministic selector.
+    const canvas = d.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const rgba = css => { ctx.clearRect(0, 0, 1, 1); ctx.fillStyle = css; ctx.fillRect(0, 0, 1, 1); const p = [...ctx.getImageData(0, 0, 1, 1).data]; return [p[0], p[1], p[2], p[3] / 255]; };
+    const blend = (fg, bg) => fg.slice(0, 3).map((v, i) => v * fg[3] + bg[i] * (1 - fg[3])).concat(1);
+    const luminance = rgb => rgb.slice(0, 3).map(v => { v /= 255; return v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; }).reduce((sum, v, i) => sum + v * [.2126, .7152, .0722][i], 0);
+    const contrast = (a, b) => { const x = luminance(a), y = luminance(b); return (Math.max(x, y) + .05) / (Math.min(x, y) + .05); };
+    const background = (element, backdrop) => {
+      const chain = [];
+      for (let el = element; el && el !== c.host; el = el.parentElement || el.getRootNode().host) chain.unshift(el);
+      return chain.reduce((bg, el) => blend(rgba(w.getComputedStyle(el).backgroundColor), bg), backdrop);
+    };
+    const readable = (element, backdrop) => contrast(rgba(w.getComputedStyle(element).color), background(element, backdrop));
+    const states = [
+      ['sample data-theme dark / system light', 'dark', 'data', false],
+      ['explicit light / system dark', 'light', 'data', true],
+      ['legacy dark class', 'dark', 'class', false],
+      ['legacy light class', 'light', 'class', true],
+      ['computed color-scheme dark', 'dark', 'scheme', false],
+      ['computed color-scheme light', 'light', 'scheme', true],
+      ['system dark fallback', 'dark', 'system', true],
+      ['system light fallback', 'light', 'system', false],
+      ['body data-theme dark', 'dark', 'body', false],
+      ['dark with conflicting old CSS tokens', 'dark', 'conflict', false],
+    ];
+    for (const [name, theme, mode, systemDark] of states) {
+      d.documentElement.className = mode === 'class' ? theme : 'chatgpt-theme';
+      d.documentElement.removeAttribute('data-theme');
+      d.body.removeAttribute('data-theme');
+      d.documentElement.style.cssText = `color-scheme: ${mode === 'scheme' ? theme : 'normal'};`;
+      if (mode === 'data' || mode === 'conflict') d.documentElement.dataset.theme = theme;
+      if (mode === 'body') d.body.dataset.theme = theme;
+      if (mode === 'conflict') {
+        d.documentElement.style.setProperty('--text-primary', '#111');
+        d.documentElement.style.setProperty('--text-secondary', '#333');
+        d.documentElement.style.setProperty('--main-surface-secondary', '#fff');
+      }
+      w.__themeMedia.matches = systemDark;
+      w.__themeMedia.dispatchEvent(new w.Event('change'));
+      d.body.style.background = theme === 'dark' ? '#0e0e0e' : '#fff';
+      d.body.style.color = theme === 'dark' ? '#ededed' : '#242424';
+      await pause();
+      check(`${name}: follows actual page theme`, c.host.dataset.theme === theme);
+      check(`${name}: native controls use matching color scheme`, w.getComputedStyle(c.host).colorScheme === theme);
+      for (const view of ['conversation', 'headings', 'images', 'search', 'export']) {
+        c.setActiveView(view, false);
+        for (const backdrop of [[0, 0, 0, 1], [255, 255, 255, 1]]) {
+          const elements = [...c.shadow.querySelectorAll('.panel-title, .count-label, .view-tab, .view-count, .toc-item, .prompt-index, .tool-button:not(:disabled), .export-option, .image-card-button, .image-gallery-status, .search-input, .search-status, .empty-state')].filter(el => el.getBoundingClientRect().width > 0);
+          const minimum = Math.min(...elements.map(el => readable(el, backdrop)));
+          check(`${name}, ${view}, ${backdrop[0]} backdrop: readable text`, minimum >= 4.5, minimum.toFixed(2));
+        }
+        const hovered = [...c.shadow.querySelectorAll('.view-tab, .toc-item, .tool-button:not(:disabled), .image-card-button, .icon-button')].filter(el => el.getBoundingClientRect().width > 0);
+        hovered.forEach(el => el.classList.add('fixture-hover'));
+        check(`${name}, ${view}: hover colors remain readable`, hovered.length > 0 && hovered.every(el => [[0, 0, 0, 1], [255, 255, 255, 1]].every(bg => readable(el, bg) >= 4.5)));
+        hovered.forEach(el => el.classList.remove('fixture-hover'));
+      }
+      c.setActiveView('headings', false);
+      const panelBg = background(c.panel, theme === 'dark' ? [14, 14, 14, 1] : [255, 255, 255, 1]);
+      const selectedBg = background(c.viewHeadingsButton, panelBg);
+      check(`${name}: selection background is subtle, not inverted`, contrast(panelBg, selectedBg) < 1.7);
+      c.setCollapsed(true, { persist: false });
+      check(`${name}: collapsed launcher is readable`, [[0, 0, 0, 1], [255, 255, 255, 1]].every(bg => readable(c.launcherExpandButton, bg) >= 4.5));
+      c.setCollapsed(false, { persist: false });
+      c.viewConversationButton.focus();
+      const focus = w.getComputedStyle(c.viewConversationButton);
+      check(`${name}: keyboard focus remains visible`, focus.outlineStyle !== 'none' && parseFloat(focus.outlineWidth) >= 2);
+      c.viewConversationButton.blur();
+    }
+    hoverStyle.remove();
+    // Attribute observer must work without a system-theme event or manual sync.
+    d.documentElement.dataset.theme = 'light';
+    await pause();
+    check('changing the page theme updates without a reload', c.host.dataset.theme === 'light');
+    d.documentElement.dataset.theme = 'dark';
+    await pause();
+    check('changing back to dark updates without a reload', c.host.dataset.theme === 'dark');
+
+    c.setPanelSize(330, 320, true);
+    c.setManualPosition(820, 480, true);
+    c.ensureManualPositionInViewport();
+    const original = { left: rect().left, top: rect().top };
+    const savedPosition = stored('position'), savedSize = stored('size');
+    for (const [width, height] of [[900, 550], [600, 420], [1000, 700], [1200, 850]]) {
+      await resize(width, height);
+      check(`${width}x${height}: widget stays inside viewport`, inside(), geometry());
+      check(`${width}x${height}: resize does not overwrite saved position or size`, stored('position') === savedPosition && stored('size') === savedSize);
+      check(`${width}x${height}: in-memory preferences remain intact`, equal(c.savedPosition, original) && equal(c.savedSize, { width: 330, height: 320 }));
+    }
+    check('restoring the window restores both original coordinates', near(rect().left, original.left) && near(rect().top, original.top));
+    c.setPanelSize(560, 760, true);
+    c.setManualPosition(620, 40, true);
+    await resize(900, 500);
+    check('small viewport temporarily shrinks a manually sized panel', rect().height < 500 && c.savedSize.height === 760 && inside(), geometry());
+    await resize(1200, 850);
+    check('original manual dimensions return when the window grows', near(rect().width, 560) && near(rect().height, 760) && near(rect().left, 620) && near(rect().top, 40));
+
+    await resize(900, 500);
+    const idealRight = c.savedPosition.left + c.savedSize.width;
+    c.setCollapsed(true, { persist: true });
+    await pause();
+    await resize(1200, 850);
+    check('collapsed launcher restores its original edge anchor', near(rect().right, idealRight) && near(rect().top, 40), geometry());
+    c.setCollapsed(false, { persist: true });
+    await pause();
+    check('expanding after restoration returns to the original panel position', near(rect().left, 620) && near(rect().top, 40));
+
+    await resize(900, 500);
+    c.setManualPosition(70, 90, true);
+    await resize(1200, 850);
+    check('intentional movement in the smaller window becomes the new preference', near(rect().left, 70) && near(rect().top, 82) && c.savedPosition.top === 90, geometry());
+    c.setPanelSize(330, 320, true);
+    c.ensureManualPositionInViewport();
+    check('relieving height constraints restores the intended top coordinate', near(rect().top, 90));
+    c.setManualPosition(820, 480, true);
+    await resize(900, 550);
+    const reload = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+    w.location.reload();
+    await reload;
+    w = frame.contentWindow; d = frame.contentDocument; c = w.__cgptAnswerTocController;
+    await pause();
+    check('reload in a small window retains the saved larger-window position', equal(c.savedPosition, { left: 820, top: 480 }) && inside(), geometry());
+    await resize(1200, 850);
+    check('resizing after reload still restores the original position', near(rect().left, 820) && near(rect().top, 480));
+    c.setPanelSize(330, 320, true);
+    await resize(900, 550);
+    const dragStart = rect();
+    const pointer = (type, x, y) => new w.PointerEvent(type, { pointerId: 7, isPrimary: true, button: 0, clientX: x, clientY: y, cancelable: true });
+    c.beginDrag(pointer('pointerdown', dragStart.left + 10, dragStart.top + 10), 'panel');
+    c.onDragPointerMove(pointer('pointermove', 90, 110));
+    c.onDragPointerEnd(pointer('pointerup', 90, 110));
+    check('real drag handlers save a deliberate move in the smaller window', equal(c.savedPosition, { left: 80, top: 100 }) && equal(JSON.parse(stored('position')), c.savedPosition));
+    await resize(1200, 850);
+    check('window restoration honors that drag instead of an obsolete position', near(rect().left, 80) && near(rect().top, 100));
+    c.positionMode = 'auto'; c.host.dataset.positionMode = 'auto';
+    const autoBefore = rect();
+    await resize(900, 550);
+    await resize(1200, 850);
+    check('automatic positioning also returns to its original location', near(rect().left, autoBefore.left) && near(rect().top, autoBefore.top));
+    d.documentElement.className = '';
+    d.documentElement.removeAttribute('data-theme');
+    d.documentElement.style.colorScheme = 'normal';
+    const oldBody = d.body;
+    const newBody = oldBody.cloneNode(true);
+    newBody.querySelector('#cgpt-answer-toc-host')?.remove();
+    newBody.dataset.theme = 'dark';
+    oldBody.replaceWith(newBody);
+    c.refreshPageBindings();
+    await pause();
+    check('body replacement rebinds the theme observer and restores host', c.themeBody === newBody && c.host.parentElement === newBody && c.host.dataset.theme === 'dark');
+    newBody.dataset.theme = 'light';
+    await pause();
+    check('theme changes still work after body replacement', c.host.dataset.theme === 'light');
+    c.setCurrentAnswer(newBody.querySelector('[data-message-author-role="assistant"]'));
+    const preview = new URLSearchParams(location.search).get('preview');
+    if (preview) {
+      c.setPanelSize(330, 360, false); c.setManualPosition(690, 90, false);
+      d.documentElement.dataset.theme = preview;
+      d.body.style.background = preview === 'dark' ? '#0e0e0e' : '#fff';
+      d.body.style.color = preview === 'dark' ? '#ededed' : '#242424';
+      document.getElementById('result').style.display = 'none';
+      await pause();
+    }
+  } catch (error) { check('unexpected exception', false, error.stack || String(error)); }
+  document.documentElement.dataset.testsPassed = String(checks.every(item => item.pass));
+  document.documentElement.dataset.testCount = String(checks.length);
+  document.getElementById('result').textContent = JSON.stringify({ passed: checks.every(item => item.pass), checks }, null, 2);
+  if (location.protocol === 'http:') fetch('/release-stream');
+});
+</script>
+</html>

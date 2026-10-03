@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.7.4
+// @version      4.7.5
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -15,7 +15,7 @@
 (() => {
     'use strict';
 
-    const SCRIPT_VERSION = '4.7.4';
+    const SCRIPT_VERSION = '4.7.5';
 
     const CONFIG = Object.freeze({
         // 单条回答本身非常长时再开启。默认关闭，兼容性更稳。
@@ -53,9 +53,9 @@
         // 目录条目的最大文本长度；完整标题仍会放在 title 提示中。
         answerTocMaxLabelLength: 180,
 
-        // 目录与折叠按钮的背景透明度，范围 0～1。
-        answerTocPanelOpacity: 0.72,
-        answerTocLauncherOpacity: 0.68,
+        // 目录与折叠按钮的背景不透明度，范围 0～1。默认避免底层文字/图片透出干扰阅读。
+        answerTocPanelOpacity: 0.94,
+        answerTocLauncherOpacity: 0.92,
 
         // 半透明背景后的模糊强度。默认关闭，避免固定模糊层增加绘制开销。
         answerTocBackdropBlurPx: 0,
@@ -790,6 +790,9 @@
             this.mainElement = null;
             this.mainObserver = null;
             this.pageObserver = null;
+            this.themeObserver = null;
+            this.themeBody = null;
+            this.themeMedia = null;
             this.answerObserver = null;
             this.headingTextObserver = null;
 
@@ -889,6 +892,7 @@
             if (!document.body) return;
 
             this.createUi();
+            this.bindThemeObserver();
             this.bindPageObserver();
             this.bindMainObserver();
             this.syncOfficialConversationNav();
@@ -957,10 +961,47 @@
         refreshPageBindings() {
             if (!document.body) return;
             if (this.host && !this.host.isConnected) document.body.appendChild(this.host);
+            if (this.themeBody !== document.body) this.bindThemeObserver();
             if (this.checkForRouteChange()) return;
             // 同一路由重挂载只重绑 DOM，不清空缓存或重新等待整段路由静默窗口。
             this.bindMainObserver();
             this.syncVisibility();
+        }
+
+        syncTheme() {
+            // 网页显式主题优先于系统；新版 ChatGPT 不一定保留旧的颜色变量。
+            const roots = [document.documentElement, document.body].filter(Boolean);
+            let theme = '';
+            for (const root of roots) {
+                const explicit = root.getAttribute('data-theme')?.toLowerCase();
+                if (explicit === 'dark' || explicit === 'light') theme = explicit;
+                else if (root.classList.contains('dark')) theme = 'dark';
+                else if (root.classList.contains('light')) theme = 'light';
+                if (theme) break;
+            }
+            if (!theme) {
+                for (const root of roots) {
+                    const schemes = getComputedStyle(root).colorScheme.split(/\s+/).filter(value => value === 'dark' || value === 'light');
+                    if (schemes.length === 1) { theme = schemes[0]; break; }
+                }
+            }
+            if (!theme) theme = this.themeMedia?.matches ? 'dark' : 'light';
+            if (this.host && this.host.dataset.theme !== theme) this.host.dataset.theme = theme;
+        }
+
+        bindThemeObserver() {
+            if (!this.themeMedia) {
+                this.themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+                this.themeMedia.addEventListener('change', () => this.syncTheme());
+            }
+            this.themeObserver?.disconnect();
+            this.themeObserver = new MutationObserver(() => this.syncTheme());
+            this.themeBody = document.body;
+            // 只观察主题根节点，流式正文和目录自身的状态变化不会触发主题重算。
+            for (const root of [document.documentElement, this.themeBody].filter(Boolean)) {
+                this.themeObserver.observe(root, { attributes: true, attributeFilter: ['class', 'data-theme', 'style'] });
+            }
+            this.syncTheme();
         }
 
         createUi() {
@@ -970,8 +1011,8 @@
                 const number = Number(value);
                 return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : fallback;
             };
-            const panelOpacity = clampUnit(this.config.answerTocPanelOpacity, 0.72);
-            const launcherOpacity = clampUnit(this.config.answerTocLauncherOpacity, 0.68);
+            const panelOpacity = clampUnit(this.config.answerTocPanelOpacity, 0.94);
+            const launcherOpacity = clampUnit(this.config.answerTocLauncherOpacity, 0.92);
             const panelOpacityPercent = `${Math.round(panelOpacity * 100)}%`;
             const launcherOpacityPercent = `${Math.round(launcherOpacity * 100)}%`;
             const backdropBlur = Math.max(0, Number(this.config.answerTocBackdropBlurPx) || 0);
@@ -1176,6 +1217,15 @@
         <style>
           :host {
             all: initial;
+            /* 独立成对配色，避免网页旧变量消失/改名后出现深底黑字、浅底白字。 */
+            --cgpt-toc-surface: #ffffff;
+            --cgpt-toc-raised: #f1f2f3;
+            --cgpt-toc-selected: #e5e7ea;
+            --cgpt-toc-text: #242424;
+            --cgpt-toc-secondary: #4c4c4c;
+            --cgpt-toc-muted: #62666b;
+            --cgpt-toc-border: rgba(0, 0, 0, 0.10);
+            --cgpt-toc-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
             position: fixed !important;
             inset-inline-end: var(--cgpt-answer-toc-inline-end, 20px) !important;
             top: 50% !important;
@@ -1188,10 +1238,22 @@
               "Segoe UI", sans-serif !important;
             font-size: 13px !important;
             line-height: 1.4 !important;
-            color: var(--text-primary, #161616) !important;
-            color-scheme: light dark !important;
+            color: var(--cgpt-toc-text) !important;
+            color-scheme: light !important;
             direction: inherit !important;
             pointer-events: none !important;
+          }
+
+          :host([data-theme="dark"]) {
+            --cgpt-toc-surface: #262626;
+            --cgpt-toc-raised: #333333;
+            --cgpt-toc-selected: #3b3b3b;
+            --cgpt-toc-text: #dedede;
+            --cgpt-toc-secondary: #c4c4c4;
+            --cgpt-toc-muted: #ababab;
+            --cgpt-toc-border: rgba(255, 255, 255, 0.10);
+            --cgpt-toc-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+            color-scheme: dark !important;
           }
 
           :host([data-position-mode="manual"]) {
@@ -1228,29 +1290,29 @@
             align-items: center;
             overflow: hidden;
             padding: 0;
-            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.14));
+            border: 1px solid var(--cgpt-toc-border);
             border-radius: 12px;
-            background: rgba(255, 255, 255, ${launcherOpacity});
+            background: var(--cgpt-toc-surface);
             background: color-mix(
               in srgb,
-              var(--main-surface-primary, var(--bg-primary, #ffffff)) ${launcherOpacityPercent},
+              var(--cgpt-toc-surface) ${launcherOpacityPercent},
               transparent
             );
-            color: var(--text-secondary, #444444);
-            box-shadow: 0 6px 22px rgba(0, 0, 0, 0.14);
+            color: var(--cgpt-toc-secondary);
+            box-shadow: var(--cgpt-toc-shadow);
             touch-action: none;
             user-select: none;
           }
 
           .launcher:hover,
           .launcher:focus-within {
-            background: rgba(244, 244, 244, ${launcherOpacity});
+            background: var(--cgpt-toc-raised);
             background: color-mix(
               in srgb,
-              var(--main-surface-secondary, var(--bg-secondary, #f4f4f4)) ${launcherOpacityPercent},
+              var(--cgpt-toc-raised) ${launcherOpacityPercent},
               transparent
             );
-            color: var(--text-primary, #161616);
+            color: var(--cgpt-toc-text);
           }
 
           .launcher-drag-handle {
@@ -1262,8 +1324,8 @@
             grid-auto-rows: 3px;
             place-content: center;
             gap: 3px;
-            border-inline-end: 1px solid var(--border-light, rgba(0, 0, 0, 0.12));
-            color: var(--text-tertiary, #777777);
+            border-inline-end: 1px solid var(--cgpt-toc-border);
+            color: var(--cgpt-toc-muted);
             cursor: grab;
           }
 
@@ -1279,7 +1341,7 @@
 
           .launcher-drag-handle:hover {
             background: color-mix(in srgb, currentColor 8%, transparent);
-            color: var(--text-primary, #161616);
+            color: var(--cgpt-toc-text);
           }
 
           .launcher-open-button {
@@ -1304,7 +1366,7 @@
           .view-tab:focus-visible,
           .toc-item:focus-visible,
           .search-clear:focus-visible {
-            outline: 2px solid var(--text-primary, #161616);
+            outline: 2px solid var(--cgpt-toc-text);
             outline-offset: 2px;
           }
 
@@ -1317,7 +1379,7 @@
 
           .launcher-mode {
             min-width: 1em;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 10px;
             font-weight: 600;
           }
@@ -1337,15 +1399,15 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.14));
+            border: 1px solid var(--cgpt-toc-border);
             border-radius: 14px;
-            background: rgba(255, 255, 255, ${panelOpacity});
+            background: var(--cgpt-toc-surface);
             background: color-mix(
               in srgb,
-              var(--main-surface-primary, var(--bg-primary, #ffffff)) ${panelOpacityPercent},
+              var(--cgpt-toc-surface) ${panelOpacityPercent},
               transparent
             );
-            box-shadow: 0 10px 34px rgba(0, 0, 0, 0.16);
+            box-shadow: var(--cgpt-toc-shadow);
           }
 
           :host([data-size-mode="manual"]) .panel {
@@ -1378,7 +1440,7 @@
             padding-block: 7px;
             padding-inline-start: 9px;
             padding-inline-end: 24px;
-            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.11));
+            border-bottom: 1px solid var(--cgpt-toc-border);
             cursor: grab;
             touch-action: none;
             user-select: none;
@@ -1393,7 +1455,7 @@
             grid-auto-rows: 3px;
             place-content: center;
             gap: 3px;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             opacity: 0.75;
           }
 
@@ -1430,7 +1492,7 @@
 
           .panel-title {
             overflow: hidden;
-            color: var(--text-primary, #161616);
+            color: var(--cgpt-toc-text);
             font-weight: 600;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -1438,7 +1500,7 @@
 
           .count-label {
             flex: none;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 11px;
             font-variant-numeric: tabular-nums;
           }
@@ -1456,13 +1518,13 @@
             border: 0;
             border-radius: 8px;
             background: transparent;
-            color: var(--text-secondary, #555555);
+            color: var(--cgpt-toc-secondary);
             cursor: pointer;
           }
 
           .icon-button:hover {
-            background: var(--main-surface-secondary, var(--bg-secondary, #f1f1f1));
-            color: var(--text-primary, #161616);
+            background: var(--cgpt-toc-raised);
+            color: var(--cgpt-toc-text);
           }
 
           .view-tabs {
@@ -1473,7 +1535,7 @@
             grid-auto-columns: minmax(0, 1fr);
             gap: clamp(1px, calc(1cqi - 2px), 2px);
             padding: 5px 2px;
-            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+            border-bottom: 1px solid var(--cgpt-toc-border);
           }
 
           .view-tab {
@@ -1487,7 +1549,7 @@
             border: 0;
             border-radius: 8px;
             background: transparent;
-            color: var(--text-secondary, #4a4a4a);
+            color: var(--cgpt-toc-secondary);
             cursor: pointer;
           }
 
@@ -1509,15 +1571,15 @@
           .view-tab:hover {
             background: color-mix(
               in srgb,
-              var(--main-surface-secondary, var(--bg-secondary, #f3f3f3)) 74%,
+              var(--cgpt-toc-raised) 74%,
               transparent
             );
-            color: var(--text-primary, #161616);
+            color: var(--cgpt-toc-text);
           }
 
           .view-tab[aria-selected="true"] {
-            background: var(--main-surface-secondary, var(--bg-secondary, #ededed));
-            color: var(--text-primary, #111111);
+            background: var(--cgpt-toc-selected);
+            color: var(--cgpt-toc-text);
             font-weight: 600;
           }
 
@@ -1554,7 +1616,7 @@
             flex-direction: column;
             gap: 5px;
             padding: 6px 7px;
-            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+            border-bottom: 1px solid var(--cgpt-toc-border);
           }
 
           .conversation-tool-row {
@@ -1572,18 +1634,18 @@
             justify-content: center;
             gap: 4px;
             padding: 4px 8px;
-            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.13));
+            border: 1px solid var(--cgpt-toc-border);
             border-radius: 7px;
-            background: color-mix(in srgb, var(--main-surface-secondary, #f3f3f3) 66%, transparent);
-            color: var(--text-secondary, #4a4a4a);
+            background: color-mix(in srgb, var(--cgpt-toc-raised) 66%, transparent);
+            color: var(--cgpt-toc-secondary);
             font-size: 10.5px;
             line-height: 1.2;
             cursor: pointer;
           }
 
           .tool-button:hover:not(:disabled) {
-            background: var(--main-surface-secondary, var(--bg-secondary, #ededed));
-            color: var(--text-primary, #111111);
+            background: var(--cgpt-toc-raised);
+            color: var(--cgpt-toc-text);
           }
 
           .tool-button:disabled {
@@ -1603,13 +1665,13 @@
             flex-wrap: wrap;
             margin: 0;
             padding: 5px 7px;
-            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.11));
+            border: 1px solid var(--cgpt-toc-border);
             border-radius: 8px;
           }
 
           .export-options legend {
             padding-inline: 4px;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 10px;
           }
 
@@ -1617,7 +1679,7 @@
             display: inline-flex;
             align-items: center;
             gap: 4px;
-            color: var(--text-secondary, #4a4a4a);
+            color: var(--cgpt-toc-secondary);
             font-size: 10.5px;
             cursor: pointer;
             user-select: none;
@@ -1644,7 +1706,7 @@
             min-width: 0;
             flex: 1 1 90px;
             overflow: hidden;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 10px;
             line-height: 1.25;
             text-overflow: ellipsis;
@@ -1680,7 +1742,7 @@
 
           .conversation-row[data-archived="true"] .prompt-index::after {
             margin-inline-start: 2px;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             content: "✓";
             font-size: 9px;
           }
@@ -1721,7 +1783,7 @@
             border: 0;
             border-radius: 8px;
             background: transparent;
-            color: var(--text-secondary, #4a4a4a);
+            color: var(--cgpt-toc-secondary);
             text-align: start;
             cursor: pointer;
           }
@@ -1739,19 +1801,19 @@
           .toc-item:hover {
             background: color-mix(
               in srgb,
-              var(--main-surface-secondary, var(--bg-secondary, #f3f3f3)) 82%,
+              var(--cgpt-toc-raised) 82%,
               transparent
             );
-            color: var(--text-primary, #161616);
+            color: var(--cgpt-toc-text);
           }
 
           .toc-item[data-active="true"] {
-            background: var(--main-surface-secondary, var(--bg-secondary, #ededed));
-            color: var(--text-primary, #111111);
+            background: var(--cgpt-toc-selected);
+            color: var(--cgpt-toc-text);
           }
 
           .toc-item[data-active="true"]::before {
-            background: var(--text-primary, #111111);
+            background: var(--cgpt-toc-text);
           }
 
           .toc-item[data-level="1"] {
@@ -1773,7 +1835,7 @@
             width: 2.4em;
             flex: none;
             padding-top: 1px;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 10.5px;
             font-variant-numeric: tabular-nums;
             text-align: end;
@@ -1813,8 +1875,8 @@
             align-self: center;
             padding: 1px 5px;
             border-radius: 999px;
-            background: color-mix(in srgb, var(--text-tertiary, #777777) 11%, transparent);
-            color: var(--text-tertiary, #777777);
+            background: color-mix(in srgb, var(--cgpt-toc-muted) 11%, transparent);
+            color: var(--cgpt-toc-muted);
             font-size: 9.5px;
             white-space: nowrap;
           }
@@ -1837,14 +1899,14 @@
             align-items: center;
             gap: 8px;
             padding: 7px 8px;
-            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+            border-bottom: 1px solid var(--cgpt-toc-border);
           }
 
           .image-gallery-status {
             min-width: 0;
             flex: 1;
             overflow: hidden;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 10.5px;
             line-height: 1.3;
             text-overflow: ellipsis;
@@ -1873,23 +1935,23 @@
             display: block;
             overflow: hidden;
             padding: 0;
-            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.13));
+            border: 1px solid var(--cgpt-toc-border);
             border-radius: 10px;
-            background: color-mix(in srgb, var(--main-surface-secondary, #f3f3f3) 54%, transparent);
-            color: var(--text-secondary, #444444);
+            background: color-mix(in srgb, var(--cgpt-toc-raised) 54%, transparent);
+            color: var(--cgpt-toc-secondary);
             text-align: start;
             cursor: pointer;
           }
 
           .image-card-button:hover,
           .image-card-button[data-active="true"] {
-            border-color: color-mix(in srgb, var(--text-primary, #161616) 34%, transparent);
-            background: var(--main-surface-secondary, var(--bg-secondary, #ededed));
-            color: var(--text-primary, #111111);
+            border-color: color-mix(in srgb, var(--cgpt-toc-text) 34%, transparent);
+            background: var(--cgpt-toc-raised);
+            color: var(--cgpt-toc-text);
           }
 
           .image-card-button:focus-visible {
-            outline: 2px solid var(--text-primary, #161616);
+            outline: 2px solid var(--cgpt-toc-text);
             outline-offset: 2px;
           }
 
@@ -1901,7 +1963,7 @@
             place-items: center;
             background:
               linear-gradient(135deg, rgba(127, 127, 127, 0.09), rgba(127, 127, 127, 0.02)),
-              color-mix(in srgb, var(--main-surface-secondary, #f3f3f3) 76%, transparent);
+              color-mix(in srgb, var(--cgpt-toc-raised) 76%, transparent);
           }
 
           .image-card-media img {
@@ -1919,7 +1981,7 @@
           .image-card-placeholder {
             width: 35%;
             height: 35%;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             opacity: 0.56;
           }
 
@@ -2424,7 +2486,7 @@
           .search-toolbar {
             flex: none;
             padding: 7px 8px 6px;
-            border-bottom: 1px solid var(--border-light, rgba(0, 0, 0, 0.09));
+            border-bottom: 1px solid var(--cgpt-toc-border);
           }
 
           .search-input-wrap {
@@ -2434,19 +2496,19 @@
             align-items: center;
             gap: 6px;
             padding-inline: 9px 5px;
-            border: 1px solid var(--border-light, rgba(0, 0, 0, 0.14));
+            border: 1px solid var(--cgpt-toc-border);
             border-radius: 9px;
             background: color-mix(
               in srgb,
-              var(--main-surface-secondary, var(--bg-secondary, #f3f3f3)) 70%,
+              var(--cgpt-toc-raised) 70%,
               transparent
             );
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
           }
 
           .search-input-wrap:focus-within {
-            border-color: color-mix(in srgb, var(--text-primary, #161616) 36%, transparent);
-            color: var(--text-secondary, #444444);
+            border-color: color-mix(in srgb, var(--cgpt-toc-text) 36%, transparent);
+            color: var(--cgpt-toc-secondary);
           }
 
           .search-icon {
@@ -2463,7 +2525,7 @@
             border: 0;
             outline: 0;
             background: transparent;
-            color: var(--text-primary, #161616);
+            color: var(--cgpt-toc-text);
             font-size: 12.5px;
           }
 
@@ -2472,7 +2534,7 @@
           }
 
           .search-input::placeholder {
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             opacity: 0.9;
           }
 
@@ -2487,13 +2549,13 @@
             border: 0;
             border-radius: 7px;
             background: transparent;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             cursor: pointer;
           }
 
           .search-clear:hover {
             background: color-mix(in srgb, currentColor 10%, transparent);
-            color: var(--text-primary, #161616);
+            color: var(--cgpt-toc-text);
           }
 
           .search-clear svg {
@@ -2505,7 +2567,7 @@
             min-height: 16px;
             margin-top: 5px;
             overflow: hidden;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 10.5px;
             line-height: 1.35;
             text-overflow: ellipsis;
@@ -2527,7 +2589,7 @@
             align-items: center;
             gap: 6px;
             margin-bottom: 3px;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             font-size: 10.5px;
           }
 
@@ -2536,7 +2598,7 @@
             padding: 1px 5px;
             border-radius: 999px;
             background: color-mix(in srgb, currentColor 10%, transparent);
-            color: var(--text-secondary, #555555);
+            color: var(--cgpt-toc-secondary);
             font-weight: 600;
           }
 
@@ -2550,7 +2612,7 @@
           .search-result-snippet {
             display: -webkit-box;
             overflow: hidden;
-            color: var(--text-secondary, #444444);
+            color: var(--cgpt-toc-secondary);
             -webkit-box-orient: vertical;
             -webkit-line-clamp: 3;
             overflow-wrap: anywhere;
@@ -2567,9 +2629,9 @@
           .empty-state {
             margin: 6px;
             padding: 18px 12px;
-            border: 1px dashed var(--border-light, rgba(0, 0, 0, 0.14));
+            border: 1px dashed var(--cgpt-toc-border);
             border-radius: 10px;
-            color: var(--text-tertiary, #777777);
+            color: var(--cgpt-toc-muted);
             text-align: center;
             font-size: 12px;
           }
@@ -2620,38 +2682,6 @@
             right: 0;
             bottom: 0;
             cursor: nwse-resize;
-          }
-
-          @media (prefers-color-scheme: dark) {
-            .launcher {
-              border-color: rgba(255, 255, 255, 0.14);
-              background: rgba(33, 33, 33, ${launcherOpacity});
-              background: color-mix(
-                in srgb,
-                var(--main-surface-primary, var(--bg-primary, #212121)) ${launcherOpacityPercent},
-                transparent
-              );
-              box-shadow: 0 8px 28px rgba(0, 0, 0, 0.42);
-            }
-
-            .panel {
-              border-color: rgba(255, 255, 255, 0.14);
-              background: rgba(33, 33, 33, ${panelOpacity});
-              background: color-mix(
-                in srgb,
-                var(--main-surface-primary, var(--bg-primary, #212121)) ${panelOpacityPercent},
-                transparent
-              );
-              box-shadow: 0 8px 28px rgba(0, 0, 0, 0.42);
-            }
-
-            .panel-header,
-            .view-tabs,
-            .search-toolbar,
-            .image-toolbar,
-            .conversation-tools {
-              border-bottom-color: rgba(255, 255, 255, 0.11);
-            }
           }
 
           @media (prefers-reduced-motion: reduce) {
@@ -3095,12 +3125,7 @@
                 return;
             }
 
-            const left = Number.parseFloat(
-                this.host?.style.getPropertyValue('--cgpt-answer-toc-left') ?? '',
-            );
-            const top = Number.parseFloat(
-                this.host?.style.getPropertyValue('--cgpt-answer-toc-top') ?? '',
-            );
+            const { left, top } = this.savedPosition || {};
             if (!Number.isFinite(left) || !Number.isFinite(top)) return;
 
             try {
@@ -3118,9 +3143,16 @@
 
             this.positionMode = 'manual';
             this.host.dataset.positionMode = 'manual';
+            // 用户设定的位置与受视口限制的显示位置分开，resize 不能覆盖用户意图。
+            this.savedPosition = { left, top };
+            this.host.dataset.dockSide = this.getWidgetDockSide({ left, width: this.getPreferredWidgetWidth() });
+            this.renderManualPosition(left, top);
+            if (persist) this.writePositionState();
+        }
+
+        renderManualPosition(left, top) {
             this.host.style.setProperty('--cgpt-answer-toc-left', `${left}px`);
             this.host.style.setProperty('--cgpt-answer-toc-top', `${top}px`);
-            if (persist) this.writePositionState();
         }
 
         readSizeState() {
@@ -3143,7 +3175,7 @@
             return null;
         }
 
-        getPanelSizeLimits() {
+        getPanelSizeLimits(ignoreViewport = false) {
             const margin = Math.max(0, Number(this.config.answerTocDragViewportMarginPx) || 0);
             const viewportWidth = Math.max(1, document.documentElement.clientWidth);
             const viewportHeight = Math.max(1, document.documentElement.clientHeight);
@@ -3157,8 +3189,8 @@
                 configuredMinHeight,
                 Number(this.config.answerTocMaxHeightPx) || 760,
             );
-            const maxWidth = Math.max(1, Math.min(configuredMaxWidth, viewportWidth - margin * 2));
-            const maxHeight = Math.max(1, Math.min(configuredMaxHeight, viewportHeight - margin * 2));
+            const maxWidth = ignoreViewport ? configuredMaxWidth : Math.max(1, Math.min(configuredMaxWidth, viewportWidth - margin * 2));
+            const maxHeight = ignoreViewport ? configuredMaxHeight : Math.max(1, Math.min(configuredMaxHeight, viewportHeight - margin * 2));
 
             return {
                 minWidth: Math.min(configuredMinWidth, maxWidth),
@@ -3171,7 +3203,7 @@
         setPanelSize(width, height, persist = false) {
             if (!this.host || !Number.isFinite(width) || !Number.isFinite(height)) return null;
 
-            const limits = this.getPanelSizeLimits();
+            const limits = this.getPanelSizeLimits(true);
             const nextWidth = Math.round(
                 Math.min(limits.maxWidth, Math.max(limits.minWidth, width)),
             );
@@ -3182,8 +3214,7 @@
             this.savedSize = { width: nextWidth, height: nextHeight };
             this.sizeMode = 'manual';
             this.host.dataset.sizeMode = 'manual';
-            this.host.style.setProperty('--cgpt-answer-toc-width', `${nextWidth}px`);
-            this.host.style.setProperty('--cgpt-answer-toc-height', `${nextHeight}px`);
+            this.ensurePanelSizeInViewport();
 
             if (persist) this.writeSizeState();
             return this.savedSize;
@@ -3202,18 +3233,13 @@
             }
         }
 
-        ensurePanelSizeInViewport(persist = false) {
+        ensurePanelSizeInViewport() {
             if (this.sizeMode !== 'manual' || !this.savedSize) return;
-
-            const anchor = !this.collapsed ? this.captureWidgetEdgeAnchor() : null;
-            const previous = this.savedSize;
-            const next = this.setPanelSize(previous.width, previous.height, false);
-            const changed = next && (
-                next.width !== previous.width || next.height !== previous.height
-            );
-
-            if (anchor) this.alignManualWidgetToEdgeAnchor(anchor, false);
-            if (persist && changed) this.writeSizeState();
+            const limits = this.getPanelSizeLimits();
+            const width = Math.min(limits.maxWidth, Math.max(limits.minWidth, this.savedSize.width));
+            const height = Math.min(limits.maxHeight, Math.max(limits.minHeight, this.savedSize.height));
+            this.host.style.setProperty('--cgpt-answer-toc-width', `${width}px`);
+            this.host.style.setProperty('--cgpt-answer-toc-height', `${height}px`);
         }
 
         readViewState() {
@@ -3469,6 +3495,12 @@
             return centerX <= viewportWidth / 2 ? 'left' : 'right';
         }
 
+        getPreferredWidgetWidth() {
+            if (this.collapsed) return this.launcher?.getBoundingClientRect().width || 1;
+            if (this.sizeMode === 'manual' && this.savedSize) return this.savedSize.width;
+            return Number.parseFloat(this.host?.style.getPropertyValue('--cgpt-answer-toc-width')) || 300;
+        }
+
         captureWidgetEdgeAnchor() {
             if (this.positionMode !== 'manual') return null;
 
@@ -3478,13 +3510,13 @@
             const rect = widget.getBoundingClientRect();
             if (rect.width <= 0 || rect.height <= 0) return null;
 
-            const side = this.getWidgetDockSide(rect);
-            if (this.host) this.host.dataset.dockSide = side;
+            const position = this.savedPosition || rect;
+            const side = this.host?.dataset.dockSide || this.getWidgetDockSide(rect);
             return {
                 side,
-                left: rect.left,
-                right: rect.right,
-                top: rect.top,
+                left: position.left,
+                right: position.left + this.getPreferredWidgetWidth(),
+                top: position.top,
             };
         }
 
@@ -3500,17 +3532,11 @@
             if (rect.width <= 0 || rect.height <= 0) return;
 
             const desiredLeft = anchor.side === 'right'
-                ? anchor.right - rect.width
+                ? anchor.right - this.getPreferredWidgetWidth()
                 : anchor.left;
-            const clamped = this.clampPosition(
-                desiredLeft,
-                anchor.top,
-                rect.width,
-                rect.height,
-            );
-
+            this.setManualPosition(desiredLeft, anchor.top, persist);
             this.host.dataset.dockSide = anchor.side;
-            this.setManualPosition(clamped.left, clamped.top, persist);
+            this.ensureManualPositionInViewport();
         }
 
         readCollapsedState() {
@@ -3783,7 +3809,7 @@
                 }
 
                 if (!this.collapsed) {
-                    this.ensurePanelSizeInViewport(false);
+                    this.ensurePanelSizeInViewport();
                     const { nav, button } = this.getActiveViewNavigation();
                     if (button) this.scrollItemIntoView(nav, button);
 
@@ -4151,7 +4177,7 @@
             this.resizeState = null;
 
             if (state.moved && !cancelled) {
-                this.ensurePanelSizeInViewport(false);
+                this.ensurePanelSizeInViewport();
                 this.ensureManualPositionInViewport(true);
                 this.writeSizeState();
             }
@@ -4205,14 +4231,15 @@
             const rect = widget.getBoundingClientRect();
             if (rect.width <= 0 || rect.height <= 0) return;
 
-            this.host.dataset.dockSide = this.getWidgetDockSide(rect);
+            const position = this.savedPosition || rect;
             const clamped = this.clampPosition(
-                rect.left,
-                rect.top,
+                position.left,
+                position.top,
                 rect.width,
                 rect.height,
             );
-            this.setManualPosition(clamped.left, clamped.top, persist);
+            this.renderManualPosition(clamped.left, clamped.top);
+            if (persist) this.writePositionState();
         }
 
         onUserScrollIntent(event) {
@@ -4323,9 +4350,9 @@
             }
 
             window.requestAnimationFrame(() => {
-                this.ensurePanelSizeInViewport(true);
+                this.ensurePanelSizeInViewport();
                 if (this.positionMode === 'manual') {
-                    this.ensureManualPositionInViewport(true);
+                    this.ensureManualPositionInViewport();
                 } else {
                     this.updateInlineEndOffset();
                 }
@@ -15253,7 +15280,7 @@
 
                 if (wasHidden) {
                     window.requestAnimationFrame(() => {
-                        this.ensurePanelSizeInViewport(false);
+                        this.ensurePanelSizeInViewport();
                         this.ensureManualPositionInViewport(true);
 
                         if (!this.collapsed) {

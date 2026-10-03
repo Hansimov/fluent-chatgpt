@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Isolated navigation appearance fixture</title>
+<style>body { margin: 0; font: 15px/1.6 system-ui; } main { max-width: 620px; margin: 40px; }</style>
+<script>
+  window.__CGPT_TOC_TEST_MODE__ = true;
+  window.unsafeWindow = window;
+  window.GM_addStyle = () => {};
+  window.GM_xmlhttpRequest = () => {};
+  window.fetch = () => new Promise(() => {});
+  window.__themeMedia = new EventTarget();
+  window.__themeMedia.matches = false;
+  const nativeMatchMedia = window.matchMedia.bind(window);
+  window.matchMedia = query => query === '(prefers-color-scheme: dark)' ? window.__themeMedia : nativeMatchMedia(query);
+</script>
+<script src="../fluent-chatgpt.user.js"></script>
+<body>
+<main>
+  <div data-message-author-role="user">介绍项目的设计思路和使用方法</div>
+  <div data-message-author-role="assistant"><h2>项目概览</h2><p>这里是用于检查配色与窗口缩放的合成内容，不包含真实会话。</p><h2>使用方法</h2><p>安装、配置与使用步骤。</p><h3>注意事项</h3></div>
+</main>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const c = window.__cgptAnswerTocController;
+  c.setCurrentAnswer(document.querySelector('[data-message-author-role="assistant"]'));
+  c.detectCurrentAnswer = () => {}; // Keep appearance tests independent of viewport answer selection.
+  for (const timer of [c.healthTimer, c.routeWatchTimer]) clearInterval(timer);
+  for (const timer of [c.generatedImageRefreshTimer, c.conversationRebuildTimer, c.frameFallbackTimer]) clearTimeout(timer);
+  cancelAnimationFrame(c.frameId);
+  c.cancelBottomPin();
+  c.clearHeadingRecovery();
+  for (const observer of [c.pageObserver, c.mainObserver, c.answerObserver, c.headingTextObserver]) observer?.disconnect();
+  c.hydrateGeneratedImagePreviews = () => {};
+  c.generatedImages = [{ imageTitle: '生成图像标题' }];
+  c.config = { ...c.config, answerTocOpenConversationAtBottom: false, answerTocMinViewportWidth: 0 };
+  c.syncVisibility();
+  const card = document.createElement('button');
+  card.className = 'image-card-button';
+  card.textContent = '生成图像标题';
+  c.shadow.querySelector('.image-gallery-grid').appendChild(card);
+});
+</script>
+</body>
+</html>

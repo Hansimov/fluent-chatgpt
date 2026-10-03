@@ -17,4 +17,8 @@ node tests/run-startup-tests.cjs
 
 导航标题悬浮提示和宿主节点的 `data-script-version` 显示实际运行版本。项目文件更新不会自动替换已经运行的标签页脚本；需更新油猴中的脚本并刷新标签页。
 
+`run-browser-tests.cjs` 还会运行 `run-appearance-tests.cjs`：在独立的本地测试页中切换 `data-theme`、旧版主题 class、`color-scheme` 和系统主题，检查五种导航视图、选中/悬浮/键盘焦点以及折叠控件的配色。包含旧颜色变量缺失或冲突的情况；文字在纯黑/纯白底层内容上均检查对比度，选中背景则限制明暗差，避免深色模式出现刺眼白块。新版主题标记和变量名称来自本机样本页的只读检查。
+
+同一测试使用真实 iframe 视口 resize 事件验证：窗口缩小后的临时限位、恢复原始位置/尺寸、折叠边缘锚点、缩小期间刷新、重新拖动，以及 body 重建后的主题切换。此测试不用虚拟时间（它不能可靠驱动 resize/动画帧），通过本地流式 HTML 等待检查结束，不操作用户的浏览器窗口。可单独运行 `node tests/run-appearance-tests.cjs`；追加 `dark` 或 `light` 会将预览截图保存到已忽略的 `.codex-navigation-*.png`。
+
 `run-startup-tests.cjs` 额外启动仅监听 `127.0.0.1` 随机端口的测试服务器：保持 HTML 响应未完成，确认面板和问答/章节能在 `DOMContentLoaded` 之前出现。再验证延迟挂载、连续流式更新、动画帧暂停、路由检查延后、路由等待上限、旧会话隔离、分支/新建会话复用消息、面板被移除、main/body 重建，以及空白首页。API 请求在夹具中故意保持 pending，证明导航不依赖网络元数据完成。测试结束关闭服务器并删除临时 Chrome 配置，不访问真实会话。

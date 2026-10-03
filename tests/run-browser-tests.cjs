@@ -39,6 +39,8 @@ try {
       console.log(`PASS: ${/data-test-count="(\d+)"/.exec(output)?.[1]} ${description} checks (headless Chrome).`);
     }
   }
+  // Real viewport events / animation frames are not advanced by Chrome's virtual-time budget.
+  execFileSync(process.execPath, [path.join(__dirname, 'run-appearance-tests.cjs')], { stdio: 'inherit', windowsHide: true, timeout: 45000 });
 } finally {
   // Only remove the uniquely-created disposable profile, never the user's Chrome profile.
   fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3 });
