@@ -106,6 +106,36 @@ frame.addEventListener('load', async function run() {
     await pause();
     check('changing back to dark updates without a reload', c.host.dataset.theme === 'dark');
 
+    c.config = { ...c.config, answerTocHeadingSelector: 'h1,h2,h3,h4' };
+    c.rebuildToc();
+    c.setActiveView('headings', false);
+    check('h2-based answers start at the first visual level', c.itemButtons[0].dataset.level === '1' && parseFloat(w.getComputedStyle(c.itemButtons[0]).paddingInlineStart) === 8);
+    check('nested headings retain a compact visible hierarchy', c.itemButtons.at(-1).dataset.level === '2' && parseFloat(w.getComputedStyle(c.itemButtons.at(-1)).paddingInlineStart) === 18);
+    c.setActiveView('conversation', false);
+    const firstPrompt = c.conversationItemButtons[0];
+    check('single-digit prompt number no longer reserves a wide empty column', firstPrompt.querySelector('.prompt-index').getBoundingClientRect().width < 10);
+    check('prompt text starts close to the row edge', firstPrompt.querySelector('.toc-item-label').getBoundingClientRect().left - firstPrompt.getBoundingClientRect().left <= 24);
+    const originalItems = c.conversationItems;
+    for (const archived of [false, true]) {
+      c.conversationItems = [0, 9, 99, 999, 12345].map(logicalIndex => ({ logicalIndex, label: '多位编号测试', fullLabel: '多位编号测试' }));
+      if (archived) c.conversationArchive.set(0, { userText: '多位编号测试', assets: [] });
+      c.renderConversationItems();
+      for (const view of ['conversation', 'export']) {
+        c.setActiveView(view, false);
+        const promptButtons = view === 'conversation' ? c.conversationItemButtons : c.exportItemButtons;
+        check(`${view}, archived=${archived}: multi-digit numbers and archive marker fit`, promptButtons.every(button => {
+          const number = button.querySelector('.prompt-index'), label = button.querySelector('.toc-item-label');
+          return number.scrollWidth <= number.clientWidth + 1 && label.getBoundingClientRect().left >= number.getBoundingClientRect().right + 3;
+        }));
+        const offsets = promptButtons.map(button => button.querySelector('.toc-item-label').getBoundingClientRect().left - button.getBoundingClientRect().left);
+        check(`${view}, archived=${archived}: prompt text is aligned across number lengths`, offsets.every(offset => near(offset, offsets[0])));
+      }
+    }
+    c.conversationArchive.delete(0);
+    c.conversationItems = originalItems;
+    c.renderConversationItems();
+    c.setActiveView('headings', false);
+
     c.setPanelSize(330, 320, true);
     c.setManualPosition(820, 480, true);
     c.ensureManualPositionInViewport();

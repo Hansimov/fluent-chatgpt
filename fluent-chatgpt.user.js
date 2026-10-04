@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.7.5
+// @version      4.7.6
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -15,7 +15,7 @@
 (() => {
     'use strict';
 
-    const SCRIPT_VERSION = '4.7.5';
+    const SCRIPT_VERSION = '4.7.6';
 
     const CONFIG = Object.freeze({
         // 单条回答本身非常长时再开启。默认关闭，兼容性更稳。
@@ -1777,9 +1777,9 @@
             min-height: 30px;
             display: flex;
             align-items: flex-start;
-            gap: 7px;
+            gap: 4px;
             overflow: hidden;
-            padding: 6px 9px 6px 11px;
+            padding: 6px 7px 6px 8px;
             border: 0;
             border-radius: 8px;
             background: transparent;
@@ -1821,18 +1821,22 @@
           }
 
           .toc-item[data-level="2"] {
-            padding-inline-start: 25px;
+            padding-inline-start: 18px;
             font-size: 12.5px;
           }
 
-          .toc-item[data-level="3"],
+          .toc-item[data-level="3"] {
+            padding-inline-start: 28px;
+            font-size: 12px;
+          }
+
           .toc-item[data-level="4"] {
             padding-inline-start: 38px;
             font-size: 12px;
           }
 
           .prompt-index {
-            width: 2.4em;
+            width: var(--cgpt-prompt-index-width, 1.25ch);
             flex: none;
             padding-top: 1px;
             color: var(--cgpt-toc-muted);
@@ -5334,6 +5338,8 @@
 
             const fragment = document.createDocumentFragment();
             this.itemButtons = [];
+            // GPT 常从 h2 开始；目录应以当前回答的最高层级为起点，而不是无故空出一级。
+            const baseLevel = Math.min(...this.headings.map((heading) => heading.level));
 
             this.headings.forEach((heading, index) => {
                 const item = document.createElement('li');
@@ -5344,7 +5350,7 @@
                 button.className = 'toc-item';
                 button.dataset.kind = 'heading';
                 button.dataset.headingIndex = String(index);
-                button.dataset.level = String(heading.level);
+                button.dataset.level = String(Math.min(4, heading.level - baseLevel + 1));
                 button.dataset.active = 'false';
                 button.title = heading.fullLabel;
 
@@ -6709,18 +6715,26 @@
             this.conversationLabelCache.set(logicalIndex, record.fullLabel);
         }
 
-        getConversationApiRecordIndices(records) {
-            if (!records.length || !this.conversationApiSnapshot ||
+        getConversationApiPrompts() {
+            if (!this.conversationApiSnapshot ||
                 this.conversationApiSnapshotId !== this.getCurrentConversationId()) return null;
-            const prompts = this.getConversationBranchMessages(this.conversationApiSnapshot)
+            return this.getConversationBranchMessages(this.conversationApiSnapshot)
                 .filter((message) => message?.author?.role === 'user')
                 .map((message) => ({
                     identity: message.id ? `message:${message.id}` : '',
                     text: this.normalizeConversationText(this.extractApiMessagePromptText(message)),
                 }));
+        }
+
+        getConversationApiRecordIndices(records) {
+            if (!records.length) return null;
+            const prompts = this.getConversationApiPrompts();
+            if (!prompts?.length) return null;
             const candidates = records.map((record) => {
                 const byId = prompts.findIndex((prompt) => prompt.identity && prompt.identity === record.identity);
                 if (byId >= 0) return [byId];
+                // 新提交的“继续”等重复文本不能匹配到旧快照中不同 ID 的消息。
+                if (record.identity?.startsWith('message:')) return [];
                 const text = this.normalizeConversationText(record.fullLabel);
                 return text ? prompts.flatMap((prompt, index) => prompt.text === text ? [index] : []) : [];
             });
@@ -6741,6 +6755,40 @@
                 next = index;
             }
             return earliest;
+        }
+
+        getAnchoredConversationRecordIndices(records, maxOfficialIndex = -1) {
+            if (!records.length) return null;
+            const prompts = this.getConversationApiPrompts() || [];
+            const apiIndices = new Map(prompts.flatMap((prompt, index) => prompt.identity ? [[prompt.identity, index]] : []));
+            const provisionalByElement = new Map(this.conversationItems.filter((item) =>
+                item.userElement?.isConnected && this.conversationCacheIdentityByIndex.get(item.logicalIndex)?.startsWith('dom-message:')
+            ).map((item) => [item.userElement, item]));
+            const known = records.map((record) => {
+                const index = apiIndices.get(record.identity) ?? this.conversationCacheIndexByIdentity.get(record.identity);
+                if (Number.isInteger(index)) return index;
+                const provisional = provisionalByElement.get(record.userElement);
+                // 乐观提交先没有 ID，之后补上服务端 ID；同一节点和相同正文应保留原序号。
+                return provisional && provisional.fullLabel === record.fullLabel ? provisional.logicalIndex : undefined;
+            });
+            const anchor = known.findIndex((index) => Number.isInteger(index));
+            if (anchor < 0) return null;
+            const hasApiAnchor = records.some((record) => apiIndices.has(record.identity));
+            const maxCachedIndex = Math.max(-1, ...this.conversationCacheIdentityByIndex.keys());
+            // 首次加载时 DOM-only 的零起点只是暂定值；稍后出现更完整的官方目录应有机会校正它。
+            if (!hasApiAnchor && maxOfficialIndex > maxCachedIndex) return null;
+            const indices = records.map((_, index) => known[anchor] + index - anchor);
+            if (!this.validateRecordIndexMapping(indices, -1)) return null;
+            for (const [position, index] of indices.entries()) {
+                if (Number.isInteger(known[position])) {
+                    if (known[position] !== index) return null; // 不把虚拟化中的非连续片段硬拼成连续序号。
+                    continue;
+                }
+                const occupiedIdentity = prompts[index]?.identity || this.conversationCacheIdentityByIndex.get(index);
+                if (occupiedIdentity && occupiedIdentity !== records[position].identity) return null;
+            }
+            // 已知消息保留绝对编号，未知的连续尾部可立即追加；无需等待 API / 官方导航更新。
+            return indices;
         }
 
         mapUserRecordsToLogicalIndices(records, officialButtons) {
@@ -6778,7 +6826,7 @@
                 candidateTrustLabels,
             ) => {
                 // 原生导航在 hydration 期间可能只挂载一部分；精确 API 身份映射不受其临时上限限制。
-                const limit = candidateSource === 'api-message-identity' ? -1 : maxOfficialIndex;
+                const limit = ['api-message-identity', 'anchored-message-identity'].includes(candidateSource) ? -1 : maxOfficialIndex;
                 if (mappedIndices || !this.validateRecordIndexMapping(candidate, limit)) {
                     return false;
                 }
@@ -6803,6 +6851,10 @@
 
             const apiIndices = this.getConversationApiRecordIndices(records);
             if (apiIndices) acceptCandidate(apiIndices, 'api-message-identity', true, true);
+            if (!mappedIndices) {
+                const anchoredIndices = this.getAnchoredConversationRecordIndices(records, maxOfficialIndex);
+                if (anchoredIndices) acceptCandidate(anchoredIndices, 'anchored-message-identity', true, true);
+            }
 
             if (!officialCount && !mappedIndices) {
                 acceptCandidate(
@@ -6919,7 +6971,7 @@
             // 官方导航/消息异步挂载期间可能没有任何可信候选；不应让解析器整体抛错。
             (mappedIndices || []).forEach((logicalIndex, recordIndex) => {
                 if (!Number.isInteger(logicalIndex) || logicalIndex < 0) return;
-                if (source !== 'api-message-identity' && maxOfficialIndex >= 0 && logicalIndex > maxOfficialIndex) return;
+                if (!['api-message-identity', 'anchored-message-identity'].includes(source) && maxOfficialIndex >= 0 && logicalIndex > maxOfficialIndex) return;
                 const record = records[recordIndex];
                 if (!record) return;
 
@@ -7075,6 +7127,11 @@
 
             const navigationFragment = document.createDocumentFragment();
             const exportFragment = document.createDocumentFragment();
+            const numberDigits = this.conversationItems.reduce((digits, item) => Math.max(digits, String(item.logicalIndex + 1).length), 1);
+            const archiveMarkerWidth = this.conversationItems.some((item) => this.conversationArchive.has(item.logicalIndex)) ? 11 : 0;
+            const indexWidth = `calc(${numberDigits + 0.25}ch + ${archiveMarkerWidth}px)`;
+            this.conversationList.style.setProperty('--cgpt-prompt-index-width', indexWidth);
+            this.exportList?.style.setProperty('--cgpt-prompt-index-width', indexWidth);
             this.conversationItemButtons = [];
             this.exportItemButtons = [];
             const validIndices = new Set(this.conversationItems.map((item) => item.logicalIndex));
