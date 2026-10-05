@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Conversation export regression</title>
+<script>
+window.__CGPT_TOC_TEST_MODE__ = true;
+window.unsafeWindow = window;
+window.GM_addStyle = () => {};
+window.GM_xmlhttpRequest = () => {};
+window.fetch = async () => { throw new Error('Network disabled in export regression'); };
+</script>
+<script src="../fluent-chatgpt.user.js"></script>
+<body><main></main><pre id="result">pending</pre>
+<script>
+document.addEventListener('DOMContentLoaded', async () => {
+  const c = window.__cgptAnswerTocController;
+  const checks = [];
+  const check = (name, pass, detail = '') => checks.push({ name, pass: !!pass, detail });
+  const equal = (name, actual, expected) => check(name, JSON.stringify(actual) === JSON.stringify(expected), JSON.stringify(actual));
+  const message = (id, role, text, extra = {}) => ({id, author:{role}, content:{content_type:'text', parts:[text]}, status:'finished_successfully', ...extra});
+  const snapshot = messages => ({current_node:messages.at(-1).id, mapping:Object.fromEntries(messages.map((m,i) => [m.id, {message:m,parent:i?messages[i-1].id:null,children:i+1<messages.length?[messages[i+1].id]:[]}]))});
+  const source = snapshot([
+    message('u0','user','历史第一问'), message('a0','assistant','# 历史答案\n\n保留 **格式** 和 `代码`', {channel:'final'}),
+    message('u1','user','历史第二问'),
+    message('hidden','assistant','HIDDEN', {metadata:{is_visually_hidden_from_conversation:true}}),
+    message('analysis','assistant','ANALYSIS', {channel:'analysis'}),
+    message('thoughts','assistant','', {content:{content_type:'thoughts',text:'THOUGHTS'}}),
+    message('comment','assistant','COMMENT', {channel:'commentary'}),
+    message('call','assistant','TOOL_CALL', {recipient:'web.run'}),
+    message('tool','tool','TOOL_RESULT'),
+    message('a1','assistant','## 第二答案\n\n<script>globalThis.exportXss=1<\/script>', {channel:'final'}),
+    message('u2','user','第三问'), message('a2','assistant','第三答案', {channel:'final'}),
+    message('u3','user','第四问'), message('a3','assistant','第四答案', {channel:'final'}),
+  ]);
+  source.mapping.other = {parent:'u1', children:[], message:message('other','assistant','OTHER_BRANCH',{channel:'final'})};
+  const install = (data) => {
+    c.conversationApiSnapshot = data;
+    c.conversationApiSnapshotId = c.getCurrentConversationId();
+    c.conversationApiAssetsByIndex = c.buildConversationApiAssetMap(data);
+    return data;
+  };
+  const mountTail = () => {
+    document.querySelector('main').innerHTML = [2,3].map(i=>`<div data-chatgpt-search-unit-key="fallback-turn-${i}:0:user" data-chatgpt-search-message-ids="u${i}"><div data-user-message-bubble="true">${i===2?'第三问':'第四问'}</div><button>编辑</button></div><div data-chatgpt-search-unit-key="fallback-turn-${i}:2:assistant" data-chatgpt-search-message-ids="a${i}"><h4 class="sr-only">ChatGPT 说：</h4><div data-markdown-text-style="assistant-message"><h2>${i===2?'第三答案':'第四答案'}</h2><p>正文</p></div><button>复制</button></div>`).join('');
+    c.rebuildConversationToc();
+  };
+  try {
+    c.config = {...c.config, conversationLoadSettleMs:80, conversationLoadRetryCount:0, conversationLoadStepDelayMs:0, answerTocOpenConversationAtBottom:false};
+    clearInterval(c.healthTimer); clearInterval(c.routeWatchTimer);
+    c.mainObserver?.disconnect(); c.pageObserver?.disconnect();
+    c.scheduleGeneratedImageRefresh = () => {};
+    c.scheduleConversationRebuild = () => {};
+    c.getCurrentConversationId = () => 'synthetic-conversation';
+    c.currentRouteKey = c.getConversationRouteKey();
+    let requests = 0;
+    c.getConversationApiSnapshot = async (signal, force) => { check('one fresh snapshot request', force); requests++; return install(source); };
+    mountTail();
+    equal('DOM initially exposes only provisional tail indices', c.conversationItems.map(i=>i.logicalIndex), [0,1]);
+    equal('no legacy navigation buttons', c.getOfficialNavButtons().length, 0);
+    let activations = 0;
+    c.activateOfficialConversationButton = () => { activations++; return false; };
+    const result = await c.loadConversationIndices([0,1], {includeAll:true, restore:true});
+    equal('export all expands to full API branch', result.indices, [0,1,2,3]);
+    equal('unmounted historical answers all load', result.loaded, [0,1,2,3]);
+    equal('no failed answers', result.failed, []);
+    equal('single snapshot fetch for the entire batch', requests, 1);
+    equal('API path does not activate buttons or scroll', activations, 0);
+    equal('original Markdown preserved exactly', c.conversationArchive.get(0).assistantMarkdown, '# 历史答案\n\n保留 **格式** 和 `代码`');
+    const md = c.buildConversationMarkdown(result.indices);
+    for (const absent of ['HIDDEN','ANALYSIS','THOUGHTS','COMMENT','TOOL_CALL','TOOL_RESULT','OTHER_BRANCH','未能在页面中挂载完整问答']) check(`export excludes ${absent}`, !md.includes(absent));
+    check('historical and visible answers both in Markdown', ['历史答案','第二答案','第三答案','第四答案'].every(t=>md.includes(t)));
+    check('answers retain branch order', md.indexOf('历史答案')<md.indexOf('第二答案')&&md.indexOf('第二答案')<md.indexOf('第三答案'));
+    const html = c.buildConversationHtml(result.indices);
+    check('API-only HTML includes safely escaped answer', html.includes('&lt;script&gt;globalThis.exportXss=1&lt;/script&gt;'));
+    check('raw API HTML is never executable', !html.includes('<script>globalThis.exportXss'));
+    check('long API-only text wraps', html.includes('pre.api-markdown{white-space:pre-wrap'));
+    check('matching mounted answer keeps native HTML formatting', c.conversationArchive.get(2).assistantHtml.includes('<h2>第三答案</h2>'));
+    check('new MarkdownRoot excludes surrounding controls', !c.conversationArchive.get(2).assistantHtml.includes('复制')&&!c.conversationArchive.get(2).assistantHtml.includes('ChatGPT 说'));
+    equal('label cache repaired to absolute indices', c.conversationCacheIndexByIdentity.get('message:u2'), 2);
+
+    c.conversationArchive.clear(); c.clearConversationLabelCacheState(); c.conversationApiSnapshot = null;
+    mountTail();
+    const selected = await c.loadConversationIndices([0], {includeAll:false,restore:false});
+    equal('selected provisional index follows message ID after API hydration', selected.indices, [2]);
+    equal('selected export never captures unselected questions', [...c.conversationArchive.keys()], [2]);
+    document.querySelector('[data-chatgpt-search-message-ids="a2"]').setAttribute('data-chatgpt-search-message-ids','old-branch-answer');
+    const apiPair = c.getConversationApiExportPairs(source).get(2);
+    equal('old branch DOM cannot supply HTML for current API answer', c.captureApiConversationPair(2,apiPair).assistantHtml, '');
+
+    const imageOnly = {user:message('image-u','user',''), assistants:[]};
+    c.conversationApiAssetsByIndex.set(5,[{id:'image-asset',role:'assistant',kind:'image',fileId:'file-test-only'}]);
+    check('image-only assistant remains exportable', !!c.captureApiConversationPair(5,imageOnly));
+    equal('image-only export keeps attachment metadata', c.conversationArchive.get(5).assets[0].fileId, 'file-test-only');
+    c.conversationApiAssetsByIndex.set(6,[{id:'upload',role:'user',kind:'image'}]);
+    equal('user upload alone cannot invent an assistant answer', c.captureApiConversationPair(6,imageOnly), null);
+    const streaming = snapshot([message('pending-u','user','等待'), message('pending-a','assistant','半句',{status:'in_progress',channel:'final'})]);
+    equal('in-progress answer is not treated as a complete API archive', c.getConversationApiExportPairs(streaming).get(0).assistants.length, 0);
+    equal('multiple text parts preserve repetition and indentation', c.getApiMessageExportText(message('x','assistant','',{content:{content_type:'text',parts:['重复','重复','```\n  indented\n```']}})), '重复\n\n重复\n\n```\n  indented\n```');
+
+    c.conversationArchive.clear(); install(source); mountTail();
+    c.getConversationApiSnapshot = async () => { throw new Error('Simulated API offline'); };
+    const offline = await c.loadConversationIndices([2,99], {restore:false});
+    check('offline batch is not aborted', !offline.aborted, `${offline.error?.stack || JSON.stringify(offline)}`);
+    equal('offline falls back to mounted modern DOM answer', offline.loaded, [2]);
+    equal('unmounted offline answer reported precisely', offline.failed, [99]);
+    check('unmounted offline answer avoids repeated old-button timeouts', c.conversationArchiveFailures.get(99).includes('结构化会话数据不可用'));
+    check('offline DOM export has actual MarkdownRoot body', c.conversationArchive.get(2).assistantMarkdown.includes('第三答案'));
+
+    const originalResolve = c.resolveConversationPair.bind(c);
+    c.resolveConversationPair = () => null;
+    c.getConversationApiSnapshot = async () => install(source);
+    const originalCapture = c.captureApiConversationPair.bind(c);
+    c.captureApiConversationPair = (index,pair) => { if(index===1) throw new Error('one malformed message'); return originalCapture(index,pair); };
+    const partial = await c.loadConversationIndices([0,1,2],{restore:false});
+    equal('one malformed pair does not stop remaining exports', partial.loaded,[0,2]);
+    equal('one malformed pair is explicitly failed', partial.failed,[1]);
+    c.captureApiConversationPair = originalCapture;
+    c.resolveConversationPair = () => { throw new Error('React remount during optional HTML capture'); };
+    check('DOM parsing error cannot discard complete API text', c.captureApiConversationPair(2,apiPair)?.assistantMarkdown === '第三答案');
+    c.resolveConversationPair = originalResolve;
+
+    c.cacheConversationRecordLabel(0,{identity:'message:no-longer-in-branch',fullLabel:'旧分支问题'});
+    const branchChanged = await c.loadConversationIndices([0],{restore:false});
+    equal('missing selected identity cannot export another branch by ordinal', branchChanged.failed,[0]);
+    check('failed capture removes stale success cache', !c.conversationArchive.has(0));
+    c.clearConversationLabelCacheState();
+    install(source); mountTail();
+    let downloadedMarkdown = '';
+    c.downloadMarkdown = (text) => { downloadedMarkdown = text; };
+    await c.exportConversationIndices([2,3],false);
+    check('Markdown button includes history missing from navigation', downloadedMarkdown.includes('历史答案')&&downloadedMarkdown.includes('第四答案'));
+    let zipBlob = null;
+    c.downloadBlob = (blob) => { zipBlob = blob; };
+    c.exportIncludeMarkdown = true; c.exportIncludeHtml = true; c.exportIncludeAssets = false;
+    await c.exportConversationIndicesZip([2,3],false);
+    check('ZIP button creates an actual archive blob', zipBlob instanceof Blob && zipBlob.size>0);
+    const bytes = new Uint8Array(await zipBlob.arrayBuffer());
+    const view = new DataView(bytes.buffer);
+    const decoder = new TextDecoder();
+    const files = new Map();
+    for(let offset=0; offset+30<bytes.length && view.getUint32(offset,true)===0x04034b50;) {
+      const size=view.getUint32(offset+18,true), nameSize=view.getUint16(offset+26,true), extraSize=view.getUint16(offset+28,true);
+      const start=offset+30+nameSize+extraSize;
+      files.set(decoder.decode(bytes.slice(offset+30,offset+30+nameSize)),decoder.decode(bytes.slice(start,start+size)));
+      offset=start+size;
+    }
+    check('ZIP contains complete Markdown', [...files].some(([name,text])=>name.endsWith('.md')&&text.includes('历史答案')&&text.includes('第四答案')));
+    check('ZIP contains complete HTML', [...files].some(([name,text])=>name.endsWith('.html')&&text.includes('qa-1')&&text.includes('qa-4')));
+    const manifest=JSON.parse(files.get('manifest.json'));
+    equal('ZIP manifest uses expanded full branch indices',manifest.conversationIndices,[1,2,3,4]);
+    equal('ZIP manifest confirms no incomplete answers',manifest.incompleteConversations,[]);
+
+    c.getConversationApiSnapshot = async () => new Promise(()=>{});
+    const abort = new AbortController();
+    const pending = c.prepareConversationExportSnapshot(abort.signal).then(()=>false,e=>e.name==='AbortError');
+    abort.abort();
+    check('cancel interrupts a pending snapshot request', await pending);
+    c.getConversationApiSnapshot = async () => { c.routeEpoch++; return source; };
+    check('route change rejects stale snapshot', await c.prepareConversationExportSnapshot().then(()=>false,e=>e.name==='AbortError'));
+
+    const multi = document.createElement('div');
+    multi.innerHTML='<div data-markdown-text-style="assistant-message"><p>第一段</p></div><div data-markdown-text-style="assistant-message"><p>第二段</p></div>';
+    check('multiple MarkdownRoot sections export together', c.elementToMarkdown(multi).includes('第一段')&&c.elementToMarkdown(multi).includes('第二段'));
+  } catch(error) { check('unexpected exception',false,error.stack||String(error)); }
+  c.cancelBottomPin(); c.clearHeadingRecovery(); c.mainObserver?.disconnect(); c.pageObserver?.disconnect();
+  const passed=checks.every(c=>c.pass);
+  document.documentElement.dataset.testsPassed=String(passed);
+  document.documentElement.dataset.testCount=String(checks.length);
+  document.getElementById('result').textContent=JSON.stringify({passed,checks},null,2);
+});
+</script></body></html>

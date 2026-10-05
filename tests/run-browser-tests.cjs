@@ -17,6 +17,7 @@ const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'fluent-chatgpt-test-'));
 try {
   for (const [fixture, description] of [
     ['conversation-parsing.html', 'conversation parsing'],
+    ['conversation-export.html', 'conversation export'],
     ['navigation-tabs.html', 'responsive navigation tabs'],
     ['selection-actions.html', 'selection action suppression'],
   ]) {
