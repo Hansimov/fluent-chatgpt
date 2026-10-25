@@ -31,6 +31,14 @@ node tests/run-startup-tests.cjs
 
 单独运行一个夹具：`node tests/run-browser-tests.cjs markdown-assets.html` 或 `node tests/run-browser-tests.cjs navigation-jump.html`。
 
+### 导出完成状态（4.8.2）
+
+导航面板底部共享状态栏会持续显示导出完成、部分缺失、取消或失败；切换问答/章节等标签、刷新目录和选择项目不会覆盖结果。结果保持到下一次加载/导出或切换会话。长目录名自动换行并可滚动查看，完整消息也可悬浮查看。目录写入等待所有文件关闭后才显示“已保存”；普通 MD/ZIP 下载显示“已交给浏览器下载”，不把发起下载误报为磁盘写入完成。缺失的回答与附件分别计数。
+
+`markdown-assets.html` 覆盖完成状态持久化、跨标签显示、可访问性、目录成功、ZIP 后备下载、部分失败、取消、错误、新任务重置，以及旧路由的 MD/ZIP 异步完成不能污染新任务状态。测试使用内存目录和下载拦截，不写用户文件。
+
+MD/离线 HTML 的用户小节包含原始消息 `create_time` 对应的发送时间，按导出设备的本地时区显示并明确写出 UTC 偏移；manifest v13 的 `userMessages[].createdAt` 保留 UTC ISO 时间。支持秒、毫秒和带时区的 ISO 时间，缺失或无效时间不猜测，不使用 `update_time` 或导出时间代替。DOM 后备只在消息 ID 匹配时从 API 补全时间。`conversation-export.html` 与 `markdown-assets.html` 使用实时 runner，避免虚拟时钟在异步 Blob 读取完成前结束测试。
+
 ### 导出完整性修复（4.8.1）
 
 用户消息中的图片和附件直接内嵌或以普通链接呈现，不再额外添加“图片、附件与 Artifacts”标题；已经在正文中的资源不重复列出。`library_file_id` 是资源库引用，不作为另一份文件下载。没有最终回答的问答也会保留完整用户输入和上传附件，并在正文及清单中注明缺少最终回答，不能因回答为空而丢弃上传图。

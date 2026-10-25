@@ -24,7 +24,7 @@ try {
     ['selection-actions.html', 'selection action suppression'],
   ]) {
     if (process.argv[2] && process.argv[2] !== fixture) continue;
-    if (fixture === 'markdown-assets.html') {
+    if (['markdown-assets.html', 'conversation-export.html'].includes(fixture)) {
       execFileSync(process.execPath, [path.join(__dirname, 'run-realtime-tests.cjs'), fixture], { stdio: 'inherit', windowsHide: true, timeout: 45000 });
       continue;
     }

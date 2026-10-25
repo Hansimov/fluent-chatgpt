@@ -20,8 +20,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   const message = (id, role, text, extra = {}) => ({id, author:{role}, content:{content_type:'text', parts:[text]}, status:'finished_successfully', ...extra});
   const snapshot = messages => ({current_node:messages.at(-1).id, mapping:Object.fromEntries(messages.map((m,i) => [m.id, {message:m,parent:i?messages[i-1].id:null,children:i+1<messages.length?[messages[i+1].id]:[]}]))});
   const source = snapshot([
-    message('u0','user','历史第一问'), message('a0','assistant','# 历史答案\n\n保留 **格式** 和 `代码`', {channel:'final'}),
-    message('u1','user','历史第二问'),
+    message('u0','user','历史第一问',{create_time:1735787045.125,update_time:1800000000}), message('a0','assistant','# 历史答案\n\n保留 **格式** 和 `代码`', {channel:'final'}),
+    message('u1','user','历史第二问',{create_time:'2025-02-03T12:13:14+08:00'}),
     message('hidden','assistant','HIDDEN', {metadata:{is_visually_hidden_from_conversation:true}}),
     message('analysis','assistant','ANALYSIS', {channel:'analysis'}),
     message('thoughts','assistant','', {content:{content_type:'thoughts',text:'THOUGHTS'}}),
@@ -29,8 +29,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     message('call','assistant','TOOL_CALL', {recipient:'web.run'}),
     message('tool','tool','TOOL_RESULT'),
     message('a1','assistant','## 第二答案\n\n<script>globalThis.exportXss=1<\/script>', {channel:'final'}),
-    message('u2','user','第三问'), message('a2','assistant','第三答案', {channel:'final'}),
-    message('u3','user','第四问'), message('a3','assistant','第四答案', {channel:'final'}),
+    message('u2','user','第三问',{update_time:1800000000}), message('a2','assistant','第三答案', {channel:'final'}),
+    message('u3','user','第四问',{create_time:'not a date'}), message('a3','assistant','第四答案', {channel:'final'}),
   ]);
   source.mapping.other = {parent:'u1', children:[], message:message('other','assistant','OTHER_BRANCH',{channel:'final'})};
   const install = (data) => {
@@ -65,11 +65,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     equal('single snapshot fetch for the entire batch', requests, 1);
     equal('API path does not activate buttons or scroll', activations, 0);
     equal('original Markdown preserved exactly', c.conversationArchive.get(0).assistantMarkdown, '# 历史答案\n\n保留 **格式** 和 `代码`');
+    equal('user send time uses create_time, not update_time',c.conversationArchive.get(0).userCreatedAt,'2025-01-02T03:04:05.125Z');
+    equal('numeric millisecond timestamps supported',c.normalizeMessageCreatedAt(1735787045125),'2025-01-02T03:04:05.125Z');
+    equal('numeric-string seconds supported',c.normalizeMessageCreatedAt('1735787045.125'),'2025-01-02T03:04:05.125Z');
+    equal('floating-point seconds do not lose a millisecond',c.normalizeMessageCreatedAt(1.001),'1970-01-01T00:00:01.001Z');
+    equal('ISO timestamps retain the original instant across timezones',c.conversationArchive.get(1).userCreatedAt,'2025-02-03T04:13:14.000Z');
+    for(const invalid of [null,undefined,'',0,-1,NaN,Infinity,1e99,{},true,'2025-01-01','2025-01-01T12:00:00','<img onerror=alert(1)>'])equal('invalid or ambiguous timestamp omitted: '+String(invalid),c.normalizeMessageCreatedAt(invalid),'');
+    const displayTime=c.formatMessageCreatedAt(c.conversationArchive.get(0).userCreatedAt);
+    check('display time explicitly includes UTC offset',/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC[+-]\d{2}:\d{2}\)$/.test(displayTime));
+    equal('local wall time plus offset represents the exact original second',Date.parse(displayTime.replace(' ','T').replace(' (UTC','').replace(')','')),1735787045000);
     const md = c.buildConversationMarkdown(result.indices);
+    equal('Markdown includes timestamps only for the two reliable source times',(md.match(/> 发送时间：/g)||[]).length,2);
+    check('time is shown under user, outside the original prompt',md.includes('### 用户\n\n> 发送时间：'+displayTime+'\n\n历史第一问'));
+    equal('missing time never uses edit time or export time',c.conversationArchive.get(2).userCreatedAt,'');
     for (const absent of ['HIDDEN','ANALYSIS','THOUGHTS','COMMENT','TOOL_CALL','TOOL_RESULT','OTHER_BRANCH','未能在页面中挂载完整问答']) check(`export excludes ${absent}`, !md.includes(absent));
     check('historical and visible answers both in Markdown', ['历史答案','第二答案','第三答案','第四答案'].every(t=>md.includes(t)));
     check('answers retain branch order', md.indexOf('历史答案')<md.indexOf('第二答案')&&md.indexOf('第二答案')<md.indexOf('第三答案'));
     const html = c.buildConversationHtml(result.indices);
+    const parsed=new DOMParser().parseFromString(html,'text/html');
+    equal('HTML provides machine-readable send times', [...parsed.querySelectorAll('.message.user time')].map(t=>t.dateTime),['2025-01-02T03:04:05.125Z','2025-02-03T04:13:14.000Z']);
+    equal('assistant sections do not inherit user timestamps',parsed.querySelectorAll('.message.assistant time').length,0);
     check('API-only HTML includes safely escaped answer', html.includes('&lt;script&gt;globalThis.exportXss=1&lt;/script&gt;'));
     check('raw API HTML is never executable', !html.includes('<script>globalThis.exportXss'));
     check('long API-only text wraps', html.includes('pre.api-markdown{white-space:pre-wrap'));
@@ -136,6 +151,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     c.downloadBlob = (blob) => { zipBlob = blob; };
     c.exportIncludeMarkdown = true; c.exportIncludeHtml = true; c.exportIncludeAssets = false;
     await c.exportConversationIndicesZip([2,3],false);
+    check('ZIP terminal success persists after ordinary refresh',c.conversationExportResult?.kind==='success'&&(c.updateViewMeta(),c.conversationArchiveStatus.textContent.includes('导出完成'))&&c.conversationArchiveStatus.textContent.includes('已交给浏览器下载'));
     check('ZIP button creates an actual archive blob', zipBlob instanceof Blob && zipBlob.size>0);
     const bytes = new Uint8Array(await zipBlob.arrayBuffer());
     const view = new DataView(bytes.buffer);
@@ -152,6 +168,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const manifest=JSON.parse(files.get('manifest.json'));
     equal('ZIP manifest uses expanded full branch indices',manifest.conversationIndices,[1,2,3,4]);
     equal('ZIP manifest confirms no incomplete answers',manifest.incompleteConversations,[]);
+    equal('manifest version includes per-message timestamps',manifest.version,13);
+    equal('ZIP manifest preserves UTC milliseconds and null for unknown send times',manifest.userMessages.map(m=>m.createdAt),['2025-01-02T03:04:05.125Z','2025-02-03T04:13:14.000Z',null,null]);
 
     c.getConversationApiSnapshot = async () => new Promise(()=>{});
     const abort = new AbortController();

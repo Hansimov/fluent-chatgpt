@@ -10,7 +10,7 @@ const pause=ms=>new Promise(r=>setTimeout(r,ms));
 const image=(id)=>({content_type:'image_asset_pointer',asset_pointer:'sediment://'+id,size_bytes:123,width:800,height:600,metadata:{}});
 const attachment=(id,name='截图.png')=>({id,name,mime_type:'image/png',size:123,library_file_id:'libfile_'+id});
 const messages=[
- {id:'u0',author:{role:'user'},content:{content_type:'multimodal_text',parts:['图前文字',image('file_old_image_one'),'图中文字',image('file_old_image_two'),'图后文字']},metadata:{attachments:[attachment('file_old_image_one'),attachment('file_old_image_two')]}},
+ {id:'u0',author:{role:'user'},create_time:1735787045.125,content:{content_type:'multimodal_text',parts:['图前文字',image('file_old_image_one'),'图中文字',image('file_old_image_two'),'图后文字']},metadata:{attachments:[attachment('file_old_image_one'),attachment('file_old_image_two')]}},
  {id:'a0',author:{role:'assistant'},channel:'final',content:{content_type:'text',parts:['## 表格\n\n| 列 A | 列 B |\n| --- | --- |\n| 1 | **两行** |\n\n```text\n  keep indentation\n```']}},
  {id:'u1',author:{role:'user'},content:{content_type:'text',parts:['只有附件元数据的旧消息']},metadata:{attachments:[attachment('file_legacy_image','旧图.png'),{id:'file_legacy_pdf',name:'说明.pdf',mime_type:'application/pdf',size:123}]}},
  {id:'a1',author:{role:'assistant'},content:{content_type:'multimodal_text',parts:['回答图示',image('file_assistant_image')]},metadata:{attachments:[attachment('file_assistant_image','回答图.png')]}},
@@ -68,6 +68,14 @@ try{
    check('Markdown local link exists on disk: '+match[1],store.has(subdir+'/'+decodeURIComponent(match[1])));
  }
  check('all attachments saved under assets/qNNN', [...store.keys()].filter(k=>k.includes('/assets/')).length===5);
+ check('directory export reports completion only after every file is closed',c.conversationExportResult?.kind==='success'&&c.conversationArchiveStatus.textContent.startsWith('✓ 导出完成')&&c.conversationArchiveStatus.textContent.includes('已保存至：'+subdir));
+ const successStatus=c.conversationArchiveStatus.textContent;
+ c.activeView='conversation';c.updateViewMeta();c.selectAllConversations();c.clearConversationSelection();
+ check('completion survives navigation tab changes and selection refreshes',c.conversationArchiveStatus.textContent===successStatus&&!c.conversationArchiveStatus.hidden&&!c.conversationArchiveStatus.closest('#export-view'));
+ check('status is accessible and wraps long destination names',c.conversationArchiveStatus.getAttribute('role')==='status'&&c.conversationArchiveStatus.getAttribute('aria-atomic')==='true'&&getComputedStyle(c.conversationArchiveStatus).whiteSpace==='pre-line');
+ await pause(2800);c.updateConversationArchiveUi();
+ equal('completion is not cleared by the former 1.8/2.6 second timers',c.conversationArchiveStatus.textContent,successStatus);
+ check('export completion releases busy controls',!c.conversationExportInProgress&&c.conversationCancelLoadButton.hidden&&!c.conversationExportAllButton.disabled);
  const beforeKeys=[...store.keys()];
  await c.exportConversationIndices([0,1],false);
  check('repeat export creates a new subdirectory without overwriting',beforeKeys.every(k=>store.has(k))&&store.size===beforeKeys.length*2);
@@ -76,15 +84,22 @@ try{
  window.showDirectoryPicker=undefined;
  await c.exportConversationIndices([0,1],false);
  check('unsupported directory API falls back to Markdown attachment ZIP',downloaded?.name.endsWith('-markdown.zip'));
+ check('ZIP fallback says handed to browser, never claims saved to disk',c.conversationExportResult.kind==='success'&&c.conversationArchiveStatus.textContent.includes('已交给浏览器下载')&&!c.conversationArchiveStatus.textContent.includes('已保存至'));
  const packed=await decodeZip(downloaded.blob);
  check('Markdown fallback ZIP contains md + assets and no unwanted HTML', [...packed.keys()].some(n=>n.endsWith('.md'))&&[...packed.keys()].filter(n=>n.startsWith('assets/')).length===5&&![...packed.keys()].some(n=>n.endsWith('.html')));
  const manifest=JSON.parse(await packed.get('manifest.json').text());
  check('manifest confirms every original file saved',manifest.assets.every(a=>a.included));
+ equal('Markdown bundle manifest includes original message ID and UTC send time',manifest.userMessages[0],{index:1,messageId:'u0',createdAt:'2025-01-02T03:04:05.125Z'});
 
  const beforeCancel=requests;downloaded=null;
  window.showDirectoryPicker=async()=>{throw new DOMException('User canceled','AbortError');};
  await c.exportConversationIndices([0,1],false);
  check('canceling picker starts no requests or downloads',requests===beforeCancel&&downloaded===null);
+ c.updateConversationArchiveUi();
+ check('picker cancellation persists distinctly from success',c.conversationExportResult.kind==='cancelled'&&c.conversationArchiveStatus.textContent.includes('已取消'));
+ window.showDirectoryPicker=async()=>{throw new Error('Disk unavailable');};
+ await c.exportConversationIndices([0,1],false);c.updateViewMeta();
+ check('export failure remains visible after normal UI refresh',c.conversationExportResult.kind==='error'&&c.conversationArchiveStatus.textContent.includes('导出失败：Disk unavailable'));
  window.showDirectoryPicker=async()=>{throw new DOMException('Sandbox','SecurityError');};
  await c.exportConversationIndices([0,1],false);
  check('userscript sandbox restriction has the same ZIP fallback',!!downloaded);
@@ -96,6 +111,8 @@ try{
  const failedMd=c.buildConversationMarkdown([0],{assetPathMap:failedPlan.tokenPathMap,urlPathMap:failedPlan.urlPathMap});
  check('missing file remains explicitly unavailable',failedMd.includes('#asset-not-available'));
  check('missing image has readable explanation instead of a broken image icon',failedMd.includes('图片未能保存')&&!/!\[[^\]]*\]\(#asset-not-available\)/.test(failedMd));
+ await c.exportConversationIndices([0],true);
+ check('completed bundle with a missing attachment is explicitly partial',c.conversationExportResult.kind==='partial'&&c.conversationArchiveStatus.textContent.startsWith('⚠ 导出完成（有缺失）')&&c.conversationArchiveStatus.textContent.includes('1 个附件未能保存')&&c.conversationArchiveStatus.textContent.includes('manifest.json'));
  equal('same-name failed asset does not borrow a successful file path',c.resolveArchiveAssetPath(a0.assets[1],0,failedPlan.urlPathMap),'');
  equal('ambiguous filename alias remains disabled even when one download fails',failedPlan.urlPathMap.get('q:0|name:截图.png'),'');
  const invalid=await c.writeMarkdownExportDirectory(root,'safe',[{path:'../outside.txt',blob:new Blob(['test'])}]).then(()=>false,e=>e.message.includes('不安全'));
@@ -131,6 +148,8 @@ try{
  const unansweredMd=c.buildConversationMarkdown([2],{assetPathMap:unansweredPlan.tokenPathMap,urlPathMap:unansweredPlan.urlPathMap});
  check('unanswered upload is downloadable despite missing final answer',unansweredPlan.files.length===1&&unansweredMd.includes('assets/q003/')&&unansweredMd.includes('暂无已完成的回答'));
  equal('manifest does not falsely claim missing final answer is complete',c.getIncompleteConversationIndices([2]),[2]);
+ const unansweredResult=c.buildConversationExportResult('Markdown',[2],unansweredPlan,'test-directory',true);
+ check('missing source answers are distinguished from missing attachments',unansweredResult.kind==='partial'&&unansweredResult.message.includes('1 轮暂无完整回答')&&unansweredResult.message.includes('1 个附件已归档')&&!unansweredResult.message.includes('附件未能保存'));
 
  const downloadUrl=location.origin+'/backend-api/files/download/file_first_expired';
  for(const status of [403,404,410,422]) c.recordAssetRouteResult(downloadUrl,false,{status,message:'HTTP '+status});
@@ -192,6 +211,35 @@ try{
  c.cancelConversationArchiveLoad('route changed',false,true);
  check('route invalidation drops deferred navigation and capture lock',!c.conversationExportDomCaptureInProgress&&!c.deferredExportNavigation);
  c.getConversationApiSnapshot=originalSnapshot;c.waitForOfficialConversationButtonsStable=originalStable;c.loadSingleConversation=originalLoad;c.seekConversationTarget=originalSeek;
+
+ c.conversationArchive.get(0).captureSource='dom';c.conversationArchive.get(0).userCreatedAt='';
+ await c.enrichConversationArchivesWithApiAssets([0]);
+ equal('DOM fallback time enrichment requires matching user ID',c.conversationArchive.get(0).userCreatedAt,'2025-01-02T03:04:05.125Z');
+ c.conversationArchive.get(0).userIdentity='message:other-branch';c.conversationArchive.get(0).userCreatedAt='';
+ await c.enrichConversationArchivesWithApiAssets([0]);
+ equal('other branch time cannot overwrite captured user metadata',c.conversationArchive.get(0).userCreatedAt,'');
+
+ // No downloads or filesystem writes in these race tests.
+ c.exportIncludeAssets=false;c.downloadMarkdown=()=>{throw Error('Unexpected stale download');};
+ c.loadConversationIndices=async()=>({aborted:true,error:Error('Snapshot failed')});
+ await c.exportConversationIndices([0],true);
+ check('failed capture is not mislabeled as user cancellation',c.conversationExportResult.kind==='error'&&c.conversationArchiveStatus.textContent.includes('Snapshot failed'));
+ let releaseLoad;
+ c.loadConversationIndices=()=>new Promise(resolve=>{releaseLoad=resolve;});
+ const stale=c.exportConversationIndices([0],true);
+ check('new export clears the old result and shows working state',!c.conversationExportResult&&c.conversationArchiveStatus.dataset.state==='working'&&c.conversationArchiveStatus.textContent.includes('正在准备'));
+ c.routeEpoch++;c.cancelConversationArchiveLoad('route changed',false,true);c.updateConversationArchiveUi();
+ check('route change clears previous export result',!c.conversationExportResult&&c.conversationArchiveStatus.dataset.state==='idle');
+ c.conversationExportInProgress=true;c.conversationExportProgressMessage='New route exporting';c.updateConversationArchiveUi();
+ releaseLoad({indices:[0],aborted:false});await stale;
+ check('old Markdown task cannot clear new route busy state or post a stale outcome',c.conversationExportInProgress&&!c.conversationExportResult&&c.conversationArchiveStatus.textContent==='New route exporting');
+ c.conversationExportInProgress=false;
+ const staleZip=c.exportConversationIndicesZip([0],true);
+ c.routeEpoch++;c.cancelConversationArchiveLoad('route changed',false,true);
+ c.conversationExportInProgress=true;c.conversationExportProgressMessage='New ZIP task';c.updateConversationArchiveUi();
+ releaseLoad({indices:[0],aborted:false});await staleZip;
+ check('old ZIP task cannot clear new route busy state or download stale data',c.conversationExportInProgress&&!c.conversationExportResult&&c.conversationArchiveStatus.textContent==='New ZIP task');
+ c.conversationExportInProgress=false;
 }catch(e){check('unexpected exception',false,e.stack||String(e));}
 c.cancelBottomPin();c.mainObserver?.disconnect();c.pageObserver?.disconnect();
 document.documentElement.dataset.testsPassed=String(checks.every(c=>c.pass));document.documentElement.dataset.testCount=checks.length;document.getElementById('result').textContent=JSON.stringify({checks},null,2);

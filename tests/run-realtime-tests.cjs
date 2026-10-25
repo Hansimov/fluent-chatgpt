@@ -8,7 +8,7 @@ const { promisify } = require('node:util');
 
 async function main() {
   const fixture = process.argv[2] || 'markdown-assets.html';
-  if (!['markdown-assets.html'].includes(fixture)) throw new Error('Unsupported fixture');
+  if (!['markdown-assets.html', 'conversation-export.html'].includes(fixture)) throw new Error('Unsupported fixture');
   const chrome = [process.env.CHROME_PATH, 'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe', '/usr/bin/google-chrome', '/usr/bin/chromium',
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'].filter(Boolean).find(fs.existsSync);
@@ -43,7 +43,7 @@ async function main() {
       try { console.error(JSON.parse(raw.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')).checks.filter(c => !c.pass)); }
       catch { console.error(raw || stdout.slice(-4000)); }
       process.exitCode = 1;
-    } else console.log(`PASS: ${/data-test-count="(\d+)"/.exec(stdout)?.[1]} Markdown attachment/directory checks (real-time headless Chrome).`);
+    } else console.log(`PASS: ${/data-test-count="(\d+)"/.exec(stdout)?.[1]} ${fixture} checks (real-time headless Chrome).`);
   } finally {
     clearTimeout(watchdog); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3 });
