@@ -1,0 +1,106 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Markdown attachments and directory export</title>
+<script>window.__CGPT_TOC_TEST_MODE__=true;window.unsafeWindow=window;window.GM_addStyle=()=>{};window.GM_xmlhttpRequest=()=>{};window.fetch=async()=>{throw Error('Network disabled');};</script>
+<script src="../fluent-chatgpt.user.js"></script><body><main></main><pre id="result">pending</pre>
+<script>
+document.addEventListener('DOMContentLoaded',async()=>{
+const c=window.__cgptAnswerTocController,checks=[];
+const check=(name,pass,details='')=>{checks.push({name,pass:!!pass,details});document.getElementById('result').textContent=JSON.stringify({checks},null,2);};
+const equal=(name,a,b)=>check(name,JSON.stringify(a)===JSON.stringify(b),JSON.stringify(a));
+const pause=ms=>new Promise(r=>setTimeout(r,ms));
+const image=(id)=>({content_type:'image_asset_pointer',asset_pointer:'sediment://'+id,size_bytes:123,width:800,height:600,metadata:{}});
+const attachment=(id,name='截图.png')=>({id,name,mime_type:'image/png',size:123});
+const messages=[
+ {id:'u0',author:{role:'user'},content:{content_type:'multimodal_text',parts:['图前文字',image('file_old_image_one'),'图中文字',image('file_old_image_two'),'图后文字']},metadata:{attachments:[attachment('file_old_image_one'),attachment('file_old_image_two')]}},
+ {id:'a0',author:{role:'assistant'},channel:'final',content:{content_type:'text',parts:['## 表格\n\n| 列 A | 列 B |\n| --- | --- |\n| 1 | **两行** |\n\n```text\n  keep indentation\n```']}},
+ {id:'u1',author:{role:'user'},content:{content_type:'text',parts:['只有附件元数据的旧消息']},metadata:{attachments:[attachment('file_legacy_image','旧图.png'),{id:'file_legacy_pdf',name:'说明.pdf',mime_type:'application/pdf',size:123}]}},
+ {id:'a1',author:{role:'assistant'},content:{content_type:'multimodal_text',parts:['回答图示',image('file_assistant_image')]},metadata:{attachments:[attachment('file_assistant_image','回答图.png')]}},
+];
+const snapshot={current_node:'a1',mapping:Object.fromEntries(messages.map((m,i)=>[m.id,{parent:i?messages[i-1].id:null,message:m}]))};
+const store=new Map(),directories=new Set(['']);
+const makeDirectory=(path='')=>({
+ async getDirectoryHandle(name,options={}){const key=path?path+'/'+name:name;if(!directories.has(key)){if(!options.create)throw new DOMException('Missing','NotFoundError');directories.add(key);}return makeDirectory(key);},
+ async getFileHandle(name){const key=path+'/'+name;return {async createWritable(){let pending;return{async write(blob){pending=blob;},async close(){store.set(key,pending);},async abort(){pending=null;}};}};},
+});
+const decodeZip=async blob=>{const bytes=new Uint8Array(await blob.arrayBuffer()),v=new DataView(bytes.buffer),dec=new TextDecoder(),files=new Map();for(let at=0;at+30<bytes.length&&v.getUint32(at,true)===0x04034b50;){const size=v.getUint32(at+18,true),n=v.getUint16(at+26,true),e=v.getUint16(at+28,true),start=at+30+n+e;files.set(dec.decode(bytes.slice(at+30,at+30+n)),new Blob([bytes.slice(start,start+size)]));at=start+size;}return files;};
+try{
+ clearInterval(c.healthTimer);clearInterval(c.routeWatchTimer);c.cancelBottomPin();c.mainObserver?.disconnect();c.pageObserver?.disconnect();
+ c.config={...c.config,conversationLoadStepDelayMs:0,answerTocOpenConversationAtBottom:false};c.scheduleGeneratedImageRefresh=()=>{};c.scheduleConversationRebuild=()=>{};
+ c.getCurrentConversationId=()=> 'assets-test';c.currentRouteKey=c.getConversationRouteKey();
+ let requests=0;
+ c.getConversationApiSnapshot=async()=>{requests++;c.conversationApiSnapshot=snapshot;c.conversationApiSnapshotId='assets-test';c.conversationApiAssetsByIndex=c.buildConversationApiAssetMap(snapshot);return snapshot;};
+ await c.getConversationApiSnapshot();
+ equal('pointer + attachments deduplicate by exact file ID',c.conversationApiAssetsByIndex.get(0).length,2);
+ equal('legacy attachment names replace generic image.png',c.conversationApiAssetsByIndex.get(0).map(a=>a.originalFilename),['截图.png','截图.png']);
+ const pairs=c.getConversationApiExportPairs(snapshot);for(const [i,p] of pairs)c.captureApiConversationPair(i,p);
+ const a0=c.conversationArchive.get(0),a1=c.conversationArchive.get(1);
+ check('both uploads embedded at exact content positions',/图前文字\n\n!\[.*?\]\(cgpt-asset:.*?\)\n\n图中文字\n\n!\[.*?\]\(cgpt-asset:.*?\)\n\n图后文字/.test(a0.userMarkdown));
+ equal('native Markdown tables preserved',a0.assistantMarkdown,messages[1].content.parts[0]);
+ check('assistant image pointer embedded',a1.assistantMarkdown.includes('![')&&a1.assistantMarkdown.includes('cgpt-asset://'));
+ let completion=[];
+ c.fetchArchiveAsset=async(asset,signal)=>{if(signal?.aborted)throw new DOMException('Canceled','AbortError');await pause(asset.fileId==='file_old_image_one'?35:0);completion.push(asset.fileId);return{blob:new Blob([asset.fileId],{type:asset.mimeType}),contentType:asset.mimeType,resolvedFilename:asset.originalFilename||asset.filenameHint};};
+ c.getAdaptiveAssetConcurrency=()=>4;
+ const plan=await c.prepareZipAssets([0,1],true);
+ equal('one binary per real attachment',plan.files.length,5);
+ check('fixture finishes second upload before first',completion.indexOf('file_old_image_two')<completion.indexOf('file_old_image_one'));
+ const first=plan.files.find(f=>f.asset.fileId==='file_old_image_one'),second=plan.files.find(f=>f.asset.fileId==='file_old_image_two');
+ check('file ordering independent of download completion',first.path.includes('/001-')&&second.path.includes('/002-'));
+ check('same-named uploads get different paths',first.path!==second.path);
+ const md=c.buildConversationMarkdown([0,1],{assetPathMap:plan.tokenPathMap,urlPathMap:plan.urlPathMap});
+ check('portable local image paths replace internal pointers',md.includes('assets/q001/001-')&&!md.includes('cgpt-asset:')&&!md.includes('sediment:'));
+ equal('each upload and answer image appears exactly once',(md.match(/!\[/g)||[]).length,4);
+ const q2=md.slice(md.indexOf('## 问答 2'));
+ check('metadata-only uploads appear in user section',q2.indexOf('旧图.png')>=0&&q2.indexOf('旧图.png')<q2.indexOf('### ChatGPT'));
+ check('PDF stays a normal link, not an image',/\[说明.pdf\]\(\.\/assets\//.test(md)&&!md.includes('![说明.pdf]'));
+ check('Markdown table and fenced indentation survive attachment rewriting',md.includes('| --- | --- |')&&md.includes('  keep indentation'));
+
+ const root=makeDirectory();let pickedBeforeRequest=false;
+ window.showDirectoryPicker=async()=>{pickedBeforeRequest=requests===1;return root;};
+ c.exportIncludeAssets=true;
+ await c.exportConversationIndices([0,1],false);
+ check('directory selection occurs before async snapshot fetch',pickedBeforeRequest);
+ check('folder output includes Markdown and manifest', [...store.keys()].some(k=>k.endsWith('.md'))&&[...store.keys()].some(k=>k.endsWith('/manifest.json')));
+ const savedMarkdown=await [...store].find(([name])=>name.endsWith('.md'))[1].text();
+ const subdir=[...directories].find(d=>d&&!d.includes('/'));
+ for(const match of savedMarkdown.matchAll(/!?\[[^\]]*\]\(\.\/(assets\/[^)]+)\)/g)){
+   check('Markdown local link exists on disk: '+match[1],store.has(subdir+'/'+decodeURIComponent(match[1])));
+ }
+ check('all attachments saved under assets/qNNN', [...store.keys()].filter(k=>k.includes('/assets/')).length===5);
+ const beforeKeys=[...store.keys()];
+ await c.exportConversationIndices([0,1],false);
+ check('repeat export creates a new subdirectory without overwriting',beforeKeys.every(k=>store.has(k))&&store.size===beforeKeys.length*2);
+ let downloaded=null;
+ c.downloadBlob=(blob,name)=>{downloaded={blob,name};};
+ window.showDirectoryPicker=undefined;
+ await c.exportConversationIndices([0,1],false);
+ check('unsupported directory API falls back to Markdown attachment ZIP',downloaded?.name.endsWith('-markdown.zip'));
+ const packed=await decodeZip(downloaded.blob);
+ check('Markdown fallback ZIP contains md + assets and no unwanted HTML', [...packed.keys()].some(n=>n.endsWith('.md'))&&[...packed.keys()].filter(n=>n.startsWith('assets/')).length===5&&![...packed.keys()].some(n=>n.endsWith('.html')));
+ const manifest=JSON.parse(await packed.get('manifest.json').text());
+ check('manifest confirms every original file saved',manifest.assets.every(a=>a.included));
+
+ const beforeCancel=requests;downloaded=null;
+ window.showDirectoryPicker=async()=>{throw new DOMException('User canceled','AbortError');};
+ await c.exportConversationIndices([0,1],false);
+ check('canceling picker starts no requests or downloads',requests===beforeCancel&&downloaded===null);
+ window.showDirectoryPicker=async()=>{throw new DOMException('Sandbox','SecurityError');};
+ await c.exportConversationIndices([0,1],false);
+ check('userscript sandbox restriction has the same ZIP fallback',!!downloaded);
+
+ c.fetchArchiveAsset=async(asset,signal)=>{if(asset.fileId==='file_old_image_two')throw Error('HTTP 404: expired attachment');return {blob:new Blob([asset.fileId],{type:asset.mimeType}),contentType:asset.mimeType,resolvedFilename:asset.originalFilename};};
+ const failedPlan=await c.prepareZipAssets([0],true);
+ check('expired file is explicit failure, never silently replaced with another image',failedPlan.manifest.some(a=>!a.included&&a.reason.includes('404')));
+ check('expired file has no fake local path',!failedPlan.tokenPathMap.has(a0.assets[1].id));
+ const failedMd=c.buildConversationMarkdown([0],{assetPathMap:failedPlan.tokenPathMap,urlPathMap:failedPlan.urlPathMap});
+ check('missing file remains explicitly unavailable',failedMd.includes('#asset-not-available'));
+ equal('same-name failed asset does not borrow a successful file path',c.resolveArchiveAssetPath(a0.assets[1],0,failedPlan.urlPathMap),'');
+ equal('ambiguous filename alias remains disabled even when one download fails',failedPlan.urlPathMap.get('q:0|name:截图.png'),'');
+ const invalid=await c.writeMarkdownExportDirectory(root,'safe',[{path:'../outside.txt',blob:new Blob(['test'])}]).then(()=>false,e=>e.message.includes('不安全'));
+ check('directory writer rejects traversal paths',invalid);
+ const controller=new AbortController();controller.abort();const count=store.size;
+ check('aborted export never writes more files',await c.writeMarkdownExportDirectory(root,'safe',[{path:'x.md',blob:new Blob(['x'])}],controller.signal).then(()=>false,e=>e.name==='AbortError')&&store.size===count);
+ check('full export never submits prompts or needs mounted historical images',document.querySelectorAll('main img').length===0);
+}catch(e){check('unexpected exception',false,e.stack||String(e));}
+c.cancelBottomPin();c.mainObserver?.disconnect();c.pageObserver?.disconnect();
+document.documentElement.dataset.testsPassed=String(checks.every(c=>c.pass));document.documentElement.dataset.testCount=checks.length;document.getElementById('result').textContent=JSON.stringify({checks},null,2);
+});
+</script></body></html>

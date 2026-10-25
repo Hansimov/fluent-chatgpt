@@ -218,6 +218,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     equal('newly hydrated official TOC can correct provisional DOM-only indices', [...c.mapUserRecordsToLogicalIndices(c.collectUserMessageRecords(), completeButtons).recordsByIndex.keys()], [4, 5]);
     equal('conflicting known anchors cannot force non-contiguous records into adjacent indices', c.getAnchoredConversationRecordIndices([{identity:'message:u4'}, {identity:'unknown'}, {identity:'message:u5'}]), null);
+    mount(`<main>${modernUser(1, '继续')}</main>`);
+    c.conversationApiSnapshot = makeSnapshot(['继续', '继续']);
+    c.conversationApiSnapshotId = c.getCurrentConversationId();
+    c.getConversationApiPrompts().forEach((p,i)=>c.cacheConversationRecordLabel(i,{identity:p.identity,fullLabel:p.text}));
+    c.rebuildConversationToc();
+    equal('identical prompts with different message IDs remain separate historical items',c.conversationItems.map(item=>item.fullLabel),['继续','继续']);
     const cyclicNode = { message: { id: 'cycle' }, children: ['a'] };
     equal('malformed API cycle terminates', c.getConversationBranchMessages({ mapping: { a: cyclicNode } }).length, 1);
 
@@ -262,8 +268,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     check('new markdown search excludes interface headings', !liveSearch.some(item => item.element?.textContent === '正文外部控件标题'));
     equal('live user prompt excludes reader header', c.conversationItems[0]?.fullLabel, '真实结构中的提问');
     check('live semantic message pairing', c.findAssistantForUser(document.getElementById('live-user')) === document.getElementById('live-answer'));
-    equal('script version is inspectable on host', c.host.dataset.scriptVersion, '4.7.7');
-    check('script version is visible as navigation-title hint', c.shadow.querySelector('.panel-title').title.includes('4.7.7'));
+    equal('script version is inspectable on host', c.host.dataset.scriptVersion, '4.8.0');
+    check('script version is visible as navigation-title hint', c.shadow.querySelector('.panel-title').title.includes('4.8.0'));
     document.getElementById('live-answer').removeAttribute('data-chatgpt-search-unit-key');
     await pause();
     equal('content-search-unit attribute is a standalone fallback', c.getAssistantMessageElements().length, 1);

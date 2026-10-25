@@ -125,6 +125,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     c.clearConversationLabelCacheState();
     install(source); mountTail();
     let downloadedMarkdown = '';
+    c.exportIncludeAssets = false;
     c.downloadMarkdown = (text) => { downloadedMarkdown = text; };
     await c.exportConversationIndices([2,3],false);
     check('Markdown button includes history missing from navigation', downloadedMarkdown.includes('历史答案')&&downloadedMarkdown.includes('第四答案'));

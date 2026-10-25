@@ -18,13 +18,20 @@ try {
   for (const [fixture, description] of [
     ['conversation-parsing.html', 'conversation parsing'],
     ['conversation-export.html', 'conversation export'],
+    ['markdown-assets.html', 'Markdown attachments and directory export'],
+    ['navigation-jump.html', 'virtualized question navigation'],
     ['navigation-tabs.html', 'responsive navigation tabs'],
     ['selection-actions.html', 'selection action suppression'],
   ]) {
+    if (process.argv[2] && process.argv[2] !== fixture) continue;
+    if (fixture === 'markdown-assets.html') {
+      execFileSync(process.execPath, [path.join(__dirname, 'run-realtime-tests.cjs'), fixture], { stdio: 'inherit', windowsHide: true, timeout: 45000 });
+      continue;
+    }
     const output = execFileSync(chrome, [
       '--headless=new', '--disable-gpu', '--disable-extensions', '--no-first-run',
       '--disable-background-networking', '--allow-file-access-from-files',
-      `--user-data-dir=${profile}`, '--window-size=1280,900', '--virtual-time-budget=6000',
+      `--user-data-dir=${profile}`, '--window-size=1280,900', `--virtual-time-budget=${['navigation-jump.html', 'markdown-assets.html'].includes(fixture) ? 30000 : 10000}`,
       '--dump-dom', pathToFileURL(path.join(__dirname, fixture)).href,
     ], { encoding: 'utf8', windowsHide: true, timeout: 45000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     if (!output.includes('data-tests-passed="true"')) {
@@ -32,8 +39,9 @@ try {
       try {
         const result = JSON.parse(resultText.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
         console.error(JSON.stringify(result.checks.filter(check => !check.pass), null, 2));
+        if (!output.includes('data-tests-passed=')) console.error('Incomplete fixture; last check:', result.checks.at(-1));
       } catch {
-        console.error(resultText || output.slice(-12000));
+        console.error(resultText === 'pending' ? output.slice(-6000) : resultText || output.slice(-12000));
       }
       process.exitCode = 1;
     } else {
@@ -41,7 +49,7 @@ try {
     }
   }
   // Real viewport events / animation frames are not advanced by Chrome's virtual-time budget.
-  execFileSync(process.execPath, [path.join(__dirname, 'run-appearance-tests.cjs')], { stdio: 'inherit', windowsHide: true, timeout: 45000 });
+  if (!process.argv[2]) execFileSync(process.execPath, [path.join(__dirname, 'run-appearance-tests.cjs')], { stdio: 'inherit', windowsHide: true, timeout: 45000 });
 } finally {
   // Only remove the uniquely-created disposable profile, never the user's Chrome profile.
   fs.rmSync(profile, { recursive: true, force: true, maxRetries: 3 });

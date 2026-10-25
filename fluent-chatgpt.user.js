@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.7.7
+// @version      4.8.0
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -15,7 +15,7 @@
 (() => {
     'use strict';
 
-    const SCRIPT_VERSION = '4.7.7';
+    const SCRIPT_VERSION = '4.8.0';
 
     const CONFIG = Object.freeze({
         // 单条回答本身非常长时再开启。默认关闭，兼容性更稳。
@@ -1187,14 +1187,14 @@
                   <span id="conversation-selection-status" class="conversation-tool-status">已选 0</span>
                 </div>
                 <fieldset class="export-options">
-                  <legend>ZIP 内容</legend>
+                  <legend>导出内容（MD 也支持图片和附件）</legend>
                   <label class="export-option"><input id="export-include-markdown" type="checkbox" ${this.exportIncludeMarkdown ? 'checked' : ''}/>Markdown</label>
                   <label class="export-option"><input id="export-include-html" type="checkbox" ${this.exportIncludeHtml ? 'checked' : ''}/>离线 HTML</label>
                   <label class="export-option"><input id="export-include-assets" type="checkbox" ${this.exportIncludeAssets ? 'checked' : ''}/>图片和附件</label>
                 </fieldset>
                 <div class="conversation-tool-row export-button-grid">
-                  <button id="conversation-export-selected" class="tool-button" type="button" title="导出单个 Markdown 文件">选中 MD</button>
-                  <button id="conversation-export-all" class="tool-button" type="button" title="导出单个 Markdown 文件">全部 MD</button>
+                  <button id="conversation-export-selected" class="tool-button" type="button" title="勾选图片和附件时保存 Markdown + assets 目录；不支持目录写入时下载 Markdown 附件 ZIP">选中 MD</button>
+                  <button id="conversation-export-all" class="tool-button" type="button" title="勾选图片和附件时保存 Markdown + assets 目录；不支持目录写入时下载 Markdown 附件 ZIP">全部 MD</button>
                   <button id="conversation-export-selected-zip" class="tool-button" data-primary="true" type="button" title="导出 Markdown/HTML 及可获取附件的 ZIP">选中 ZIP</button>
                   <button id="conversation-export-all-zip" class="tool-button" data-primary="true" type="button" title="导出 Markdown/HTML 及可获取附件的 ZIP">全部 ZIP</button>
                 </div>
@@ -4776,7 +4776,8 @@
                     else turn.removeAttribute('data-cgpt-message-role');
                     changed = true;
                 }
-                const isTurn = Boolean(role || nativeRole);
+                // 外层 transcript 含有很多 native 消息，并不代表整个会话就是一个 turn。
+                const isTurn = Boolean(role || turn.matches(NATIVE_MESSAGE_SELECTOR));
                 if (turn.hasAttribute('data-cgpt-turn') !== isTurn) {
                     if (isTurn) turn.setAttribute('data-cgpt-turn', '');
                     else turn.removeAttribute('data-cgpt-turn');
@@ -6347,9 +6348,13 @@
         }
 
         getConversationTurnElement(element) {
-            return element instanceof Element
-                ? element.closest(TURN_SELECTOR)
-                : null;
+            if (!(element instanceof Element)) return null;
+            const virtualTurn = element.closest('[data-turn-key]');
+            if (virtualTurn) return virtualTurn;
+            const turn = element.closest(TURN_SELECTOR);
+            if (turn && turn.querySelectorAll(USER_SELECTOR).length <= 1 &&
+                turn.querySelectorAll(ASSISTANT_SELECTOR).length <= 1) return turn;
+            return element.closest(`${USER_SELECTOR}, ${ASSISTANT_SELECTOR}`);
         }
 
         getConversationTurnNumber(element) {
@@ -6369,9 +6374,9 @@
             const messageId =
                 element?.getAttribute?.('data-message-id') ||
                 element?.closest?.('[data-message-id]')?.getAttribute('data-message-id') ||
-                turn?.querySelector?.('[data-message-id]')?.getAttribute('data-message-id') ||
                 modernMessage?.getAttribute('data-chatgpt-search-message-ids')?.trim().split(/\s+/)[0] ||
                 modernMessage?.getAttribute('data-chatgpt-selection-message-id') ||
+                turn?.querySelector?.('[data-message-id]')?.getAttribute('data-message-id') ||
                 '';
             if (messageId) return `message:${messageId}`;
 
@@ -7075,7 +7080,11 @@
                  */
                 if (!displayRecord && cachedLabel) {
                     const liveIndices = liveLabelIndices.get(cachedLabel);
-                    if (liveIndices && !liveIndices.has(logicalIndex)) {
+                    const cachedIdentity = this.conversationCacheIdentityByIndex.get(logicalIndex);
+                    const sameMessageMoved = liveIndices && [...liveIndices].some((index) =>
+                        mapping.recordsByIndex.get(index)?.identity === cachedIdentity);
+                    // 不同 ID 的“继续”等重复提问是合法历史，不能仅按相同文本删掉。
+                    if (liveIndices && !liveIndices.has(logicalIndex) && (!cachedIdentity || sameMessageMoved)) {
                         this.removeConversationCachedLabel(logicalIndex);
                         cachedLabel = '';
                     }
@@ -7343,6 +7352,8 @@
         }
 
         cancelConversationJump() {
+            this.conversationJumpAbortController?.abort();
+            this.conversationJumpAbortController = null;
             this.conversationJumpToken += 1;
             for (const timer of this.conversationJumpTimers) window.clearTimeout(timer);
             this.conversationJumpTimers.clear();
@@ -7361,24 +7372,28 @@
             return timer;
         }
 
-        resolveConversationTarget(logicalIndex) {
+        resolveConversationTarget(logicalIndex, identity = this.conversationCacheIdentityByIndex.get(logicalIndex)) {
             const currentItem = this.conversationItems.find(
                 (item) => item.logicalIndex === logicalIndex,
             );
             if (
                 currentItem?.mappingConfident &&
-                currentItem.targetElement?.isConnected
+                currentItem.userElement?.isConnected &&
+                (!identity || this.getConversationRecordIdentity(currentItem.userElement) === identity)
             ) {
-                return currentItem.targetElement;
+                return this.getConversationTurnElement(currentItem.userElement) || currentItem.userElement;
             }
 
             const records = this.collectUserMessageRecords();
+            const exact = identity && records.find((record) => record.identity === identity);
+            if (exact) return exact.targetElement || exact.userElement;
             const mapping = this.mapUserRecordsToLogicalIndices(
                 records,
                 this.getOfficialNavButtons(),
             );
             const record = mapping.recordsByIndex.get(logicalIndex);
             if (!record || !mapping.confident) return null;
+            if (identity && record.identity !== identity) return null;
 
             if (record.fullLabel && mapping.trustLabels) {
                 this.cacheConversationRecordLabel(logicalIndex, record);
@@ -7455,69 +7470,117 @@
             }
         }
 
+        getConversationSeekPosition(logicalIndex, root) {
+            const records = this.collectUserMessageRecords();
+            const mapping = this.mapUserRecordsToLogicalIndices(records, this.getOfficialNavButtons());
+            if (!mapping.confident || !records.length) return null;
+            const range = Math.max(0, root.scrollHeight - root.clientHeight);
+            const reverse = getComputedStyle(root).flexDirection === 'column-reverse';
+            const origin = reverse ? -range : 0;
+            const top = root.getBoundingClientRect().top;
+            const anchors = [...mapping.recordsByIndex].map(([index, record]) => ({
+                index, y: root.scrollTop - origin + (record.targetElement || record.userElement).getBoundingClientRect().top - top,
+            })).sort((a, b) => a.index - b.index);
+            const count = Math.max(logicalIndex + 1, this.getConversationApiPrompts()?.length || 0,
+                ...this.conversationItems.map((item) => item.logicalIndex + 1));
+            const before = anchors.findLast((anchor) => anchor.index < logicalIndex) || { index: -1, y: 0 };
+            const after = anchors.find((anchor) => anchor.index > logicalIndex) || { index: count, y: root.scrollHeight };
+            const fraction = (logicalIndex - before.index) / Math.max(1, after.index - before.index);
+            const y = before.y + (after.y - before.y) * fraction - this.getConversationScrollOffset();
+            return origin + Math.max(0, Math.min(range, y));
+        }
+
+        async seekConversationTarget(logicalIndex, identity, signal) {
+            const deadline = performance.now() + 14000;
+            let aligned = 0;
+            let lastStep = '';
+            let stalled = 0;
+            while (performance.now() < deadline) {
+                if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+                if (identity) {
+                    const apiIndex = this.getConversationApiPrompts()?.findIndex((prompt) => prompt.identity === identity);
+                    if (apiIndex >= 0) logicalIndex = apiIndex;
+                }
+                this.pendingConversationLogicalIndex = logicalIndex;
+                const target = this.resolveConversationTarget(logicalIndex, identity);
+                if (this.isUsableConversationTarget(target)) {
+                    this.scrollConversationTarget(target, 'auto');
+                    // 在图片/字体加载和虚拟节点重挂载后再校正，不能持续使用已脱离 DOM 的旧节点。
+                    if (++aligned >= 6) return true;
+                } else {
+                    aligned = 0;
+                    const root = this.findConversationScrollRoot();
+                    if (!(root instanceof HTMLElement)) return false;
+                    const position = this.getConversationSeekPosition(logicalIndex, root);
+                    if (position !== null) {
+                        const step = `${Math.round(position)}:${this.collectUserMessageRecords().map((record) => record.identity).join(',')}`;
+                        stalled = step === lastStep ? stalled + 1 : 0;
+                        lastStep = step;
+                        // 已有完整虚拟高度时按锚点跳跃；到达惰性加载边界时保留等待时间。
+                        root.scrollTo({ top: position, behavior: 'auto' });
+                        if (stalled > 20) return false;
+                    }
+                }
+                await this.waitForDelay(aligned ? 180 : 140, signal);
+            }
+            return false;
+        }
+
         jumpToConversation(index) {
             const item = this.conversationItems[index];
             if (!item) return;
 
             this.cancelConversationJump();
+            this.cancelBottomPin();
             const token = this.conversationJumpToken;
+            const controller = new AbortController();
+            this.conversationJumpAbortController = controller;
             const logicalIndex = item.logicalIndex;
+            const identity = this.conversationCacheIdentityByIndex.get(logicalIndex) ||
+                (item.userElement?.isConnected ? this.getConversationRecordIdentity(item.userElement) : '');
             this.pendingConversationLogicalIndex = logicalIndex;
-            this.pendingConversationUntil = performance.now() + 2600;
+            this.pendingConversationUntil = performance.now() + 15000;
             this.applyActiveConversationIndex(index, true);
-
-            const initialTarget = this.resolveConversationTarget(logicalIndex);
-            const canDirectlyScroll = this.isUsableConversationTarget(initialTarget);
-
-            if (canDirectlyScroll) {
-                this.scrollConversationTarget(
-                    initialTarget,
-                    this.getConversationJumpBehavior(),
-                );
-
-                for (const delay of [460, 980, 1700]) {
-                    this.scheduleConversationJumpTask(() => {
-                        const liveTarget = this.resolveConversationTarget(logicalIndex) || initialTarget;
-                        this.correctConversationTargetPosition(liveTarget);
-                        this.requestFrame(true);
-                    }, delay, token);
-                }
-            } else {
-                const activated = this.activateOfficialConversationButton(logicalIndex);
-
-                for (const delay of [100, 280, 620, 1150, 1950]) {
-                    this.scheduleConversationJumpTask(() => {
-                        this.syncOfficialConversationNav();
-                        this.scheduleConversationRebuild(0);
-                        this.requestFrame(true);
-
-                        const liveTarget = this.resolveConversationTarget(logicalIndex);
-                        if (this.isUsableConversationTarget(liveTarget)) {
-                            this.correctConversationTargetPosition(liveTarget);
-                            return;
-                        }
-
-                        /* React 若替换了官方按钮，在中段再解析并补点一次。 */
-                        if (activated && delay === 620) {
-                            const activeLogicalIndex = this.getOfficialActiveLogicalIndex();
-                            if (activeLogicalIndex !== logicalIndex) {
-                                this.activateOfficialConversationButton(logicalIndex);
-                            }
-                        }
-                    }, delay, token);
-                }
+            if (!this.isUsableConversationTarget(this.resolveConversationTarget(logicalIndex, identity))) {
+                this.activateOfficialConversationButton(logicalIndex);
+                if (!this.getConversationApiPrompts()) this.getConversationApiSnapshot(controller.signal).catch(() => {});
             }
+            const root = this.findConversationScrollRoot() || window;
+            const cancel = () => this.cancelConversationJump();
+            const cancelKey = (event) => { if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End','Escape',' '].includes(event.key)) cancel(); };
+            root.addEventListener('wheel', cancel, { passive: true });
+            root.addEventListener('touchstart', cancel, { passive: true });
+            root.addEventListener('pointerdown', cancel, { passive: true });
+            window.addEventListener('keydown', cancelKey);
+            const task = this.seekConversationTarget(logicalIndex, identity, controller.signal).then((found) => {
+                if (!found && token === this.conversationJumpToken) this.setConversationJumpStatus('目标问答尚未加载，请稍后重试');
+                return found;
+            }).catch((error) => {
+                if (error?.name !== 'AbortError') console.warn('[ChatGPT 导航] 定位失败：', error);
+                return false;
+            }).finally(() => {
+                root.removeEventListener('wheel', cancel);
+                root.removeEventListener('touchstart', cancel);
+                root.removeEventListener('pointerdown', cancel);
+                window.removeEventListener('keydown', cancelKey);
+                if (token === this.conversationJumpToken) {
+                    this.conversationJumpAbortController = null;
+                    this.pendingConversationLogicalIndex = -1;
+                    this.pendingConversationUntil = 0;
+                    this.scheduleConversationRebuild(0);
+                    this.requestFrame(true);
+                }
+            });
+            this.setConversationJumpStatus('正在定位问答…');
+            task.then((found) => { if (found && token === this.conversationJumpToken) this.setConversationJumpStatus(''); });
+            return task;
+        }
 
-            this.scheduleConversationJumpTask(() => {
-                this.pendingConversationLogicalIndex = -1;
-                this.pendingConversationUntil = 0;
-                this.requestFrame(true);
-                window.setTimeout(() => {
-                    if (token === this.conversationJumpToken) {
-                        this.clearConversationJumpReveal();
-                    }
-                }, 240);
-            }, 2250, token);
+        setConversationJumpStatus(message) {
+            if (this.conversationNav) {
+                this.conversationNav.setAttribute('aria-busy', String(Boolean(this.conversationJumpAbortController)));
+                this.conversationNav.title = message;
+            }
         }
 
 
@@ -7634,11 +7697,16 @@
                     reject(new DOMException('Aborted', 'AbortError'));
                     return;
                 }
-                const timer = window.setTimeout(resolve, Math.max(0, Number(ms) || 0));
-                signal?.addEventListener('abort', () => {
+                const abort = () => {
                     window.clearTimeout(timer);
+                    signal?.removeEventListener('abort', abort);
                     reject(new DOMException('Aborted', 'AbortError'));
-                }, { once: true });
+                };
+                const timer = window.setTimeout(() => {
+                    signal?.removeEventListener('abort', abort);
+                    resolve();
+                }, Math.max(0, Number(ms) || 0));
+                signal?.addEventListener('abort', abort, { once: true });
             });
         }
 
@@ -7952,6 +8020,10 @@
                 ) {
                     this.conversationApiSnapshot = snapshot;
                     this.conversationApiAssetsByIndex = this.buildConversationApiAssetMap(snapshot);
+                    // 虚拟列表只挂载尾部几轮；目录不能等用户逐页滚动后才认识历史消息。
+                    this.getConversationApiPrompts()?.forEach((prompt, index) => {
+                        this.cacheConversationRecordLabel(index, { identity: prompt.identity, fullLabel: prompt.text || '[图片或附件]' });
+                    });
                     this.scheduleConversationRebuild(0);
                 }
                 return snapshot;
@@ -8019,6 +8091,22 @@
             return pairs;
         }
 
+        getApiMessageExportMarkdown(message, assets) {
+            const parts = message?.content?.parts;
+            if (!Array.isArray(parts)) return this.getApiMessageExportText(message);
+            return parts.map((part) => {
+                if (typeof part === 'string') return part;
+                if (part?.content_type === 'text') return part.text || '';
+                if (part?.content_type !== 'image_asset_pointer') return '';
+                const fileId = this.extractFileIdFromValue(part.asset_pointer, 'asset_pointer');
+                const asset = assets.find((candidate) => candidate.messageId === message.id &&
+                    [candidate.fileId, candidate.originalFileId, ...(candidate.fileIdCandidates || [])].includes(fileId));
+                if (!asset) return '[上传图片未能解析]';
+                const label = this.escapeMarkdownInline(asset.imageTitle || asset.originalFilename || asset.label || '图片');
+                return `![${label}](cgpt-asset://${asset.id})`;
+            }).filter(Boolean).join('\n\n').replace(/\r\n?/g, '\n').trim();
+        }
+
         async prepareConversationExportSnapshot(signal) {
             const requestEpoch = this.routeEpoch;
             const conversationId = this.getCurrentConversationId();
@@ -8053,9 +8141,9 @@
         captureApiConversationPair(logicalIndex, pair) {
             if (!pair) return null;
             const assets = (this.conversationApiAssetsByIndex.get(logicalIndex) || []).map((asset) => ({ ...asset }));
-            const assistantMarkdown = pair.assistants.map((message) => this.getApiMessageExportText(message)).filter(Boolean).join('\n\n');
+            const assistantMarkdown = pair.assistants.map((message) => this.getApiMessageExportMarkdown(message, assets)).filter(Boolean).join('\n\n');
             if (!assistantMarkdown && !assets.some((asset) => asset.role === 'assistant')) return null;
-            const userMarkdown = this.getApiMessageExportText(pair.user);
+            const userMarkdown = this.getApiMessageExportMarkdown(pair.user, assets);
             const userText = this.extractApiMessagePromptText(pair.user) || '[图片或附件]';
             const archive = {
                 logicalIndex, userText, userMarkdown: userMarkdown || userText,
@@ -8621,7 +8709,7 @@
                         existing.byteLength = inlineBlob.size;
                     }
                     if (mimeType || inlineBlob?.type) existing.mimeType = String(mimeType || inlineBlob.type);
-                    if (filename && (!existing.filenameHint || !/\.[a-z0-9]{1,10}$/i.test(existing.filenameHint) ||
+                    if (filename && (!existing.filenameHint || this.isGenericAssetMatchFilename(existing.filenameHint) || !/\.[a-z0-9]{1,10}$/i.test(existing.filenameHint) ||
                         existing.filenameHint === 'Artifact' || existing.filenameHint === 'attachment')) {
                         existing.filenameHint = this.sanitizeAssetFilename(filename, existing.filenameHint || 'asset');
                     }
@@ -8650,6 +8738,8 @@
                     originalUrls: [...new Set((originalUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))],
                     previewUrls: [...new Set((previewUrls || []).map((value) => this.normalizeAssetCandidateUrl(value)).filter(Boolean))],
                     fileId: resolvedFileId,
+                    fileIdCandidates,
+                    originalFileId: this.extractFileIdFromValue(originalFileId, 'original_file_id') || '',
                     artifactId: resolvedArtifactId,
                     filenameHint: this.sanitizeAssetFilename(inferredName || `asset-${sequence}`, `asset-${sequence}`),
                     originalFilename: originalFilename ? this.sanitizeAssetFilename(originalFilename, inferredName || `asset-${sequence}`) : '',
@@ -13027,6 +13117,12 @@
                 if (path) return path;
             }
             const keys = this.getArchiveReferenceKeys(raw, logicalIndex);
+            const fileId = this.extractFileIdFromValue(raw);
+            const artifactId = this.extractArtifactIdFromValue(raw);
+            if (fileId || artifactId) {
+                // 明确 ID 的文件获取失败时，不能降级到同名的另一个文件。
+                return referencePathMap.get(fileId ? `file:${fileId}` : `artifact:${artifactId}`) || '';
+            }
             // 优先当前问答中的别名，再使用全局唯一别名。
             keys.sort((a, b) => (a.key.startsWith(`q:${logicalIndex}|`) ? -1 : 0) - (b.key.startsWith(`q:${logicalIndex}|`) ? -1 : 0));
             for (const { key } of keys) {
@@ -13046,6 +13142,7 @@
                 const path = referencePathMap.get(`artifact:${asset.artifactId}`);
                 if (path) return path;
             }
+            if (this.getAssetStrongFileIds(asset).size || asset.artifactId) return '';
             for (const value of [
                 asset.sourceUrl,
                 ...(asset.alternateUrls || []),
@@ -13133,7 +13230,7 @@
             return this.rewriteMarkdownArchiveReferences(tokenRewritten, archive, referencePathMap);
         }
 
-        buildArchiveAssetMarkdown(archive, assetPathMap = new Map(), referencePathMap = new Map()) {
+        buildArchiveAssetMarkdown(archive, assetPathMap = new Map(), referencePathMap = new Map(), role = '', body = '') {
             const groups = this.getCanonicalArchiveAssetGroupsForArchive(archive);
             if (!groups.length) return '';
             const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
@@ -13141,17 +13238,21 @@
             const seen = new Set();
             for (const group of groups) {
                 const asset = group.asset;
+                if (role && !group.refs.some((ref) => (ref.asset.role === 'user' ? 'user' : 'assistant') === role)) continue;
+                if (body && group.refs.some((ref) => body.includes(`cgpt-asset://${ref.asset.id}`))) continue;
                 const localPath = group.refs.map((ref) => assetPathMap.get(ref.asset.id) || this.resolveArchiveAssetPath(ref.asset, logicalIndex, referencePathMap)).find(Boolean) || '';
                 const fallbackAsset = group.refs.map((ref) => ref.asset).find((candidate) => this.getPortableAssetFallbackReference(candidate)) || asset;
                 const reference = localPath ? this.toArchiveLocalReference(localPath) : this.getPortableAssetFallbackReference(fallbackAsset);
                 const dedupeKey = localPath ? `local:${localPath}` : reference ? `reference:${reference}` : `asset:${asset.id}`;
                 if (seen.has(dedupeKey)) continue;
                 seen.add(dedupeKey);
-                const label = this.escapeMarkdownInline(asset.label || asset.filenameHint || '附件');
+                const label = this.escapeMarkdownInline(asset.imageTitle || asset.originalFilename || asset.label || asset.filenameHint || '附件');
                 const suffix = localPath ? '' : reference ? '（外部链接）' : '（未能获取）';
-                lines.push(reference ? `- [${label}](${reference})${suffix}` : `- ${label}${suffix}`);
+                const image = /image|canvas|svg/i.test(asset.kind || '') || String(asset.mimeType).startsWith('image/');
+                if (reference && body.includes(`](${reference})`)) continue;
+                lines.push(reference ? image ? `![${label}](${reference})${suffix}\n` : `- [${label}](${reference})${suffix}` : `- ${label}${suffix}`);
             }
-            return `${lines.join('\n')}\n`;
+            return lines.length > 2 ? `${lines.join('\n')}\n` : '';
         }
 
         buildConversationMarkdown(indices, options = {}) {
@@ -13185,6 +13286,10 @@
                     const fallback = this.conversationItems.find((item) => item.logicalIndex === logicalIndex)?.fullLabel;
                     lines.push(fallback || `_未能加载第 ${logicalIndex + 1} 轮提问_`, '');
                 }
+                if (archive && includeAssetAppendix) {
+                    const uploads = this.buildArchiveAssetMarkdown(archive, assetPathMap, referencePathMap, 'user', archive.userMarkdown || '');
+                    if (uploads) lines.push(uploads, '');
+                }
                 lines.push('### ChatGPT', '');
                 if (archive?.assistantMarkdown) {
                     const assistantMarkdown = this.replaceArchiveAssetTokens(
@@ -13199,7 +13304,7 @@
                     lines.push(`_${reason}_`, '');
                 }
                 if (archive && includeAssetAppendix) {
-                    const appendix = this.buildArchiveAssetMarkdown(archive, assetPathMap, referencePathMap);
+                    const appendix = this.buildArchiveAssetMarkdown(archive, assetPathMap, referencePathMap, 'assistant', archive.assistantMarkdown || '');
                     if (appendix) lines.push(appendix, '');
                 }
                 lines.push('---', '');
@@ -15126,6 +15231,19 @@
             // 使用规范化资源清单：一个真实文件只形成一个任务；DOM 按钮、sandbox 占位符、
             // API 元数据和正文链接只是同一资源的引用，不再分别计数和分别失败。
             const canonicalGroups = this.getCanonicalArchiveAssetGroupsForIndices(indices);
+            // 在下载前登记整个清单的歧义；即使同名文件之一下载失败，也不解除歧义。
+            const aliasOwners = new Map();
+            canonicalGroups.forEach((group, index) => {
+                for (const ref of group.refs) {
+                    for (const name of this.getAssetAliasNames(ref.asset)) {
+                        for (const key of [`name:${name}`, `q:${ref.logicalIndex}|name:${name}`]) {
+                            if (!aliasOwners.has(key)) aliasOwners.set(key, new Set());
+                            aliasOwners.get(key).add(index);
+                        }
+                    }
+                }
+            });
+            for (const [key, owners] of aliasOwners) if (owners.size > 1) urlPathMap.set(key, '');
             const uniqueJobs = new Map();
             for (const group of canonicalGroups) {
                 const entry = group.refs.find((ref) => this.isArchiveAssetFetchableCandidate(ref.asset)) || group.refs[0];
@@ -15141,6 +15259,12 @@
                 uniqueJobs.get(key).refs.push(...group.refs);
             }
 
+            const ordinals = new Map();
+            for (const job of uniqueJobs.values()) {
+                const next = (ordinals.get(job.logicalIndex) || 0) + 1;
+                ordinals.set(job.logicalIndex, next);
+                job.fileOrdinal = next;
+            }
             const jobs = [...uniqueJobs.values()].sort((a, b) => this.scoreAssetJob(a) - this.scoreAssetJob(b));
             this.conversationAssetProgress = { completed: 0, total: jobs.length, failed: 0 };
             this.assetProgressActive = 0;
@@ -15169,7 +15293,8 @@
                         dispositionName || result.resolvedFilename || asset.originalFilename || asset.filenameHint || asset.label || 'asset',
                         result.contentType || asset.mimeType || result.blob.type,
                     );
-                    const path = this.createUniqueAssetPath(logicalIndex, filename, usedPaths);
+                    // 编号在并发下载前确定，不能由网络完成顺序决定同名文件的次序。
+                    const path = this.createUniqueAssetPath(logicalIndex, `${String(job.fileOrdinal).padStart(3, '0')}-${filename}`, usedPaths);
                     plannedZipBytes += result.blob.size;
                     this.assetProgressBytes += result.blob.size;
                     files.push({ path, blob: result.blob, asset, logicalIndex });
@@ -15393,6 +15518,81 @@
             return this.exportConversationIndicesZip(this.getAllConversationLogicalIndices(), false);
         }
 
+        async writeMarkdownExportDirectory(parent, basename, files, signal) {
+            // 仅写用户选择目录下的全新子目录，不覆盖用户已有归档。
+            let directory = null;
+            let name = '';
+            for (let attempt = 0; attempt < 10; attempt += 1) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                name = `${basename}-${crypto.randomUUID().slice(0, 8)}`;
+                try { await parent.getDirectoryHandle(name); }
+                catch (error) {
+                    if (error?.name !== 'NotFoundError') throw error;
+                    directory = await parent.getDirectoryHandle(name, { create: true });
+                    break;
+                }
+            }
+            if (!directory) throw new Error('无法创建新的导出子目录');
+            for (const file of files) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                const parts = file.path.split('/');
+                if (parts.some((part) => !part || part === '.' || part === '..' || /[\\:\x00-\x1f]/.test(part))) throw new Error('不安全的归档路径');
+                let folder = directory;
+                for (const part of parts.slice(0, -1)) folder = await folder.getDirectoryHandle(part, { create: true });
+                const handle = await folder.getFileHandle(parts.at(-1), { create: true });
+                const writable = await handle.createWritable();
+                try {
+                    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                    await writable.write(file.blob);
+                    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                    await writable.close();
+                } catch (error) {
+                    await writable.abort().catch(() => {});
+                    throw error;
+                }
+            }
+            return name;
+        }
+
+        async saveMarkdownExportBundle(indices, selectedOnly, parent, signal) {
+            this.updateConversationArchiveUi('正在下载 Markdown 的图片和附件…');
+            await this.enrichConversationArchivesWithApiAssets(indices, signal);
+            const plan = await this.prepareZipAssets(indices, true, signal);
+            if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+            const title = this.sanitizeAssetFilename(this.getConversationExportTitle(), 'conversation');
+            const base = `${title}${selectedOnly ? '-selected' : '-all'}-${this.getExportTimestamp()}`;
+            const markdown = this.buildConversationMarkdown(indices, {
+                assetPathMap: plan.tokenPathMap, urlPathMap: plan.urlPathMap, includeAssetAppendix: true,
+            });
+            const incomplete = indices.filter((index) => !this.conversationArchive.has(index));
+            const manifest = {
+                version: 11, source: location.href, generatedAt: new Date().toISOString(),
+                conversationIndices: indices.map((index) => index + 1),
+                incompleteConversations: incomplete.map((index) => ({ index: index + 1, reason: this.conversationArchiveFailures.get(index) })),
+                assets: plan.manifest,
+            };
+            // 先写资源，最后写正文/清单；中止时不会留下声称完整成功的清单。
+            const files = [...plan.files,
+                { path: `${title}.md`, blob: new Blob([markdown], { type: 'text/markdown;charset=utf-8' }) },
+                { path: 'manifest.json', blob: new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }) },
+            ];
+            let destination = '';
+            if (parent) {
+                destination = await this.writeMarkdownExportDirectory(parent, base, files, signal);
+            } else {
+                const zip = new StoredZipBuilder();
+                for (const file of files) {
+                    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                    await zip.add(file.path, file.blob);
+                }
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                this.downloadBlob(zip.build(), `${base}-markdown.zip`);
+                destination = 'Markdown 附件 ZIP（解压后查看）';
+            }
+            const failed = plan.manifest.filter((item) => !item.included && !item.skipped).length;
+            return `已保存 ${destination}；${indices.length - incomplete.length} 轮，${plan.files.length} 个附件${incomplete.length || failed ? `；${incomplete.length} 轮/ ${failed} 个附件不完整，详见 manifest.json` : ''}`;
+        }
+
         async exportConversationIndices(indices, selectedOnly) {
             if (this.conversationExportInProgress || this.conversationLoadPromise) return;
             let uniqueIndices = [...new Set(indices)]
@@ -15404,9 +15604,24 @@
             }
 
             this.conversationExportInProgress = true;
+            const controller = new AbortController();
+            const requestEpoch = this.routeEpoch;
+            this.conversationLoadAbortController = controller;
+            const includeAssets = this.exportIncludeAssets;
             this.updateConversationArchiveUi('正在准备 Markdown…');
             let completionMessage = '';
             try {
+                let parent = null;
+                if (includeAssets && typeof window.showDirectoryPicker === 'function') {
+                    // 必须在点击调用栈内请求目录；等待网络之后用户激活凭证会失效。
+                    try { parent = await window.showDirectoryPicker({ mode: 'readwrite', id: 'fluent-chatgpt-export' }); }
+                    catch (error) {
+                        if (error?.name === 'AbortError') throw error;
+                        if (!['SecurityError', 'NotAllowedError', 'TypeError'].includes(error?.name)) throw error;
+                        // 油猴隔离环境/浏览器权限不允许目录写入时，用单个 ZIP 保留文件层级。
+                    }
+                }
+                if (controller.signal.aborted || requestEpoch !== this.routeEpoch) throw new DOMException('Aborted', 'AbortError');
                 {
                     const loadResult = await this.loadConversationIndices(uniqueIndices, { mode: 'export', restore: true, includeAll: !selectedOnly });
                     if (loadResult?.aborted) {
@@ -15415,6 +15630,12 @@
                     }
                     uniqueIndices = loadResult?.indices || uniqueIndices;
                 }
+                this.conversationLoadAbortController = controller;
+                if (controller.signal.aborted || requestEpoch !== this.routeEpoch) throw new DOMException('Aborted', 'AbortError');
+                if (includeAssets) {
+                    completionMessage = await this.saveMarkdownExportBundle(uniqueIndices, selectedOnly, parent, controller.signal);
+                    return;
+                }
                 const markdown = this.buildConversationMarkdown(uniqueIndices);
                 this.downloadMarkdown(markdown, selectedOnly);
                 const succeeded = uniqueIndices.filter((index) => this.conversationArchive.has(index)).length;
@@ -15422,7 +15643,12 @@
                 completionMessage = failed
                     ? `已导出 ${uniqueIndices.length} 轮，其中 ${failed} 轮不完整`
                     : `已导出 ${uniqueIndices.length} 轮`;
+            } catch (error) {
+                completionMessage = error?.name === 'AbortError'
+                    ? 'Markdown 导出已取消；若已开始写入目录，可保留或删除未完成子目录'
+                    : `Markdown 导出失败：${error?.message || error}；已写入的部分文件保留在新建子目录中`;
             } finally {
+                if (this.conversationLoadAbortController === controller) this.conversationLoadAbortController = null;
                 this.conversationExportInProgress = false;
                 this.updateConversationArchiveUi(completionMessage);
                 window.setTimeout(() => this.updateConversationArchiveUi(), 1800);

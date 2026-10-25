@@ -1,0 +1,69 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Virtualized question navigation</title>
+<style>.thread-scroll-container{height:500px;overflow:auto;display:flex;flex-direction:column} .virtual-space{flex-shrink:0} [data-turn-key]{box-sizing:border-box;padding-top:8px} .question{height:40px}</style>
+<script>window.__CGPT_TOC_TEST_MODE__=true;window.unsafeWindow=window;window.GM_addStyle=()=>{};window.GM_xmlhttpRequest=()=>{};window.fetch=async()=>{throw Error('No network');};</script>
+<script src="../fluent-chatgpt.user.js"></script><body><main><div class="thread-scroll-container"><div class="transcriptContent-test virtual-space"><div id="window"></div></div></div></main><pre id="result">pending</pre>
+<script>
+document.addEventListener('DOMContentLoaded',async()=>{
+const c=window.__cgptAnswerTocController,checks=[];
+const check=(name,pass,details='')=>checks.push({name,pass:!!pass,details});
+const root=document.querySelector('.thread-scroll-container'),space=document.querySelector('.virtual-space'),holder=document.getElementById('window');
+const heights=Array.from({length:50},(_,i)=>500+(i%7)*260),offsets=[0];heights.forEach(h=>offsets.push(offsets.at(-1)+h));
+space.style.height=offsets.at(-1)+'px';
+const snapshot={current_node:'u49',mapping:Object.fromEntries(heights.map((_,i)=>['u'+i,{parent:i?'u'+(i-1):null,message:{id:'u'+i,author:{role:'user'},content:{parts:['问题 '+i]}}}]))};
+let reverse=false,renderTimer=0;
+const render=()=>{
+ const position=root.scrollTop+(reverse?root.scrollHeight-root.clientHeight:0);
+ const at=Math.max(0,offsets.findIndex((y,i)=>i<50&&y+heights[i]>position));
+ const start=Math.max(0,at-1),end=Math.min(50,at+3);
+ holder.style.marginTop=offsets[start]+'px';
+ holder.innerHTML=Array.from({length:end-start},(_,n)=>{const i=start+n;return `<div data-turn-key="u${i}" style="height:${heights[i]}px"><div class="question" data-chatgpt-search-unit-key="fallback-turn-${i}:0:user" data-chatgpt-search-message-ids="u${i}">问题 ${i}</div><div data-chatgpt-search-unit-key="fallback-turn-${i}:2:assistant"><div data-markdown-text-style="assistant-message">回答 ${i}</div></div></div>`;}).join('');
+ c.rebuildConversationToc();
+};
+const onScroll=()=>{clearTimeout(renderTimer);renderTimer=setTimeout(render,60);};
+const aligned=i=>{const node=document.querySelector(`[data-turn-key="u${i}"]`);return node&&Math.abs(node.getBoundingClientRect().top-root.getBoundingClientRect().top-88)<4;};
+const jump=async i=>{const buttonIndex=c.conversationItems.findIndex(item=>item.logicalIndex===i);return c.jumpToConversation(buttonIndex);};
+try{
+ clearInterval(c.healthTimer);clearInterval(c.routeWatchTimer);c.cancelBottomPin();c.mainObserver?.disconnect();c.pageObserver?.disconnect();
+ c.config={...c.config,answerTocOpenConversationAtBottom:false};c.scheduleGeneratedImageRefresh=()=>{};c.scheduleConversationRebuild=()=>{};c.requestFrame=()=>{};
+ c.getCurrentConversationId=()=> 'navigation-test';c.currentRouteKey=c.getConversationRouteKey();c.conversationApiSnapshot=snapshot;c.conversationApiSnapshotId='navigation-test';
+ c.clearConversationLabelCacheState();
+ c.fetchChatGptApiJson=async()=>snapshot;
+ await c.getConversationApiSnapshot(null,true);
+ check('snapshot initializes full historical navigation without scrolling',c.conversationLabelCache.size===50);
+ c.getConversationApiPrompts().forEach((p,i)=>c.cacheConversationRecordLabel(i,{identity:p.identity,fullLabel:p.text}));
+ root.scrollTop=offsets[46];render();root.addEventListener('scroll',onScroll);
+ check('fixture mounts only a small virtual window',c.collectUserMessageRecords().length<6);
+ check('fixture has no old native TOC',c.getOfficialNavButtons().length===0);
+ const first=c.collectUserMessageRecords()[0];
+ space.setAttribute('data-cgpt-turn','');
+ check('turn target is one data-turn-key, not shared transcript',c.getConversationTurnElement(first.userElement)===first.userElement.closest('[data-turn-key]'));
+ check('semantic adapter does not mark shared transcript as one turn',!holder.parentElement.hasAttribute('data-cgpt-message-role'));
+ check('unmounted early question becomes mounted',await jump(2));
+ check('early question aligns below sticky header',aligned(2));
+ check('late question remounts after jumping from history',await jump(46));
+ check('late question aligns correctly',aligned(46));
+ const old=c.getUserMessageElements()[0],oldIdentity=c.getConversationRecordIdentity(old);
+ const oldIndex=c.conversationCacheIndexByIdentity.get(oldIdentity);
+ old.setAttribute('data-chatgpt-search-message-ids','recycled-message');
+ check('recycled connected node cannot impersonate old question',c.resolveConversationTarget(oldIndex,oldIdentity)===null);
+ render();
+ const pending=jump(4);root.dispatchEvent(new WheelEvent('wheel',{deltaY:120}));
+ check('manual scrolling cancels ongoing seek',await pending===false);
+ check('canceled seek clears pending state',c.pendingConversationLogicalIndex===-1);
+ const firstJump=jump(1),secondJump=jump(25);
+ check('rapid second click cancels first jump',await firstJump===false);
+ check('rapid second click reaches only newest target',await secondJump&&aligned(25));
+ reverse=true;root.style.flexDirection='column-reverse';root.scrollTop=0;render();
+ check('negative-scroll container supports historical seek',await jump(3));
+ check('reverse container lands at correct offset',aligned(3)&&root.scrollTop<0);
+ let abortListeners=0;
+ const controller=new AbortController(),add=controller.signal.addEventListener.bind(controller.signal),remove=controller.signal.removeEventListener.bind(controller.signal);
+ controller.signal.addEventListener=(type,...args)=>{if(type==='abort')abortListeners++;add(type,...args);};
+ controller.signal.removeEventListener=(type,...args)=>{if(type==='abort')abortListeners--;remove(type,...args);};
+ for(let i=0;i<12;i++)await c.waitForDelay(0,controller.signal);
+ check('settle polling does not accumulate abort listeners',abortListeners===0);
+}catch(e){check('unexpected exception',false,e.stack||String(e));}
+root.removeEventListener('scroll',onScroll);clearTimeout(renderTimer);c.cancelConversationJump();c.cancelBottomPin();
+document.documentElement.dataset.testsPassed=String(checks.every(c=>c.pass));document.documentElement.dataset.testCount=checks.length;document.getElementById('result').textContent=JSON.stringify({checks},null,2);
+});
+</script></body></html>
