@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 长对话性能优化、导航、搜索与归档
 // @namespace    local.chatgpt
-// @version      4.8.0
+// @version      4.8.1
 // @description  优化长对话渲染，提供 SPA 导航、生成图像画廊与按序原图 ZIP、全文搜索、安全全量加载，以及原始附件与 Artifacts 离线归档
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -15,7 +15,7 @@
 (() => {
     'use strict';
 
-    const SCRIPT_VERSION = '4.8.0';
+    const SCRIPT_VERSION = '4.8.1';
 
     const CONFIG = Object.freeze({
         // 单条回答本身非常长时再开启。默认关闭，兼容性更稳。
@@ -198,7 +198,7 @@
 
         // 连接/首字节、正文无进展和绝对上限分开控制。
         // 大文件只要持续有数据就不会像旧版那样在固定 30 秒后被中断并重新尝试。
-        conversationExportAssetHeaderTimeoutMs: 3800,
+        conversationExportAssetHeaderTimeoutMs: 8000,
         conversationExportAssetIdleTimeoutMs: 30000,
         conversationExportAssetHardTimeoutMs: 10 * 60 * 1000,
         conversationExportAssetTimeoutMs: 30000,
@@ -726,6 +726,8 @@
             this.conversationLoadAbortController = null;
             this.conversationLoadPromise = null;
             this.conversationLoadMode = '';
+            this.conversationExportDomCaptureInProgress = false;
+            this.deferredExportNavigation = null;
             this.conversationLoadProgress = { completed: 0, total: 0, failed: 0 };
             this.conversationExportInProgress = false;
             this.conversationAssetProgress = { completed: 0, total: 0, failed: 0 };
@@ -4685,6 +4687,8 @@
             this.cancelConversationArchiveLoad('页面已切换', false, true);
             this.conversationArchive.clear();
             this.conversationArchiveFailures.clear();
+            this.conversationExportDomCaptureInProgress = false;
+            this.deferredExportNavigation = null;
             this.selectedConversationIndices.clear();
             this.conversationApiSnapshot = null;
             this.conversationApiSnapshotPromise = null;
@@ -7530,6 +7534,16 @@
             const item = this.conversationItems[index];
             if (!item) return;
 
+            if (this.conversationExportDomCaptureInProgress) {
+                // API 正文和附件下载不依赖滚动；只有旧页面 DOM 后备采集需要独占挂载位置。
+                this.deferredExportNavigation = {
+                    logicalIndex: item.logicalIndex,
+                    identity: this.conversationCacheIdentityByIndex.get(item.logicalIndex) || '',
+                };
+                this.setConversationJumpStatus('正在读取页面正文，完成后定位到所选问答…');
+                return Promise.resolve(false);
+            }
+
             this.cancelConversationJump();
             this.cancelBottomPin();
             const token = this.conversationJumpToken;
@@ -7686,6 +7700,8 @@
                 this.conversationLoadAbortController = null;
                 this.conversationLoadPromise = null;
                 this.conversationLoadMode = '';
+                this.conversationExportDomCaptureInProgress = false;
+                this.deferredExportNavigation = null;
                 this.conversationExportInProgress = false;
             }
             if (updateUi) this.updateConversationArchiveUi(reason);
@@ -8094,7 +8110,7 @@
         getApiMessageExportMarkdown(message, assets) {
             const parts = message?.content?.parts;
             if (!Array.isArray(parts)) return this.getApiMessageExportText(message);
-            return parts.map((part) => {
+            const markdown = parts.map((part) => {
                 if (typeof part === 'string') return part;
                 if (part?.content_type === 'text') return part.text || '';
                 if (part?.content_type !== 'image_asset_pointer') return '';
@@ -8105,6 +8121,28 @@
                 const label = this.escapeMarkdownInline(asset.imageTitle || asset.originalFilename || asset.label || '图片');
                 return `![${label}](cgpt-asset://${asset.id})`;
             }).filter(Boolean).join('\n\n').replace(/\r\n?/g, '\n').trim();
+            return message.author?.role === 'assistant' ? this.replaceApiCitationTokens(markdown, message) : markdown;
+        }
+
+        replaceApiCitationTokens(markdown, message) {
+            const references = Array.isArray(message.metadata?.content_references) ? message.metadata.content_references : [];
+            return markdown.replace(/\ue200cite\ue202[^\ue201]*\ue201/g, (token) => {
+                const ref = references.find((item) => item.matched_text === token);
+                const items = [...(Array.isArray(ref?.items) ? ref.items : []), ...(Array.isArray(ref?.fallback_items) ? ref.fallback_items : [])];
+                if (!items.length && typeof ref?.alt === 'string') {
+                    items.push(...this.extractUrlLikeValues(ref.alt).map((url) => ({ url })));
+                }
+                const links = new Map();
+                for (const item of items.flatMap((item) => [item, ...(Array.isArray(item?.supporting_websites) ? item.supporting_websites : [])])) {
+                    try {
+                        const url = new URL(item.url);
+                        if (!/^https?:$/.test(url.protocol)) continue;
+                        const label = this.escapeMarkdownInline(item.title || item.attribution || url.hostname);
+                        links.set(url.href, `[${label}](${url.href.replace(/[()]/g, (ch) => ch === '(' ? '%28' : '%29')})`);
+                    } catch { }
+                }
+                return links.size ? `（${[...links.values()].join('；')}）` : '（引用来源信息不可用）';
+            });
         }
 
         async prepareConversationExportSnapshot(signal) {
@@ -8138,16 +8176,18 @@
             }
         }
 
-        captureApiConversationPair(logicalIndex, pair) {
+        captureApiConversationPair(logicalIndex, pair, snapshotAssets = null) {
             if (!pair) return null;
-            const assets = (this.conversationApiAssetsByIndex.get(logicalIndex) || []).map((asset) => ({ ...asset }));
+            const assets = (snapshotAssets || this.conversationApiAssetsByIndex.get(logicalIndex) || []).map((asset) => ({ ...asset }));
             const assistantMarkdown = pair.assistants.map((message) => this.getApiMessageExportMarkdown(message, assets)).filter(Boolean).join('\n\n');
-            if (!assistantMarkdown && !assets.some((asset) => asset.role === 'assistant')) return null;
+            const answerUnavailableReason = !assistantMarkdown && !assets.some((asset) => asset.role === 'assistant')
+                ? '此轮暂无已完成的回答（用户输入和附件已保留）' : '';
             const userMarkdown = this.getApiMessageExportMarkdown(pair.user, assets);
             const userText = this.extractApiMessagePromptText(pair.user) || '[图片或附件]';
             const archive = {
                 logicalIndex, userText, userMarkdown: userMarkdown || userText,
-                assistantMarkdown: assistantMarkdown || '_此回答主要包含图片、文件或 Artifact。_',
+                assistantMarkdown: assistantMarkdown || (answerUnavailableReason ? `_${answerUnavailableReason}_` : '_此回答主要包含图片、文件或 Artifact。_'),
+                answerUnavailableReason,
                 // 无需挂载页面即可保留原始 Markdown；HTML 后备按原文换行安全显示。
                 userHtml: '', assistantHtml: '', assets,
                 userIdentity: pair.user.id ? `message:${pair.user.id}` : '',
@@ -8166,7 +8206,8 @@
                 // React 正在替换 DOM 或页面排版解析失败，不影响已经读到的完整结构化正文。
             }
             this.conversationArchive.set(logicalIndex, archive);
-            this.conversationArchiveFailures.delete(logicalIndex);
+            if (answerUnavailableReason) this.conversationArchiveFailures.set(logicalIndex, answerUnavailableReason);
+            else this.conversationArchiveFailures.delete(logicalIndex);
             this.cacheConversationRecordLabel(logicalIndex, { identity: archive.userIdentity, fullLabel: userText });
             this.markSearchIndexDirty(true);
             return archive;
@@ -8175,6 +8216,8 @@
         extractFileIdFromValue(value, keyHint = '') {
             const raw = String(value || '').trim();
             if (!raw) return '';
+            // Library 引用不是 files/download 的文件 ID，也不能成为第二份附件。
+            if (/^libfile[-_]/i.test(raw) || /library[_-]?file[_-]?id/i.test(keyHint)) return '';
             const decoded = (() => {
                 try { return decodeURIComponent(raw); } catch { return raw; }
             })();
@@ -8767,6 +8810,8 @@
                 const raw = String(rawValue || '').trim();
                 if (!raw) return;
                 const keySignal = String(keyHint || '').toLowerCase();
+                // safe_urls 是网页链接的安全白名单，包含引用/搜索来源，并非附件清单。
+                if (/(?:^|[.\s])safe[_-]?urls?(?:$|[.\s])/i.test(keySignal)) return;
                 const preciseFileField = /(?:^|[.\s_-])(?:original|source|upload)?[_-]?(?:file|attachment|asset)[_-]?(?:id|key|pointer)(?:$|[.\s_-])/i.test(keySignal);
                 const preciseArtifactField = /(?:^|[.\s_-])(?:artifact|canvas|canmore|textdoc|document)[_-]?(?:id|key|pointer)(?:$|[.\s_-])/i.test(keySignal);
                 const internalFilePointer = /^(?:file-service|sediment):\/\//i.test(raw) || /\/backend-api\/(?:files?|file)\//i.test(raw);
@@ -8795,7 +8840,13 @@
                         const freeFormContent = /\bcontent\b.*(?:^|[.\s])parts(?:$|[.\s])/i.test(keySignal) || /(?:^|[.\s])content\.parts(?:$|[.\s])/i.test(keySignal) || /^content parts/i.test(keySignal);
                         const ordinaryPublicUrl = /^https?:/i.test(foundUrl) &&
                             !/(?:\/backend-api\/(?:files?|file|artifacts?|canvas|canmore|textdocs?|documents?)\/|oaiusercontent|oaistatic|\/download(?:[/?#]|$)|[?&](?:download|response-content-disposition)=)/i.test(foundUrl);
-                        if (freeFormContent && ordinaryPublicUrl) continue;
+                        if (freeFormContent && ordinaryPublicUrl) {
+                            // 只接受正文明确的 Markdown 图片/文件链接，普通网站链接不是附件。
+                            const links = [...raw.matchAll(/(!?)\[[^\]\n]*\]\(([^)]+)\)/g)];
+                            const explicitLink = links.some((match) => match[2].replace(/^<|>$/g, '') === foundUrl &&
+                                (match[1] || /\.(?:pdf|docx?|xlsx?|pptx?|zip|csv|txt|png|jpe?g|gif|webp)(?:$|[?#])/i.test(foundUrl)));
+                            if (!explicitLink) continue;
+                        }
                         if (!this.isLikelyDownloadableAssetReference({
                             url: foundUrl,
                             keySignal,
@@ -8992,6 +9043,7 @@
             const walk = (value, keyPath = '', depth = 0) => {
                 if (value == null || depth > 11 || visitedCount > 5200) return;
                 if (typeof value === 'string') {
+                    if (/(?:citations?|content[_ -]?references?|search[_ -]?results?|web[_ -]?(?:sources?|pages?)|source[_ -]?attributions?)/i.test(keyPath)) return;
                     addStringReferences(value, keyPath);
                     return;
                 }
@@ -10855,6 +10907,15 @@
             ];
             return new Set(values
                 .map((value) => this.normalizeAssetCandidateUrl(value))
+                .map((value) => {
+                    // 去除纯跟踪参数；签名、文件版本等其它参数仍参与强身份判断。
+                    if (!/^https?:/i.test(value)) return value;
+                    try {
+                        const parsed = new URL(value);
+                        for (const key of [...parsed.searchParams.keys()]) if (/^utm_/i.test(key)) parsed.searchParams.delete(key);
+                        return parsed.href;
+                    } catch { return value; }
+                })
                 .filter((value) => value && !/^sandbox:/i.test(value) && !this.isPreviewAssetUrl(value)));
         }
 
@@ -10960,6 +11021,9 @@
         }
 
         async enrichConversationArchivesWithApiAssets(indices, signal) {
+            // API 归档的正文/附件来自同一份批次快照，不能被导航触发的迟到请求或新分支污染。
+            const pending = indices.filter((index) => this.conversationArchive.get(index)?.captureSource !== 'api');
+            if (!pending.length) return { added: 0, merged: 0, available: true };
             let snapshot = null;
             try {
                 snapshot = await this.getConversationApiSnapshot(signal);
@@ -10968,13 +11032,16 @@
                 return { added: 0, merged: 0, available: false };
             }
             if (!snapshot) return { added: 0, merged: 0, available: false };
+            const incomingByIndex = this.buildConversationApiAssetMap(snapshot);
+            const incomingPairs = this.getConversationApiExportPairs(snapshot);
             let added = 0;
             let merged = 0;
-            for (const logicalIndex of indices) {
+            for (const logicalIndex of pending) {
                 const archive = this.conversationArchive.get(logicalIndex);
                 if (!archive) continue;
+                if (archive.userIdentity && archive.userIdentity !== `message:${incomingPairs.get(logicalIndex)?.user.id}`) continue;
                 if (!Array.isArray(archive.assets)) archive.assets = [];
-                const incomingAssets = this.conversationApiAssetsByIndex.get(logicalIndex) || [];
+                const incomingAssets = incomingByIndex.get(logicalIndex) || [];
                 const category = (asset) => /image|canvas|svg/i.test(asset?.kind || '')
                     ? 'image'
                     : /artifact|html/i.test(asset?.kind || '') ? 'artifact' : 'file';
@@ -12734,6 +12801,8 @@
                     userHtml,
                     assistantHtml,
                     assets: assetCapture.assets,
+                    userIdentity: pair.record?.identity || this.getConversationRecordIdentity(pair.userElement),
+                    captureSource: 'dom',
                     capturedAt: new Date().toISOString(),
                 };
                 this.conversationArchive.set(logicalIndex, archive);
@@ -12755,7 +12824,7 @@
         async loadSingleConversation(logicalIndex, signal, options = {}) {
             if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
             if (options.apiPair) {
-                const archive = this.captureApiConversationPair(logicalIndex, options.apiPair);
+                const archive = this.captureApiConversationPair(logicalIndex, options.apiPair, options.apiAssets);
                 if (archive) return archive;
                 this.conversationArchive.delete(logicalIndex);
             }
@@ -12796,6 +12865,7 @@
             const requestEpoch = this.routeEpoch;
             const requestedIdentities = new Map(uniqueIndices.map((index) => [index, this.conversationCacheIdentityByIndex.get(index)]));
             const returnPoint = this.getConversationReturnPoint();
+            let initialJumpToken = this.conversationJumpToken;
             this.conversationLoadAbortController = controller;
             this.conversationLoadMode = options.mode || 'load';
             this.conversationLoadProgress = { completed: 0, total: uniqueIndices.length, failed: 0 };
@@ -12812,6 +12882,7 @@
                 try {
                     const snapshot = await this.prepareConversationExportSnapshot(signal);
                     const apiPairs = this.getConversationApiExportPairs(snapshot);
+                    const apiAssetsByIndex = this.buildConversationApiAssetMap(snapshot);
                     const missingSelectedIdentities = new Set();
                     if (apiPairs.size) {
                         if (options.includeAll) {
@@ -12828,6 +12899,10 @@
                         }
                         this.conversationLoadProgress.total = uniqueIndices.length;
                     } else {
+                        this.cancelConversationJump();
+                        this.cancelBottomPin();
+                        initialJumpToken = this.conversationJumpToken;
+                        this.conversationExportDomCaptureInProgress = true;
                         await this.waitForOfficialConversationButtonsStable(signal);
                     }
                     for (const logicalIndex of uniqueIndices) {
@@ -12839,6 +12914,7 @@
                             if (missingSelectedIdentities.has(logicalIndex)) throw new Error('选中的消息已不在当前会话分支，请重新选择');
                             archive = await this.loadSingleConversation(logicalIndex, signal, {
                                 apiPair: apiPairs.get(logicalIndex),
+                                apiAssets: apiAssetsByIndex.get(logicalIndex) || [],
                                 allowInteractiveProbe: false,
                                 sourceMode: this.conversationLoadMode,
                             });
@@ -12847,7 +12923,7 @@
                             this.conversationArchive.delete(logicalIndex);
                             this.conversationArchiveFailures.set(logicalIndex, `读取此轮回答失败：${error?.message || error}`);
                         }
-                        if (archive) loaded.push(logicalIndex);
+                        if (archive && !archive.answerUnavailableReason) loaded.push(logicalIndex);
                         else failed.push(logicalIndex);
                         this.conversationLoadProgress.completed += 1;
                         this.conversationLoadProgress.failed = failed.length;
@@ -12861,17 +12937,26 @@
                     }
                     return { loaded, failed, aborted: true, error };
                 } finally {
-                    if (options.restore !== false && runId === this.conversationLoadRunId && requestEpoch === this.routeEpoch && this.getOfficialNavButtons().length) {
+                    if (options.restore !== false && !this.deferredExportNavigation && initialJumpToken === this.conversationJumpToken && runId === this.conversationLoadRunId && requestEpoch === this.routeEpoch && this.getOfficialNavButtons().length) {
                         await this.restoreConversationReturnPoint(returnPoint, null).catch(() => { });
                     }
                     const quarantineStats = downloadQuarantine?.restore?.() || null;
                     if (runId === this.conversationLoadRunId) {
+                        this.conversationExportDomCaptureInProgress = false;
                         this.conversationLoadAbortController = null;
                         this.conversationLoadPromise = null;
                         this.conversationLoadMode = '';
                         this.scheduleConversationRebuild(0);
                         if (quarantineStats?.blocked) {
                             this.updateConversationArchiveUi(`安全拦截 ${quarantineStats.blocked} 次自动下载；加载内容已保留`);
+                        }
+                        const deferred = this.deferredExportNavigation;
+                        this.deferredExportNavigation = null;
+                        if (deferred && requestEpoch === this.routeEpoch) {
+                            const index = this.conversationItems.findIndex((item) => deferred.identity
+                                ? this.conversationCacheIdentityByIndex.get(item.logicalIndex) === deferred.identity
+                                : item.logicalIndex === deferred.logicalIndex);
+                            if (index >= 0) this.jumpToConversation(index);
                         }
                     }
                 }
@@ -13220,7 +13305,12 @@
         replaceArchiveAssetTokens(markdown, archive, assetPathMap = new Map(), referencePathMap = new Map()) {
             const assetsById = new Map((archive?.assets || []).map((asset) => [asset.id, asset]));
             const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
-            const tokenRewritten = String(markdown || '').replace(/cgpt-asset:\/\/([\w.-]+)/g, (match, assetId) => {
+            const readable = String(markdown || '').replace(/!\[([^\]\n]*)\]\(cgpt-asset:\/\/([\w.-]+)\)/g, (match, label, assetId) => {
+                const asset = assetsById.get(assetId);
+                const available = assetPathMap.get(assetId) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap) || this.getPortableAssetFallbackReference(asset);
+                return available ? match : `[图片未能保存：${label}](#asset-not-available)`;
+            });
+            const tokenRewritten = readable.replace(/cgpt-asset:\/\/([\w.-]+)/g, (match, assetId) => {
                 const asset = assetsById.get(assetId);
                 const local = assetPathMap.get(assetId) || this.resolveArchiveAssetPath(asset, logicalIndex, referencePathMap);
                 if (local) return this.toArchiveLocalReference(local);
@@ -13234,7 +13324,9 @@
             const groups = this.getCanonicalArchiveAssetGroupsForArchive(archive);
             if (!groups.length) return '';
             const logicalIndex = Number.isInteger(archive?.logicalIndex) ? archive.logicalIndex : -1;
-            const lines = ['#### 图片、附件与 Artifacts', ''];
+            const lines = role === 'user' ? [] : ['#### 图片、附件与 Artifacts', ''];
+            const headerLength = lines.length;
+            const renderedBody = this.replaceArchiveAssetTokens(body, archive, assetPathMap, referencePathMap);
             const seen = new Set();
             for (const group of groups) {
                 const asset = group.asset;
@@ -13249,10 +13341,10 @@
                 const label = this.escapeMarkdownInline(asset.imageTitle || asset.originalFilename || asset.label || asset.filenameHint || '附件');
                 const suffix = localPath ? '' : reference ? '（外部链接）' : '（未能获取）';
                 const image = /image|canvas|svg/i.test(asset.kind || '') || String(asset.mimeType).startsWith('image/');
-                if (reference && body.includes(`](${reference})`)) continue;
+                if (reference && renderedBody.includes(`](${reference})`)) continue;
                 lines.push(reference ? image ? `![${label}](${reference})${suffix}\n` : `- [${label}](${reference})${suffix}` : `- ${label}${suffix}`);
             }
-            return lines.length > 2 ? `${lines.join('\n')}\n` : '';
+            return lines.length > headerLength ? `${lines.join('\n')}\n` : '';
         }
 
         buildConversationMarkdown(indices, options = {}) {
@@ -13734,10 +13826,10 @@
                 const message = String(error?.message || error || '');
                 const routeUnsupported = [405, 501].includes(status);
                 const authStatus = status === 401;
-                const fileSpecificStatus = [400, 403, 404, 410, 422].includes(status);
                 const timeoutLike = /timeout|超时|network|failed to fetch|连接/i.test(message);
                 const threshold = Math.max(1, Number(this.config.conversationExportRouteTimeoutFailureThreshold) || 2);
-                const mayBlockAfterThreshold = stats.successes === 0 && (fileSpecificStatus || timeoutLike);
+                // 某个文件过期/无权限，或签名 URL 传输超时，不代表其它文件的下载路由不可用。
+                const mayBlockAfterThreshold = stats.successes === 0 && timeoutLike && !/\/files?\//i.test(key);
                 if (routeUnsupported || authStatus || (mayBlockAfterThreshold && stats.consecutiveFailures >= threshold)) {
                     const cooldown = Math.max(5000, Number(this.config.conversationExportRouteFailureCooldownMs) || 600000);
                     stats.blockedUntil = now + (authStatus ? Math.min(cooldown, 60000) : cooldown);
@@ -13785,7 +13877,7 @@
             if (!/^https?:/i.test(normalized)) return normalized;
             try {
                 const parsed = new URL(normalized, location.href);
-                const volatileNames = /^(?:token|sig|signature|expires?|expiry|policy|key-pair-id|x-amz-.+|x-goog-.+|response-content-disposition|download|auth|jwt)$/i;
+                const volatileNames = /^(?:utm_.+|token|sig|signature|expires?|expiry|policy|key-pair-id|x-amz-.+|x-goog-.+|response-content-disposition|download|auth|jwt)$/i;
                 const hadVolatile = [...parsed.searchParams.keys()].some((key) => volatileNames.test(key));
                 if (!hadVolatile) return parsed.href;
                 for (const key of [...parsed.searchParams.keys()]) {
@@ -14735,9 +14827,27 @@
                 : '没有可读取的附件地址'));
         }
 
+        isRetryableAssetError(error) {
+            return error?.name !== 'AbortError' && /timeout|超时|长时间没有进展|network|failed to fetch|连接|HTTP\s+(?:408|429|5\d\d)\b/i.test(String(error?.message || error || ''));
+        }
+
+        async fetchArchiveAssetWithRetry(asset, signal) {
+            for (let attempt = 0; ; attempt += 1) {
+                if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+                try {
+                    const result = await this.fetchArchiveAssetUncached(asset, signal);
+                    return { ...result, retryCount: attempt };
+                } catch (error) {
+                    if (attempt >= 1 || !this.isRetryableAssetError(error)) throw error;
+                    for (const id of this.getAssetStrongFileIds(asset)) this.fileDownloadMetadataCache.delete(id);
+                    await this.waitForDelay(750, signal);
+                }
+            }
+        }
+
         async fetchArchiveAsset(asset, signal) {
             const baseKey = this.getAssetFetchCacheKey(asset);
-            if (!baseKey) return this.fetchArchiveAssetUncached(asset, signal);
+            if (!baseKey) return this.fetchArchiveAssetWithRetry(asset, signal);
             let key = baseKey;
 
             const cached = this.assetBinaryCache.get(key);
@@ -14785,7 +14895,7 @@
                     }
                     if (record) await this.deleteGeneratedImagePersistentCache(asset);
                 }
-                const value = await this.fetchArchiveAssetUncached(asset, signal);
+                const value = await this.fetchArchiveAssetWithRetry(asset, signal);
                 if (persistentCacheKey && value?.blob instanceof Blob) {
                     await this.writeGeneratedImagePersistentCache(asset, value.blob, value).catch(() => false);
                 }
@@ -14808,7 +14918,7 @@
                 return value;
             } catch (error) {
                 this.assetBinaryCache.delete(key);
-                if (error?.name !== 'AbortError') {
+                if (error?.name !== 'AbortError' && !this.isRetryableAssetError(error)) {
                     this.assetFailureCache.set(key, { at: Date.now(), message: error?.message || String(error) });
                 }
                 throw error;
@@ -15326,6 +15436,7 @@
                         fetchIdentityKey: job.key,
                         fetchDurationMs: Number(result.fetchDurationMs) || 0,
                         attemptCount: Number(result.attemptCount) || 0,
+                        retryCount: Number(result.retryCount) || 0,
                         resolvedVia: result.resolvedVia || '',
                         resolvedFileId: result.resolvedFileId || asset.fileId || '',
                         previewFallback: Boolean(result.previewFallback),
@@ -15464,13 +15575,13 @@
                 }
 
                 const manifest = {
-                    version: 10,
+                    version: 12,
                     generatedAt: new Date().toISOString(),
                     source: location.href,
                     title: this.getConversationExportTitle(),
                     selectedOnly,
                     conversationIndices: uniqueIndices.map((index) => index + 1),
-                    incompleteConversations: uniqueIndices.filter((index) => !this.conversationArchive.has(index))
+                    incompleteConversations: this.getIncompleteConversationIndices(uniqueIndices)
                         .map((index) => ({ index: index + 1, reason: this.conversationArchiveFailures.get(index) || '未能读取回答' })),
                     options: {
                         markdown: this.exportIncludeMarkdown,
@@ -15486,7 +15597,7 @@
                 const suffix = selectedOnly ? '-selected' : '-all';
                 this.downloadBlob(blob, `${title}${suffix}-${this.getExportTimestamp()}.zip`);
                 const failedAssets = assetPlan.manifest.filter((item) => !item.included && !item.skipped).length;
-                const failedConversations = uniqueIndices.filter((index) => !this.conversationArchive.has(index)).length;
+                const failedConversations = this.getIncompleteConversationIndices(uniqueIndices).length;
                 completionMessage = failedConversations
                     ? `ZIP 已导出；${failedConversations} 轮问答不完整${failedAssets ? `，${failedAssets} 个资源未能打包` : ''}，详见 manifest`
                     : failedAssets
@@ -15554,6 +15665,10 @@
             return name;
         }
 
+        getIncompleteConversationIndices(indices) {
+            return indices.filter((index) => !this.conversationArchive.has(index) || this.conversationArchive.get(index).answerUnavailableReason);
+        }
+
         async saveMarkdownExportBundle(indices, selectedOnly, parent, signal) {
             this.updateConversationArchiveUi('正在下载 Markdown 的图片和附件…');
             await this.enrichConversationArchivesWithApiAssets(indices, signal);
@@ -15564,9 +15679,9 @@
             const markdown = this.buildConversationMarkdown(indices, {
                 assetPathMap: plan.tokenPathMap, urlPathMap: plan.urlPathMap, includeAssetAppendix: true,
             });
-            const incomplete = indices.filter((index) => !this.conversationArchive.has(index));
+            const incomplete = this.getIncompleteConversationIndices(indices);
             const manifest = {
-                version: 11, source: location.href, generatedAt: new Date().toISOString(),
+                version: 12, source: location.href, generatedAt: new Date().toISOString(),
                 conversationIndices: indices.map((index) => index + 1),
                 incompleteConversations: incomplete.map((index) => ({ index: index + 1, reason: this.conversationArchiveFailures.get(index) })),
                 assets: plan.manifest,
@@ -15638,7 +15753,7 @@
                 }
                 const markdown = this.buildConversationMarkdown(uniqueIndices);
                 this.downloadMarkdown(markdown, selectedOnly);
-                const succeeded = uniqueIndices.filter((index) => this.conversationArchive.has(index)).length;
+                const succeeded = uniqueIndices.length - this.getIncompleteConversationIndices(uniqueIndices).length;
                 const failed = uniqueIndices.length - succeeded;
                 completionMessage = failed
                     ? `已导出 ${uniqueIndices.length} 轮，其中 ${failed} 轮不完整`

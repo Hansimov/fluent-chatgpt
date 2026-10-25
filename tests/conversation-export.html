@@ -91,7 +91,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     check('image-only assistant remains exportable', !!c.captureApiConversationPair(5,imageOnly));
     equal('image-only export keeps attachment metadata', c.conversationArchive.get(5).assets[0].fileId, 'file-test-only');
     c.conversationApiAssetsByIndex.set(6,[{id:'upload',role:'user',kind:'image'}]);
-    equal('user upload alone cannot invent an assistant answer', c.captureApiConversationPair(6,imageOnly), null);
+    const unanswered=c.captureApiConversationPair(6,imageOnly);
+    check('user upload without answer remains exportable', unanswered?.assets.length===1);
+    check('user upload alone cannot invent an assistant answer', unanswered?.answerUnavailableReason?.includes('暂无已完成的回答'));
+    equal('manifest reports unanswered turn despite preserving its uploads',c.getIncompleteConversationIndices([6]),[6]);
     const streaming = snapshot([message('pending-u','user','等待'), message('pending-a','assistant','半句',{status:'in_progress',channel:'final'})]);
     equal('in-progress answer is not treated as a complete API archive', c.getConversationApiExportPairs(streaming).get(0).assistants.length, 0);
     equal('multiple text parts preserve repetition and indentation', c.getApiMessageExportText(message('x','assistant','',{content:{content_type:'text',parts:['重复','重复','```\n  indented\n```']}})), '重复\n\n重复\n\n```\n  indented\n```');

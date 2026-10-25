@@ -8,7 +8,7 @@ const check=(name,pass,details='')=>{checks.push({name,pass:!!pass,details});doc
 const equal=(name,a,b)=>check(name,JSON.stringify(a)===JSON.stringify(b),JSON.stringify(a));
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 const image=(id)=>({content_type:'image_asset_pointer',asset_pointer:'sediment://'+id,size_bytes:123,width:800,height:600,metadata:{}});
-const attachment=(id,name='截图.png')=>({id,name,mime_type:'image/png',size:123});
+const attachment=(id,name='截图.png')=>({id,name,mime_type:'image/png',size:123,library_file_id:'libfile_'+id});
 const messages=[
  {id:'u0',author:{role:'user'},content:{content_type:'multimodal_text',parts:['图前文字',image('file_old_image_one'),'图中文字',image('file_old_image_two'),'图后文字']},metadata:{attachments:[attachment('file_old_image_one'),attachment('file_old_image_two')]}},
  {id:'a0',author:{role:'assistant'},channel:'final',content:{content_type:'text',parts:['## 表格\n\n| 列 A | 列 B |\n| --- | --- |\n| 1 | **两行** |\n\n```text\n  keep indentation\n```']}},
@@ -30,6 +30,7 @@ try{
  c.getConversationApiSnapshot=async()=>{requests++;c.conversationApiSnapshot=snapshot;c.conversationApiSnapshotId='assets-test';c.conversationApiAssetsByIndex=c.buildConversationApiAssetMap(snapshot);return snapshot;};
  await c.getConversationApiSnapshot();
  equal('pointer + attachments deduplicate by exact file ID',c.conversationApiAssetsByIndex.get(0).length,2);
+ check('library IDs never become separate file download jobs', [...c.conversationApiAssetsByIndex.values()].flat().every(a=>!a.fileId.startsWith('libfile_')));
  equal('legacy attachment names replace generic image.png',c.conversationApiAssetsByIndex.get(0).map(a=>a.originalFilename),['截图.png','截图.png']);
  const pairs=c.getConversationApiExportPairs(snapshot);for(const [i,p] of pairs)c.captureApiConversationPair(i,p);
  const a0=c.conversationArchive.get(0),a1=c.conversationArchive.get(1);
@@ -48,8 +49,10 @@ try{
  const md=c.buildConversationMarkdown([0,1],{assetPathMap:plan.tokenPathMap,urlPathMap:plan.urlPathMap});
  check('portable local image paths replace internal pointers',md.includes('assets/q001/001-')&&!md.includes('cgpt-asset:')&&!md.includes('sediment:'));
  equal('each upload and answer image appears exactly once',(md.match(/!\[/g)||[]).length,4);
+ check('already embedded uploads need no repeated attachment subsection',!md.split('### ChatGPT')[0].includes('图片、附件与 Artifacts'));
  const q2=md.slice(md.indexOf('## 问答 2'));
  check('metadata-only uploads appear in user section',q2.indexOf('旧图.png')>=0&&q2.indexOf('旧图.png')<q2.indexOf('### ChatGPT'));
+ check('metadata-only uploads render directly without an unnecessary user heading',!q2.split('### ChatGPT')[0].includes('图片、附件与 Artifacts'));
  check('PDF stays a normal link, not an image',/\[说明.pdf\]\(\.\/assets\//.test(md)&&!md.includes('![说明.pdf]'));
  check('Markdown table and fenced indentation survive attachment rewriting',md.includes('| --- | --- |')&&md.includes('  keep indentation'));
 
@@ -92,6 +95,7 @@ try{
  check('expired file has no fake local path',!failedPlan.tokenPathMap.has(a0.assets[1].id));
  const failedMd=c.buildConversationMarkdown([0],{assetPathMap:failedPlan.tokenPathMap,urlPathMap:failedPlan.urlPathMap});
  check('missing file remains explicitly unavailable',failedMd.includes('#asset-not-available'));
+ check('missing image has readable explanation instead of a broken image icon',failedMd.includes('图片未能保存')&&!/!\[[^\]]*\]\(#asset-not-available\)/.test(failedMd));
  equal('same-name failed asset does not borrow a successful file path',c.resolveArchiveAssetPath(a0.assets[1],0,failedPlan.urlPathMap),'');
  equal('ambiguous filename alias remains disabled even when one download fails',failedPlan.urlPathMap.get('q:0|name:截图.png'),'');
  const invalid=await c.writeMarkdownExportDirectory(root,'safe',[{path:'../outside.txt',blob:new Blob(['test'])}]).then(()=>false,e=>e.message.includes('不安全'));
@@ -99,6 +103,95 @@ try{
  const controller=new AbortController();controller.abort();const count=store.size;
  check('aborted export never writes more files',await c.writeMarkdownExportDirectory(root,'safe',[{path:'x.md',blob:new Blob(['x'])}],controller.signal).then(()=>false,e=>e.name==='AbortError')&&store.size===count);
  check('full export never submits prompts or needs mounted historical images',document.querySelectorAll('main img').length===0);
+
+ const refs={id:'ref',author:{role:'assistant'},content:{content_type:'text',parts:['回答 citeturn0search1']},metadata:{
+   safe_urls:['https://example.org/info.html','https://example.org/reference.pdf'],
+   citations:['https://example.org/citation.pdf'],search_result_groups:[{entries:[{url:'https://example.org/search.pdf'}]}],
+   content_references:[{type:'grouped_webpages',matched_text:'citeturn0search1',items:[{title:'来源 [一]',url:'https://example.org/info(a).html',supporting_websites:[{title:'补充',url:'https://example.org/reference.pdf'}]}]}],
+ }};
+ equal('safe URL allowlist and reference metadata are not attachments',c.collectApiAssetsFromMessage(refs,3).length,0);
+ const cited=c.getApiMessageExportMarkdown(refs,[]);
+ check('native citation tokens become portable source links',cited.includes('[来源 \\[一\\]](https://example.org/info%28a%29.html)')&&cited.includes('[补充](https://example.org/reference.pdf)')&&!cited.includes(''));
+ equal('unresolved citation is explicit, not an opaque internal token',c.replaceApiCitationTokens('citeturn9search9',{}),'（引用来源信息不可用）');
+ check('legacy citation alt is usable when structured items are absent',c.replaceApiCitationTokens('citeold',{metadata:{content_references:[{matched_text:'citeold',alt:'([来源](https://example.org/old))'}]}}).includes('(https://example.org/old)'));
+ check('citation metadata cannot create javascript links',!c.replaceApiCitationTokens('citeold',{metadata:{content_references:[{matched_text:'citeold',items:[{url:'javascript:alert(1)'}]}]}}).includes('javascript:'));
+ const publicFile={id:'explicit',author:{role:'assistant'},content:{content_type:'text',parts:['[文件](https://example.org/download.pdf) [网页](https://example.org/info.html)']}};
+ equal('explicit Markdown file link is preserved as a real attachment',c.collectApiAssetsFromMessage(publicFile,3).map(a=>a.sourceUrl),['https://example.org/download.pdf']);
+ equal('tracking variants share one canonical URL key',c.getStableAssetUrlKey('https://example.org/a.pdf?utm_source=chatgpt.com'),c.getStableAssetUrlKey('https://example.org/a.pdf'));
+ check('meaningful URL query still distinguishes different files',c.getStableAssetUrlKey('https://example.org/a.pdf?version=1')!==c.getStableAssetUrlKey('https://example.org/a.pdf?version=2'));
+ const tracked=c.collectApiAssetsFromMessage({...publicFile,content:{content_type:'text',parts:['[一](https://example.org/a.pdf) [二](https://example.org/a.pdf?utm_source=chatgpt.com)']}},3);
+ equal('tracking variants actually become one resource, not just equal cache keys',tracked.length,1);
+ check('different signed resource identities are never weakly collapsed',!c.assetsShareStrongIdentity({sourceUrl:'https://example.org/download?token=first'},{sourceUrl:'https://example.org/download?token=second'}));
+
+ const noAnswer={id:'unanswered',author:{role:'user'},content:{content_type:'multimodal_text',parts:['未回答的上传',image('file_unanswered')]},metadata:{attachments:[attachment('file_unanswered','未回答图.png')]}};
+ c.conversationApiAssetsByIndex.set(2,c.collectApiAssetsFromMessage(noAnswer,2));
+ const incomplete=c.captureApiConversationPair(2,{user:noAnswer,assistants:[]});
+ check('unanswered turn retains the full user message and its image',incomplete.userMarkdown.includes('cgpt-asset:')&&incomplete.assets.length===1&&!!incomplete.answerUnavailableReason);
+ const unansweredPlan=await c.prepareZipAssets([2],true);
+ const unansweredMd=c.buildConversationMarkdown([2],{assetPathMap:unansweredPlan.tokenPathMap,urlPathMap:unansweredPlan.urlPathMap});
+ check('unanswered upload is downloadable despite missing final answer',unansweredPlan.files.length===1&&unansweredMd.includes('assets/q003/')&&unansweredMd.includes('暂无已完成的回答'));
+ equal('manifest does not falsely claim missing final answer is complete',c.getIncompleteConversationIndices([2]),[2]);
+
+ const downloadUrl=location.origin+'/backend-api/files/download/file_first_expired';
+ for(const status of [403,404,410,422]) c.recordAssetRouteResult(downloadUrl,false,{status,message:'HTTP '+status});
+ check('expired files never suppress downloads for other file IDs',!c.isAssetRouteSuppressed(location.origin+'/backend-api/files/download/file_second_valid'));
+ c.recordAssetRouteResult(downloadUrl,false,Error('附件连接超时'));
+ c.recordAssetRouteResult(downloadUrl,false,Error('附件连接超时'));
+ check('per-file network timeouts never globally disable file downloads',!c.isAssetRouteSuppressed(downloadUrl));
+ const unsupported=location.origin+'/backend-api/files/file_old/download';c.recordAssetRouteResult(unsupported,false,{status:405});
+ check('proven unsupported route is still suppressed',c.isAssetRouteSuppressed(unsupported));
+ const originalFetch=c.fetchArchiveAssetUncached, originalWait=c.waitForDelay;
+ let attempts=0;c.fileDownloadMetadataCache.set('file_retry_test',{downloadUrl:'expired'});
+ c.waitForDelay=async(ms,signal)=>{if(signal?.aborted)throw new DOMException('Canceled','AbortError');};
+ c.fetchArchiveAssetUncached=async()=>{attempts++;if(attempts===1)throw Error('附件连接超时');return {blob:new Blob(['ok'])};};
+ const retried=await c.fetchArchiveAssetWithRetry({fileId:'file_retry_test'},null);
+ check('transient download failure gets one bounded retry with refreshed metadata',attempts===2&&retried.retryCount===1&&!c.fileDownloadMetadataCache.has('file_retry_test'));
+ attempts=0;c.fetchArchiveAssetUncached=async()=>{attempts++;throw Error('HTTP 404');};
+ await c.fetchArchiveAssetWithRetry({fileId:'file_retry_test'}).catch(()=>{});
+ equal('permanent not-found errors are not blindly retried',attempts,1);
+ attempts=0;c.fetchArchiveAssetUncached=async()=>{attempts++;throw Error('HTTP 503');};
+ await c.fetchArchiveAssetWithRetry({fileId:'file_retry_test'}).catch(()=>{});
+ equal('server-error retries are bounded',attempts,2);
+ const retryAbort=new AbortController();attempts=0;c.fetchArchiveAssetUncached=async()=>{attempts++;retryAbort.abort();throw Error('附件连接超时');};
+ check('abort during retry does not start another network request',await c.fetchArchiveAssetWithRetry({fileId:'file_retry_test'},retryAbort.signal).then(()=>false,e=>e.name==='AbortError')&&attempts===1);
+ c.fetchArchiveAssetUncached=originalFetch;c.waitForDelay=originalWait;
+
+ await c.getConversationApiSnapshot();for(const [i,p] of c.getConversationApiExportPairs(snapshot))c.captureApiConversationPair(i,p);
+ let navigated=false,remounted=false;
+ const originalSeek=c.seekConversationTarget;
+ c.seekConversationTarget=async(index)=>{navigated=index===1;document.querySelector('main').innerHTML='<div data-message-author-role="user" data-message-id="u1">只有附件元数据的旧消息</div>';remounted=true;return true;};
+ c.conversationItems=[{logicalIndex:0},{logicalIndex:1}];
+ c.fetchArchiveAsset=async(asset,signal)=>{await c.jumpToConversation(1);check('navigation has independent cancellation from file export',!signal?.aborted);return {blob:new Blob([asset.fileId]),resolvedFilename:asset.originalFilename};};
+ const exportAbort=new AbortController();c.conversationLoadAbortController=exportAbort;
+ const parallel=await c.prepareZipAssets([0,1],true,exportAbort.signal);
+ const parallelMd=c.buildConversationMarkdown([0,1],{assetPathMap:parallel.tokenPathMap,urlPathMap:parallel.urlPathMap});
+ check('question navigation remains available while downloading assets',navigated&&remounted);
+ check('DOM remount during navigation cannot alter captured export text or file order',parallel.files.length===5&&parallelMd.includes('图前文字')&&parallelMd.includes('图后文字')&&parallelMd.indexOf('001-')<parallelMd.indexOf('002-'));
+ c.conversationExportDomCaptureInProgress=true;navigated=false;
+ await c.jumpToConversation(0);await c.jumpToConversation(1);
+ check('legacy DOM capture defers navigation and remembers the latest selected target',!navigated&&c.deferredExportNavigation.logicalIndex===1);
+ c.conversationExportDomCaptureInProgress=false;c.deferredExportNavigation=null;c.seekConversationTarget=originalSeek;
+
+ const originalLoad=c.loadSingleConversation;
+ c.loadSingleConversation=async function(i,signal,options){this.conversationApiAssetsByIndex=new Map([[i,[{id:'wrong-branch',fileId:'file_other_branch',role:'user',messageId:'u'+i}]]]);return originalLoad.call(this,i,signal,options);};
+ await c.loadConversationIndices([0,1],{restore:false,includeAll:true});
+ check('late navigation API response cannot replace the export batch asset snapshot',c.conversationArchive.get(0).assets.length===2&&c.conversationArchive.get(1).assets.length===3&&c.conversationArchive.get(0).userMarkdown.includes('file_old_image_one'));
+ const beforeEnrichment=requests;
+ await c.enrichConversationArchivesWithApiAssets([0,1]);
+ check('API archive enrichment cannot mix another branch into captured text',requests===beforeEnrichment&&!c.conversationArchive.get(0).assets.some(a=>a.fileId==='file_other_branch'));
+ c.loadSingleConversation=originalLoad;
+
+ const originalSnapshot=c.getConversationApiSnapshot,originalStable=c.waitForOfficialConversationButtonsStable;
+ c.getConversationApiSnapshot=async()=>null;navigated=false;
+ c.seekConversationTarget=async index=>{navigated=index===1;return true;};
+ c.waitForOfficialConversationButtonsStable=async()=>{await c.jumpToConversation(0);await c.jumpToConversation(1);};
+ c.loadSingleConversation=async index=>c.conversationArchive.get(index);
+ await c.loadConversationIndices([0,1],{restore:true});
+ check('deferred old-page navigation is replayed after capture completes',navigated&&!c.conversationExportDomCaptureInProgress&&!c.deferredExportNavigation);
+ c.conversationExportDomCaptureInProgress=true;c.deferredExportNavigation={logicalIndex:1};
+ c.cancelConversationArchiveLoad('route changed',false,true);
+ check('route invalidation drops deferred navigation and capture lock',!c.conversationExportDomCaptureInProgress&&!c.deferredExportNavigation);
+ c.getConversationApiSnapshot=originalSnapshot;c.waitForOfficialConversationButtonsStable=originalStable;c.loadSingleConversation=originalLoad;c.seekConversationTarget=originalSeek;
 }catch(e){check('unexpected exception',false,e.stack||String(e));}
 c.cancelBottomPin();c.mainObserver?.disconnect();c.pageObserver?.disconnect();
 document.documentElement.dataset.testsPassed=String(checks.every(c=>c.pass));document.documentElement.dataset.testCount=checks.length;document.getElementById('result').textContent=JSON.stringify({checks},null,2);
